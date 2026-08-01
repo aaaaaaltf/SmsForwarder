@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="#000000">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:padding="8dp"
+        android:background="#66000000">
+
+        <com.xuexiang.xui.widget.button.ButtonView
+            android:id="@+id/btn_camera_switch"
+            style="@style/ButtonView.Blue"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/camera_preview_switch" />
+
+        <com.xuexiang.xui.widget.button.ButtonView
+            android:id="@+id/btn_camera_screenshot"
+            style="@style/ButtonView.Blue"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:text="@string/camera_preview_screenshot" />
+    </LinearLayout>
+
+    <FrameLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1">
+
+        <ImageView
+            android:id="@+id/iv_camera_preview"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:scaleType="fitCenter"
+            android:background="#000000" />
+
+        <!-- ★ 画面叠加提示：当前前置/后置摄像头 -->
+        <TextView
+            android:id="@+id/tv_camera_tag"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="top|start"
+            android:layout_margin="12dp"
+            android:background="#88000000"
+            android:paddingStart="10dp"
+            android:paddingEnd="10dp"
+            android:paddingTop="4dp"
+            android:paddingBottom="4dp"
+            android:text="@string/camera_preview_back"
+            android:textColor="#FFFFFF"
+            android:textSize="15sp" />
+
+        <!-- ★ 画面叠加：实时时间（精确到秒） -->
+        <TextView
+            android:id="@+id/tv_camera_time"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="top|end"
+            android:layout_margin="12dp"
+            android:background="#88000000"
+            android:paddingStart="10dp"
+            android:paddingEnd="10dp"
+            android:paddingTop="4dp"
+            android:paddingBottom="4dp"
+            android:textColor="#FFFFFF"
+            android:textSize="15sp" />
+    </FrameLayout>
+
+    <TextView
+        android:id="@+id/tv_camera_status"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:padding="10dp"
+        android:background="#66000000"
+        android:text="@string/camera_preview_connecting"
+        android:textColor="#FFFFFF"
+        android:textSize="14sp" />
+
+    <com.xuexiang.xui.widget.button.ButtonView
+        android:id="@+id/btn_camera_close"
+        style="@style/ButtonView.Blue"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_margin="12dp"
+        android:text="@string/camera_preview_close" />
+
+</LinearLayout>
