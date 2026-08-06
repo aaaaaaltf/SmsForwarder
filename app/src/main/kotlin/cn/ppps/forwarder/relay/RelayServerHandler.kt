@@ -554,18 +554,40 @@ object RelayServerHandler {
         Thread({
             try {
                 val total = f.length()
+                // ★ 等待连接就绪后再发送元信息（连接断开时等待重连，最多30秒）
+                if (!waitForConnection(sender, 30000)) {
+                    Log.w(TAG, "文件下载取消: 连接未恢复 $p")
+                    return@Thread
+                }
                 sender.send(RelayCommands.RSP_FS_GET, "$total|${f.name}|ok")
                 val buf = ByteArray(128 * 1024)
+                var sentBytes = 0L
                 f.inputStream().use { ins ->
                     while (true) {
                         val n = ins.read(buf)
                         if (n <= 0) break
                         val chunk = if (n == buf.size) buf else buf.copyOf(n)
+                        // ★ 每块发送前检查连接状态：断线时等待重连，避免数据丢失
+                        if (!sender.isConnected()) {
+                            Log.w(TAG, "文件下载: 连接中断，等待重连... (已发送 $sentBytes/$total)")
+                            if (!waitForConnection(sender, 30000)) {
+                                Log.w(TAG, "文件下载中止: 重连超时 $p (已发送 $sentBytes/$total)")
+                                return@Thread
+                            }
+                        }
                         sender.send(RelayCommands.CMD_FS_DATA, chunk)
+                        sentBytes += n
+                        // ★ 流控：每块间隔20ms，防止发送队列积压过多分块导致内存暴涨
+                        Thread.sleep(20)
                     }
                 }
+                // ★ 等待连接就绪后再发送完成标记
+                if (!waitForConnection(sender, 30000)) {
+                    Log.w(TAG, "文件下载完成但连接断开，无法发送完成标记: $p")
+                    return@Thread
+                }
                 sender.send(RelayCommands.CMD_FS_DONE, "")
-                Log.i(TAG, "文件下载完成: $p (${total}字节)")
+                Log.i(TAG, "fs download done: $p ($total bytes)")
             } catch (e: Exception) {
                 Log.w(TAG, "文件下载异常: $p ${e.message}")
                 try {
@@ -574,6 +596,22 @@ object RelayServerHandler {
                 }
             }
         }, "FsDownload").apply { isDaemon = true }.start()
+    }
+
+    /** ★ 等待sender连接就绪（用于文件下载断线重连），返回是否在超时内恢复 */
+    private fun waitForConnection(sender: RelaySender?, timeoutMs: Long): Boolean {
+        if (sender == null) return false
+        if (sender.isConnected()) return true
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                Thread.sleep(1000)
+            } catch (_: InterruptedException) {
+                return false
+            }
+            if (sender.isConnected()) return true
+        }
+        return false
     }
 
     private fun handleLocation(): LocationInfo {
