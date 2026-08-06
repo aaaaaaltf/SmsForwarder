@@ -802,6 +802,13 @@
     <string name="screen_preview_auth_denied">屏幕捕获授权被拒绝</string>
     <string name="screen_preview_auth_failed">屏幕捕获授权失败</string>
     <string name="screen_preview_auth_notify">屏幕捕获服务运行中</string>
+    <string name="accessibility_touch_service_desc">用于远程控制时在被控端手机上模拟点击和滑动操作。开启后，控制端即可通过远程桌面进行触摸操控。</string>
+    <string name="accessibility_touch_service_name">远程触摸控制</string>
+    <string name="enable_accessibility_touch">开启远程触摸（无障碍服务）</string>
+    <string name="touch_service_enabled">远程触摸：已开启（无障碍服务运行中）</string>
+    <string name="touch_service_disabled">远程触摸：未开启</string>
+    <string name="wakeup_screen">点亮屏幕</string>
+    <string name="wakeup_screen_sent">已发送点亮屏幕命令</string>
     <string name="screen_preview_starting">正在请求被控端 #%1$d 屏幕...</string>
     <string name="screen_preview_connecting">正在连接视频流...</string>
     <string name="screen_preview_connected">已连接视频流，接收被控端 #%1$d 屏幕</string>

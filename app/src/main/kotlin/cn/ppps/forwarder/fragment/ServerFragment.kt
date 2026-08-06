@@ -192,8 +192,30 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             }
         }
 
+        //远程触摸（无障碍服务）开关
+        binding!!.btnEnableTouch.setOnClickListener {
+            val svc = cn.ppps.forwarder.relay.TouchControlService.instance
+            if (svc != null) {
+                XToastUtils.toast(getString(R.string.touch_service_enabled))
+            } else {
+                // 跳转无障碍设置页开启远程触摸服务
+                try {
+                    val intent = Intent("android.settings.ACCESSIBILITY_SETTINGS")
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    startActivity(intent)
+                } catch (e: Exception) {
+                    XToastUtils.error("打开无障碍设置失败: ${e.message}")
+                }
+            }
+        }
+
         //启动更新UI定时器
         handler.post(runnable)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refreshButtonText()
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?) {
@@ -232,6 +254,13 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
 
     //刷新按钮
     private fun refreshButtonText() {
+        // 远程触摸状态
+        val touchOn = cn.ppps.forwarder.relay.TouchControlService.instance != null
+        binding!!.tvTouchStatus.text = if (touchOn) {
+            resources.getText(R.string.touch_service_enabled)
+        } else {
+            resources.getText(R.string.touch_service_disabled)
+        }
         if (RelayServerService.isRunning) {
             binding!!.btnToggleServer.text = resources.getText(R.string.stop_server)
             // ★ 两段连接状态：被控端↔中继、控制端↔中继

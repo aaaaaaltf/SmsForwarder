@@ -10,7 +10,7 @@ import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.PowerManager
-import android.util.Log
+import cn.ppps.forwarder.utils.Log
 import cn.ppps.forwarder.App
 
 /**
@@ -33,7 +33,10 @@ object CameraStreamManager {
     private const val FRAME_INTERVAL_MS = 100L
 
     @Volatile
-    private var client: RelayServerClient? = null
+    private var client: RelaySender? = null
+
+    /** ★ 所有可用的帧发送通道（中继client / 直连监听listener / ZT直连client），发送时按连接状态择可用通道 */
+    private val senders: MutableList<RelaySender> = java.util.Collections.synchronizedList(mutableListOf())
 
     @Volatile
     private var running = false
@@ -84,10 +87,25 @@ object CameraStreamManager {
         }
     }
 
-    /** 由 RelayServerService 在创建连接后设置，用于推流 */
-    fun setClient(c: RelayServerClient?) {
+    /** 由 RelayServerService 在创建连接后设置，用于推流（同时加入发送通道列表） */
+    fun setClient(c: RelaySender?) {
         client = c
+        if (c != null) addSender(c)
         if (c == null) stop()
+    }
+
+    /** ★ 注册帧发送通道（中继/直连监听/ZT直连），同一连接重复注册自动忽略 */
+    fun addSender(c: RelaySender) {
+        synchronized(senders) {
+            if (!senders.contains(c)) senders.add(c)
+        }
+    }
+
+    /** ★ 移除帧发送通道（连接断开时调用） */
+    fun removeSender(c: RelaySender) {
+        synchronized(senders) {
+            senders.remove(c)
+        }
     }
 
     fun isStreaming(): Boolean = running
@@ -99,9 +117,12 @@ object CameraStreamManager {
      */
     @Synchronized
     fun start(index: Int): Boolean {
-        val c = client
-        if (c == null || !c.isConnected()) {
-            lastError = "中继未连接，无法推流摄像头"
+        // ★ 2026-08-05修复：直连模式下中继client未连接（云服务关闭/中继不可达）时，
+        //   只要存在任一已连接的发送通道（直连监听56786 / ZT直连56789），摄像头仍可推流。
+        //   原逻辑只检查中继client，导致直连模式摄像头永远启动失败。
+        val hasSender = synchronized(senders) { senders.any { it.isConnected() } }
+        if (!hasSender) {
+            lastError = "无可用连接通道，无法推流摄像头"
             Log.w(TAG, lastError!!)
             return false
         }
@@ -181,7 +202,20 @@ object CameraStreamManager {
                         val header = "$cameraIndex|$streamId|".toByteArray(Charsets.UTF_8)
                         val data = header + jpeg
                         try {
-                            client?.send(RelayCommands.CMD_CAMERA_STREAM_FRAME, data)
+                            // ★ 2026-08-05：逐通道发送——中继/直连监听/ZT直连，只要有连接就推（直连模式下摄像头仍可用）
+                            var sent = false
+                            synchronized(senders) {
+                                for (s in senders) {
+                                    if (s.isConnected()) {
+                                        try {
+                                            s.send(RelayCommands.CMD_CAMERA_STREAM_FRAME, data)
+                                            sent = true
+                                        } catch (_: Exception) {
+                                        }
+                                    }
+                                }
+                            }
+                            if (!sent) client?.send(RelayCommands.CMD_CAMERA_STREAM_FRAME, data)
                         } catch (_: Exception) {
                         }
                     }

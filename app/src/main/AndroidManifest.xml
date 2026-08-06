@@ -49,6 +49,8 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- 后台启动点亮屏幕Activity（远程点亮被控端屏幕） -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
     <application
         android:name=".App"
@@ -192,6 +194,27 @@
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="mediaProjection" />
+        <!--远程触摸无障碍服务（远程桌面模拟点击/滑动）-->
+        <service
+            android:name=".relay.TouchControlService"
+            android:exported="false"
+            android:label="@string/accessibility_touch_service_name"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+        <!--点亮屏幕Activity（透明，远程点亮被控端屏幕并解锁）-->
+        <activity
+            android:name=".activity.WakeUpActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:screenOrientation="portrait"
+            android:theme="@style/DialogTheme"
+            tools:ignore="DiscouragedApi" />
         <service
             android:name=".service.LocationService"
             android:enabled="true"

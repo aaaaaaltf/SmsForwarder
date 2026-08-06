@@ -241,6 +241,8 @@ const val SP_CLIENT_SIGN_KEY = "client_sign_key"
 const val SP_RELAY_HOST = "relay_host"
 const val SP_RELAY_SERVER_PORT = "relay_server_port"
 const val SP_RELAY_CONTROLLER_PORT = "relay_controller_port"
+/** ★ ZeroTier直连模式开关（true=被控端监听56786接受控制端直连，false=传统中继模式） */
+const val SP_RELAY_DIRECT_MODE = "relay_direct_mode"
 const val SP_RELAY_ENABLE_SERVER_AUTORUN = "relay_enable_server_autorun"
 
 

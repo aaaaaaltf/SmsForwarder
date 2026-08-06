@@ -39,6 +39,16 @@
             android:text="@string/camera_preview_screenshot" />
 
         <com.xuexiang.xui.widget.button.ButtonView
+            android:id="@+id/btn_screen_wakeup"
+            style="@style/ButtonView.Blue"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="12dp"
+            android:paddingStart="20dp"
+            android:paddingEnd="20dp"
+            android:text="@string/wakeup_screen" />
+
+        <com.xuexiang.xui.widget.button.ButtonView
             android:id="@+id/btn_screen_close"
             style="@style/ButtonView.Blue"
             android:layout_width="wrap_content"

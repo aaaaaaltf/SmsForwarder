@@ -73,6 +73,8 @@ CMD_SYS_STATUS_STR = "sfsys0000000"
 SYS_CTRL_ON = "ctrlon"
 SYS_CTRL_OFF = "ctrloff"
 CMD_PING_STR = "sfping000000"
+# ★ 被控端设备状态上报（手机被控端→广播给所有手机控制端）：负载 名称|锁屏|屏幕|电量|充电
+CMD_DEV_STATE_STR = "devstate0000"
 
 # ★ 分块确认传输命令
 CMD_BLOCK_START_STR  = "blkstr000000"  # 开始分块传输(转发给stream owner)
@@ -286,6 +288,8 @@ class RelayServer:
             controllers = list(self._controllers.items())
             pc_ids_sorted = sorted(self._pc_clients.keys()) if self._pc_clients else []
         is_first_pc = pc_ids_sorted and pc_ids_sorted[0] == pc_id
+        # ★ 设备类型标签：PC被控端(56784) / 手机被控端(56786)，供手机控制端区分
+        dev_label = 'PC被控端' if client_type != "PHONE_PC" else '手机被控端'
 
         dead_controllers = []
         for cid, info in controllers:
@@ -293,7 +297,7 @@ class RelayServer:
                 if info["type"] == "PHONE":
                     frame = self._build_frame_with_pcid(
                         BROADCAST_PC_ID, CMD_CLIENT_ONLINE,
-                        f'PC被控端#{pc_id}已上线|{pc_addr[0]}'
+                        f'{dev_label}#{pc_id}已上线|{pc_addr[0]}'
                     )
                 else:
                     # PC_SERVER兼容模式：只通知第一个PC
@@ -496,6 +500,16 @@ class RelayServer:
                                             dead_controllers.append(cid)
                             except (ConnectionResetError, BrokenPipeError, OSError) as e:
                                 dead_controllers.append(cid)
+                    elif cmd_str == CMD_DEV_STATE_STR:
+                        # ★ 被控端设备状态上报：广播给所有PHONE控制器（实时状态，所有手机控制端都需要）
+                        for cid, info in controllers:
+                            try:
+                                if info["type"] == "PHONE":
+                                    frame_with_pcid = self._pack_with_pcid(pc_id, frame_data)
+                                    if not self._send_to_controller(cid, frame_with_pcid):
+                                        dead_controllers.append(cid)
+                            except (ConnectionResetError, BrokenPipeError, OSError) as e:
+                                dead_controllers.append(cid)
                     elif cmd_str in STREAM_RESPONSE_CMDS:
                         # 流式响应：转发给stream owner（发起流式操作的控制器）
                         # ★ 关键修复：只有当stream_owner对应的控制器**仍处于活跃连接**时才转发
@@ -587,6 +601,8 @@ class RelayServer:
 
         # PC断开，清理并通知控制器
         was_first_pc = False
+        # ★ 记录断开设备的类型（删除前取值，供下线通知区分PC/手机）
+        disconnected_type = self._pc_clients.get(pc_id, {}).get("type", "PC")
         with self._cmd_lock:
             # 先判断是不是第一个PC（用于兼容模式通知）
             pc_ids_sorted = sorted(self._pc_clients.keys()) if self._pc_clients else []
@@ -605,9 +621,10 @@ class RelayServer:
         for cid, info in controllers:
             try:
                 if info["type"] == "PHONE":
+                    dev_label = 'PC被控端' if disconnected_type != "PHONE_PC" else '手机被控端'
                     frame = self._build_frame_with_pcid(
                         BROADCAST_PC_ID, CMD_CLIENT_DISCONNECT,
-                        f'PC被控端#{pc_id}已断开'
+                        f'{dev_label}#{pc_id}已断开'
                     )
                 else:
                     # PC_SERVER兼容模式：只有第一个PC断开才通知
@@ -691,9 +708,11 @@ class RelayServer:
         if ctrl_type == "PHONE":
             for pc_id, pc_info in pc_list:
                 try:
+                    # ★ 按设备类型标注：手机被控端(56786)与PC被控端(56784)区分
+                    dev_label = 'PC被控端' if pc_info.get("type") != "PHONE_PC" else '手机被控端'
                     frame = self._build_frame_with_pcid(
                         BROADCAST_PC_ID, CMD_CLIENT_ONLINE,
-                        f'PC被控端#{pc_id}已上线|{pc_info["addr"][0]}'
+                        f'{dev_label}#{pc_id}已上线|{pc_info["addr"][0]}'
                     )
                     # ★ 修复：通过send_queue发送，避免竞态
                     self._send_to_controller(ctrl_id, frame)

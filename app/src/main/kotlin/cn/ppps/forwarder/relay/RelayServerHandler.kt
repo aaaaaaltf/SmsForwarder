@@ -5,7 +5,7 @@ import android.content.ContentValues
 import android.content.Intent
 import android.content.IntentFilter
 import android.provider.ContactsContract
-import android.util.Log
+import cn.ppps.forwarder.utils.Log
 import cn.ppps.forwarder.App
 import cn.ppps.forwarder.entity.BatteryInfo
 import cn.ppps.forwarder.entity.CallInfo
@@ -25,6 +25,7 @@ import cn.ppps.forwarder.utils.PhoneUtils
 import cn.ppps.forwarder.utils.RelaySettings
 import cn.ppps.forwarder.utils.SettingUtils
 import com.xuexiang.xutil.XUtil
+import java.io.File
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -36,6 +37,40 @@ import java.util.Locale
  */
 object RelayServerHandler {
     private const val TAG = "RelayServerHandler"
+
+    /** ★ 命令来源通道常量：供ScreenStreamManager等按通道决定推流模式 */
+    const val CHANNEL_RELAY = 0    // 命令经中继连接到达（被控端→中继56786）
+    const val CHANNEL_DIRECT = 1   // 命令经直连监听(56786)到达（控制端ZT/局域网直连）
+    const val CHANNEL_ZT = 2       // 命令经ZT直连(56789)到达（被控端主动连接控制端）
+
+    /** ★ ZT直连启动器（由RelayServerService设置，触发后主动连接控制端56789） */
+    var ztDirectLauncher: ((phoneIp: String, port: Int) -> Unit)? = null
+
+    /** ★ 本机ZeroTier IP缓存（60秒） */
+    private var ownZtIpsCache: Set<String>? = null
+    private var ownZtIpsCacheTime = 0L
+
+    /** 获取本机ZeroTier IP（172.2x网段，与PC被控端逻辑一致） */
+    fun getOwnZtIps(): Set<String> {
+        val now = System.currentTimeMillis()
+        if (ownZtIpsCache != null && now - ownZtIpsCacheTime < 60000) return ownZtIpsCache!!
+        val ips = LinkedHashSet<String>()
+        try {
+            java.util.Collections.list(java.net.NetworkInterface.getNetworkInterfaces()).forEach { ni ->
+                java.util.Collections.list(ni.inetAddresses).forEach { addr ->
+                    val ip = addr.hostAddress ?: return@forEach
+                    if (!addr.isLoopbackAddress && ip.startsWith("172.2")) {
+                        ips.add(ip)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "获取本机ZT IP失败: ${e.message}")
+        }
+        ownZtIpsCache = ips
+        ownZtIpsCacheTime = now
+        return ips
+    }
 
     private fun success(data: Any?): String {
         val resp = BaseResponse<Any?>(
@@ -61,13 +96,33 @@ object RelayServerHandler {
 
     /**
      * 处理收到的命令
+     * @param channel 命令来源通道：CHANNEL_RELAY / CHANNEL_DIRECT / CHANNEL_ZT（供屏幕推流模式选择）
+     * @param sender 命令来源通道的发送器（★ 2026-08-06新增：文件下载等二进制推送用，由RelayServerService传入）
      * @return (响应命令, 响应负载JSON)，未知命令返回 null
      */
-    fun handle(cmd: String, payload: ByteArray): Pair<String, String>? {
+    fun handle(cmd: String, payload: ByteArray, channel: Int = CHANNEL_RELAY,
+               sender: RelaySender? = null): Pair<String, String>? {
         val payloadText = String(payload, Charsets.UTF_8)
         return try {
             when (cmd) {
                 RelayCommands.CMD_GET_CONFIG -> RelayCommands.RSP_CONFIG to success(handleConfig())
+
+                // ★ ZeroTier直连请求（中继在线时触发）：负载 "目标ZT IP|控制端ZT IP|端口"
+                RelayCommands.CMD_ZT_DIRECT_CONNECT -> {
+                    val parts = payloadText.split("|")
+                    if (parts.size >= 3) {
+                        val targetIp = parts[0].trim()
+                        val phoneIp = parts[1].trim()
+                        val port = parts.getOrNull(2)?.trim()?.toIntOrNull() ?: RelayCommands.ZT_DIRECT_PORT
+                        if (targetIp in getOwnZtIps()) {
+                            Log.i(TAG, "★ 收到ZT直连请求，目标匹配本机，主动连接控制端 $phoneIp:$port")
+                            ztDirectLauncher?.invoke(phoneIp, port)
+                        } else {
+                            Log.i(TAG, "ZT直连目标 $targetIp 不是本机 (本机: ${getOwnZtIps()})，忽略")
+                        }
+                    }
+                    null  // 直连触发无需响应
+                }
 
                 RelayCommands.CMD_PING -> {
                     // ★ 心跳探测：响应 pong（同时保持中继链路活跃，防止NAT超时断连）
@@ -77,6 +132,21 @@ object RelayServerHandler {
                 RelayCommands.CMD_BATTERY -> {
                     if (!HttpServerUtils.enableApiBatteryQuery) return RelayCommands.RSP_BATTERY to error("服务端已禁用该功能")
                     RelayCommands.RSP_BATTERY to success(handleBattery())
+                }
+
+                // ==================== 文件系统（2026-08-06新增） ====================
+                RelayCommands.CMD_FS_LIST -> {
+                    RelayCommands.RSP_FS_LIST to handleFsList(payloadText)
+                }
+
+                RelayCommands.CMD_FS_DELETE -> {
+                    RelayCommands.RSP_FS_DELETE to handleFsDelete(payloadText)
+                }
+
+                RelayCommands.CMD_FS_GET -> {
+                    // ★ 下载：启动后台线程推送（RSP_FS_GET → CMD_FS_DATA分块 → CMD_FS_DONE），此处不返回
+                    startFsDownload(payloadText, sender)
+                    null
                 }
 
                 RelayCommands.CMD_SMS_QUERY -> {
@@ -155,7 +225,8 @@ object RelayServerHandler {
                     val fps = parts.getOrNull(2)?.toIntOrNull() ?: 15
                     val quality = parts.getOrNull(4)?.toIntOrNull() ?: 50
                     val clientId = parts.getOrNull(5)?.toIntOrNull() ?: -1
-                    val ok = ScreenStreamManager.startStream(RelaySettings.relayHost, clientId, fps, quality)
+                    // ★ 按命令来源通道决定推流模式（中继→PUSHER；直连/ZT→监听56788）
+                    val ok = ScreenStreamManager.startStream(RelaySettings.relayHost, clientId, fps, quality, channel)
                     if (ok) {
                         RelayCommands.RSP_RD_START_ACK to RelayCommands.RELAY_VIDEO_PORT.toString()
                     } else {
@@ -166,6 +237,101 @@ object RelayServerHandler {
                 RelayCommands.CMD_RD_STOP -> {
                     ScreenStreamManager.stop()
                     RelayCommands.RSP_RD_START_ACK to success("success")
+                }
+
+                // ==================== 远程触摸操控（无障碍手势注入） ====================
+                RelayCommands.CMD_RD_MOUSE_DOWN -> {
+                    touchUnavailable() ?: run {
+                        val (nx, ny) = parseCoords(payloadText)
+                        TouchControlService.instance?.touchDown(nx, ny)
+                        null
+                    }
+                }
+
+                RelayCommands.CMD_RD_MOUSE_MOVE -> {
+                    touchUnavailable() ?: run {
+                        val (nx, ny) = parseCoords(payloadText)
+                        TouchControlService.instance?.touchMove(nx, ny)
+                        null
+                    }
+                }
+
+                RelayCommands.CMD_RD_MOUSE_UP -> {
+                    touchUnavailable() ?: run {
+                        val (nx, ny) = parseCoords(payloadText)
+                        TouchControlService.instance?.touchUp(nx, ny)
+                        null
+                    }
+                }
+
+                RelayCommands.CMD_RD_MOUSE_DBL -> {
+                    touchUnavailable() ?: run {
+                        val (nx, ny) = parseCoords(payloadText)
+                        val svc = TouchControlService.instance
+                        if (svc != null) {
+                            val metrics = App.context.resources.displayMetrics
+                            svc.tap(nx * metrics.widthPixels, ny * metrics.heightPixels)
+                            Thread.sleep(50)
+                            svc.tap(nx * metrics.widthPixels, ny * metrics.heightPixels)
+                        }
+                        null
+                    }
+                }
+
+                RelayCommands.CMD_RD_MOUSE_WHEEL -> {
+                    touchUnavailable() ?: run {
+                        val delta = payloadText.trim().toIntOrNull() ?: 0
+                        val svc = TouchControlService.instance
+                        if (svc != null) {
+                            val metrics = App.context.resources.displayMetrics
+                            val cx = metrics.widthPixels / 2f
+                            val cy = metrics.heightPixels / 2f
+                            val dy = delta * 200
+                            svc.swipe(cx, cy, cx, cy - dy, 300)
+                        }
+                        null
+                    }
+                }
+
+                // ==================== 点亮屏幕解锁 ====================
+                RelayCommands.CMD_WAKEUP_SCREEN -> {
+                    // ★ 改用悬浮窗方案：MIUI/Android10+ 拦截后台启动Activity，悬浮窗可正常点亮
+                    val ok = ScreenLighter.lightUp(App.context)
+                    if (ok) {
+                        Log.i(TAG, "已执行点亮屏幕")
+                        // ★ 返回执行结果给控制端，让控制端显示成功/失败
+                        RelayCommands.RSP_SCREEN_CTRL to "1|success|点亮屏幕成功"
+                    } else {
+                        RelayCommands.RSP_ERROR to error("被控端未授予悬浮窗权限（显示在其他应用上层），无法点亮屏幕，请在系统设置中开启")
+                    }
+                }
+
+                // ==================== 熄灭屏幕 ====================
+                RelayCommands.CMD_SCREEN_OFF -> {
+                    // ★ 通过无障碍服务执行全局锁屏动作熄灭屏幕（等同电源键锁屏）
+                    val svc = TouchControlService.instance
+                    if (svc == null) {
+                        RelayCommands.RSP_ERROR to error("被控端未开启远程触摸（无障碍）服务，请在系统设置-无障碍中开启后重试")
+                    } else {
+                        val ok = svc.screenOff()
+                        if (ok) {
+                            Log.i(TAG, "已执行熄屏")
+                            // ★ 返回执行结果给控制端
+                            RelayCommands.RSP_SCREEN_CTRL to "1|success|熄屏成功"
+                        } else {
+                            RelayCommands.RSP_ERROR to error("熄屏失败：系统版本过低或无障碍服务异常")
+                        }
+                    }
+                }
+
+                // ==================== 版本确认（PC协议兼容，控制端用于确认被控端在线） ====================
+                RelayCommands.CMD_GET_VERSION -> {
+                    val versionName = try { AppUtils.getAppVersionName() } catch (_: Exception) { "1.0" }
+                    val deviceName = try {
+                        (android.os.Build.MANUFACTURER + " " + android.os.Build.MODEL).trim()
+                    } catch (_: Exception) { "Android" }
+                    // 负载格式与PC被控端一致: 版本|设备名|用户|isAdmin|isService（纯ASCII，编码安全）
+                    RelayCommands.CMD_VERSION_INFO to "$versionName|$deviceName|Android|0|0"
                 }
 
                 RelayCommands.CMD_CAMERA_STREAM_START -> {
@@ -207,6 +373,27 @@ object RelayServerHandler {
         }
     }
 
+    /** 解析归一化坐标负载 "x|y"（0.0~1.0），非法返回 (0,0) */
+    private fun parseCoords(text: String): Pair<Float, Float> {
+        val parts = text.trim().split("|")
+        if (parts.size < 2) return 0f to 0f
+        val x = parts[0].toFloatOrNull()?.coerceIn(0f, 1f) ?: 0f
+        val y = parts[1].toFloatOrNull()?.coerceIn(0f, 1f) ?: 0f
+        return x to y
+    }
+
+    /**
+     * 触摸服务可用性检查：无障碍服务未开启时返回错误响应（明确原因提示控制端）
+     * @return null=服务可用；非null=错误响应(命令, JSON)
+     */
+    private fun touchUnavailable(): Pair<String, String>? {
+        return if (TouchControlService.instance == null) {
+            RelayCommands.RSP_ERROR to error("被控端未开启远程触摸（无障碍）服务，请在系统设置-无障碍中开启后重试")
+        } else {
+            null
+        }
+    }
+
     private fun handleConfig(): ConfigData {
         // 获取卡槽信息
         if (App.SimInfoList.isEmpty()) {
@@ -235,6 +422,158 @@ object RelayServerHandler {
         val intentFilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
         val intent: Intent? = App.context.registerReceiver(null, intentFilter)
         return BatteryUtils.getBatteryInfo(intent)
+    }
+
+    // ==================== 文件系统（2026-08-06新增） ====================
+
+    /** 默认根目录：/storage/emulated/0（Download目录的父目录） */
+    private val FS_DEFAULT_ROOT = "/storage/emulated/0"
+
+    /** 图库目录：根目录顶部"图库"条目点击后直接进入的目录（手机相机相册，与系统相册一致） */
+    private val FS_GALLERY_DIR = "/storage/emulated/0/DCIM/Camera"
+
+    /**
+     * 过滤系统/隐藏/无权限目录：隐藏目录(.开头)、Android系统目录、不可读目录
+     * 根目录下不显示这些目录，避免用户误操作或看到无意义的系统目录
+     */
+    private fun isFsVisibleDir(f: File): Boolean {
+        if (f.isHidden) return false
+        if (f.name == "Android") return false
+        return f.canRead()
+    }
+
+    /**
+     * 列目录：负载=目录路径（空=默认根 /storage/emulated/0）
+     * 根目录列表最前面插入"图库"特殊条目（点击直接进入图库目录）
+     * @return JSON数组字符串 [{name,type,size,mtime,path},...]，type=D目录/F文件
+     */
+    private fun handleFsList(path: String): String {
+        val dir = if (path.trim().isEmpty()) FS_DEFAULT_ROOT else path.trim()
+        val file = File(dir)
+        if (!file.exists() || !file.isDirectory) {
+            return "[]"
+        }
+        val list = ArrayList<Map<String, Any>>()
+        // ★ 根目录最上面加"图库"目录，点击直接进入图库目录
+        if (file.absolutePath == FS_DEFAULT_ROOT) {
+            list.add(linkedMapOf(
+                "name" to "图库",
+                "type" to "D",
+                "size" to 0L,
+                "mtime" to 0L,
+                "path" to FS_GALLERY_DIR
+            ))
+        }
+        try {
+            val children = file.listFiles() ?: return fsJson(list)
+            // 目录在前、文件在后，各自按名称排序（目录优先，与PC文件管理器一致）
+            // 目录需过滤系统/隐藏/无权限目录
+            children.filter { it.isDirectory && isFsVisibleDir(it) }.sortedBy { it.name.lowercase() }.forEach {
+                list.add(linkedMapOf(
+                    "name" to it.name,
+                    "type" to "D",
+                    "size" to 0L,
+                    "mtime" to it.lastModified(),
+                    "path" to it.absolutePath
+                ))
+            }
+            children.filter { it.isFile }.sortedBy { it.name.lowercase() }.forEach {
+                list.add(linkedMapOf(
+                    "name" to it.name,
+                    "type" to "F",
+                    "size" to it.length(),
+                    "mtime" to it.lastModified(),
+                    "path" to it.absolutePath
+                ))
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "列目录异常: $dir ${e.message}")
+        }
+        return fsJson(list)
+    }
+
+    private fun fsJson(list: List<Map<String, Any>>): String {
+        return try {
+            RelayClientHolder.gson.toJson(list)
+        } catch (e: Exception) {
+            "[]"
+        }
+    }
+
+    /**
+     * 删除文件/目录（目录递归删除）
+     * @return "1|success|信息" 或 "0|failed|原因"
+     */
+    private fun handleFsDelete(path: String): String {
+        val p = path.trim()
+        if (p.isEmpty()) return "0|failed|路径为空"
+        val f = File(p)
+        if (!f.exists()) return "0|failed|文件或目录不存在"
+        if (p == FS_DEFAULT_ROOT || p == FS_GALLERY_DIR || p == "/") {
+            return "0|failed|系统目录不允许删除"
+        }
+        return try {
+            if (deleteRecursively(f)) "1|success|删除成功" else "0|failed|删除失败"
+        } catch (e: Exception) {
+            Log.w(TAG, "删除失败: $p ${e.message}")
+            "0|failed|${e.message ?: "删除失败"}"
+        }
+    }
+
+    private fun deleteRecursively(f: File): Boolean {
+        return if (f.isDirectory) {
+            val children = f.listFiles() ?: return f.delete()
+            for (c in children) {
+                if (!deleteRecursively(c)) return false
+            }
+            f.delete()
+        } else {
+            f.delete()
+        }
+    }
+
+    /**
+     * 启动文件下载（后台线程）：RSP_FS_GET(大小|文件名|状态) → CMD_FS_DATA分块(128KB) → CMD_FS_DONE
+     * 通过命令来源通道sender（中继client/直连listener/ZT直连）推送数据。
+     */
+    private fun startFsDownload(path: String, sender: RelaySender?) {
+        if (sender == null) {
+            Log.w(TAG, "文件下载失败: sender为空，无法推送数据")
+            return
+        }
+        val p = path.trim()
+        val f = File(p)
+        if (!f.exists()) {
+            sender.send(RelayCommands.RSP_FS_GET, "0||not_found")
+            return
+        }
+        if (f.isDirectory) {
+            sender.send(RelayCommands.RSP_FS_GET, "0||error")
+            return
+        }
+        Thread({
+            try {
+                val total = f.length()
+                sender.send(RelayCommands.RSP_FS_GET, "$total|${f.name}|ok")
+                val buf = ByteArray(128 * 1024)
+                f.inputStream().use { ins ->
+                    while (true) {
+                        val n = ins.read(buf)
+                        if (n <= 0) break
+                        val chunk = if (n == buf.size) buf else buf.copyOf(n)
+                        sender.send(RelayCommands.CMD_FS_DATA, chunk)
+                    }
+                }
+                sender.send(RelayCommands.CMD_FS_DONE, "")
+                Log.i(TAG, "文件下载完成: $p (${total}字节)")
+            } catch (e: Exception) {
+                Log.w(TAG, "文件下载异常: $p ${e.message}")
+                try {
+                    sender.send(RelayCommands.RSP_FS_GET, "0||error")
+                } catch (ignored: Exception) {
+                }
+            }
+        }, "FsDownload").apply { isDaemon = true }.start()
     }
 
     private fun handleLocation(): LocationInfo {

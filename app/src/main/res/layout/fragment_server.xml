@@ -468,6 +468,45 @@
 
             </LinearLayout>
 
+            <!--远程触摸（无障碍服务）-->
+            <LinearLayout
+                style="@style/BarStyle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content">
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="@string/accessibility_touch_service_name"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/tv_touch_status"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="@string/touch_service_disabled"
+                        android:textSize="@dimen/text_size_mini"
+                        tools:ignore="SmallSp" />
+
+                </LinearLayout>
+
+                <com.xuexiang.xui.widget.button.ButtonView
+                    android:id="@+id/btn_enable_touch"
+                    style="@style/ButtonView.Blue"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:minWidth="110dp"
+                    android:padding="5dp"
+                    android:text="@string/enable_accessibility_touch" />
+
+            </LinearLayout>
+
             <LinearLayout
                 style="@style/BarStyle"
                 android:layout_width="match_parent"

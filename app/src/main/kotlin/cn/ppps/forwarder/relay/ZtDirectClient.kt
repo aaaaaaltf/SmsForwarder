@@ -8,36 +8,27 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 /**
- * 被控端命令发送器统一接口
- * RelayServerClient（中继模式）与 RelayServerListener（ZeroTier直连模式）均实现，
- * 供 CameraStreamManager 等模块透明使用。
- */
-interface RelaySender {
-    fun isConnected(): Boolean
-    fun send(cmd: String, payload: ByteArray)
-    fun send(cmd: String, payload: String)
-}
-
-/**
- * 被控端中继客户端
- * 主动连接中继服务 56786 端口（本项目专用端口），
- * 接收控制端通过中继转发的命令并发送响应。
+ * ★ ZeroTier直连客户端（被控端侧，2026-08-04新增）
  *
- * 帧格式: [4字节大端长度][12字节命令][负载]
+ * 主动连接手机控制端的 ZT IP:56789（DirectHostServer，参照PC被控端↔PC控制端逻辑）。
+ * 用于中继服务关闭时，被控端仍可通过 ZeroTier 直连接收控制端命令。
+ *
+ * 帧格式与中继一致: [4字节大端长度][12字节命令][负载]
+ * 命令处理复用 RelayServerHandler，响应通过本直连通道回传。
  */
-class RelayServerClient(
+class ZtDirectClient(
     private val host: String,
     private val port: Int,
     private val onConnected: () -> Unit,
     private val onDisconnected: () -> Unit,
     private val onCommand: (cmd: String, payload: ByteArray) -> Unit,
 ) : RelaySender {
-    private val TAG = "RelayServerClient"
+    private val TAG = "ZtDirectClient"
     private val sendLock = Any()
 
     /** ★ 专用发送线程：所有socket写操作必须在后台线程执行，禁止主线程直发 */
     private val sendExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "RelayServerSend").apply { isDaemon = true }
+        Thread(r, "ZtDirectSend").apply { isDaemon = true }
     }
 
     @Volatile
@@ -45,6 +36,9 @@ class RelayServerClient(
     @Volatile
     private var running = false
     private var thread: Thread? = null
+
+    /** ★ 最多重连次数：触发后保持一段时间窗口（每5秒1次），连接建立后重置 */
+    private val maxReconnect = 20
 
     override fun isConnected(): Boolean {
         val s = socket ?: return false
@@ -54,7 +48,7 @@ class RelayServerClient(
     fun start() {
         if (running) return
         running = true
-        thread = Thread({ connectLoop() }, "RelayServerConnect").apply { isDaemon = true }.also { it.start() }
+        thread = Thread({ connectLoop() }, "ZtDirectConnect").apply { isDaemon = true }.also { it.start() }
     }
 
     fun stop() {
@@ -68,7 +62,8 @@ class RelayServerClient(
     }
 
     private fun connectLoop() {
-        while (running) {
+        var retries = 0
+        while (running && retries < maxReconnect) {
             try {
                 val s = Socket()
                 s.tcpNoDelay = true
@@ -81,21 +76,24 @@ class RelayServerClient(
                     return
                 }
                 socket = s
-                Log.i(TAG, "已连接中继服务 $host:$port")
+                retries = 0
+                Log.i(TAG, "★ ZT直连成功: $host:$port")
                 onConnected()
                 receiveLoop(s)
             } catch (e: Exception) {
-                if (running) Log.w(TAG, "连接中继失败: ${e.message}")
+                if (running) Log.w(TAG, "ZT直连失败(${e.message})，剩余重试=${maxReconnect - retries - 1}")
             }
             socket = null
             if (running) onDisconnected()
-            if (running) {
+            retries++
+            if (running && retries < maxReconnect) {
                 try {
                     Thread.sleep(5000)
                 } catch (_: InterruptedException) {
                 }
             }
         }
+        if (running) Log.w(TAG, "ZT直连停止重试（已达最大次数）")
     }
 
     private fun receiveLoop(s: Socket) {
@@ -125,12 +123,12 @@ class RelayServerClient(
                 }
             }
         } catch (e: IOException) {
-            if (running) Log.w(TAG, "接收中断: ${e.message}")
+            if (running) Log.w(TAG, "ZT直连接收中断: ${e.message}")
         }
     }
 
     /**
-     * 发送命令响应（★ 网络写入在后台发送线程执行，禁止主线程直发）
+     * 发送命令响应（网络写入在后台发送线程执行）
      * @param cmd 12字节命令前缀
      * @param payload 负载（UTF-8）
      */
@@ -146,8 +144,7 @@ class RelayServerClient(
                         out.flush()
                     }
                 } catch (e: Exception) {
-                    Log.w(TAG, "发送失败: ${e.javaClass.simpleName}: ${e.message}，关闭socket触发自动重连")
-                    // ★ 发送失败说明连接已失效：关闭socket，connectLoop 检测到接收中断后自动重连
+                    Log.w(TAG, "ZT直连发送失败: ${e.javaClass.simpleName}: ${e.message}，关闭socket触发重连")
                     try {
                         s.close()
                     } catch (_: Exception) {
@@ -155,7 +152,7 @@ class RelayServerClient(
                 }
             }
         } catch (e: Exception) {
-            Log.w(TAG, "提交发送任务失败: ${e.message}")
+            Log.w(TAG, "提交ZT直连发送任务失败: ${e.message}")
         }
     }
 

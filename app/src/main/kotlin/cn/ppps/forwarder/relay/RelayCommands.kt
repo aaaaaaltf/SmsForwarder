@@ -44,6 +44,45 @@ object RelayCommands {
     /** 屏幕推流启动确认（负载: 推流端口） */
     const val RSP_RD_START_ACK = "rdack0000000"
 
+    // ==================== 远程触摸操控（控制端→被控端，负载: 归一化坐标 "x|y" 0.0~1.0） ====================
+    /** 触摸按下 */
+    const val CMD_RD_MOUSE_DOWN = "md0000000000"
+
+    /** 触摸移动 */
+    const val CMD_RD_MOUSE_MOVE = "mm0000000000"
+
+    /** 触摸抬起（被控端根据拖动距离判定点击或滑动） */
+    const val CMD_RD_MOUSE_UP = "mu0000000000"
+
+    /** 双击 */
+    const val CMD_RD_MOUSE_DBL = "mdb000000000"
+
+    /** 滚轮（负载: 增量数字） */
+    const val CMD_RD_MOUSE_WHEEL = "mw0000000000"
+
+    // ==================== 点亮/熄灭屏幕（控制端→被控端） ====================
+    /** 点亮被控端屏幕并解锁（无密码锁屏），负载可为空 */
+    const val CMD_WAKEUP_SCREEN = "wakeup000000"
+
+    /** 熄灭屏幕（亮屏时执行全局锁屏动作，屏幕立即熄灭），负载可为空 */
+    const val CMD_SCREEN_OFF = "scroff000000"
+
+    /** 熄屏/点亮屏幕执行结果响应（负载: 1|success|成功信息 或 0|failed|失败原因） */
+    const val RSP_SCREEN_CTRL = "sfscreen0000"
+
+    // ==================== ZeroTier直连（中继关闭时被控端主动连接控制端56789） ====================
+    /** ZeroTier直连请求（控制端→被控端，负载: 目标ZT IP|控制端ZT IP|端口） */
+    const val CMD_ZT_DIRECT_CONNECT = "ztdirect0000"
+
+    /** 手机控制端ZT直连监听端口（DirectHostServer） */
+    const val ZT_DIRECT_PORT = 56789
+
+    /** PC协议版本查询（控制端用于确认被控端在线，兼容PC被控端协议） */
+    const val CMD_GET_VERSION = "ver000000000"
+
+    /** 版本信息响应（负载: 版本|设备名|用户|isAdmin|isService，ASCII内容GBK/UTF-8解码一致） */
+    const val CMD_VERSION_INFO = "ver100000000"
+
     // ==================== 摄像头（被控端摄像头推流，图像仅推送到控制端，不显示在被控端屏幕） ====================
     /** 启动摄像头流（负载: 摄像头索引） */
     const val CMD_CAMERA_STREAM_START = "vcdstr000000"
@@ -91,6 +130,31 @@ object RelayCommands {
     /** 一键换新机-推送配置（负载: "push|" + CloneInfo JSON） */
     const val CMD_CLONE_PUSH = "sfclone10000"
 
+    // ==================== 文件系统（控制端→被控端，2026-08-06新增） ====================
+    /** 列目录（负载: 目录路径；空负载=默认根目录 Download 父目录 /storage/emulated/0） */
+    const val CMD_FS_LIST = "sflsdir00000"
+
+    /** 删除文件/目录（负载: 路径） */
+    const val CMD_FS_DELETE = "sfdel0000000"
+
+    /** 下载文件（负载: 路径，被控端先回 RSP_FS_GET 再分块推送 CMD_FS_DATA → CMD_FS_DONE） */
+    const val CMD_FS_GET = "sfget0000000"
+
+    /** 列目录响应（负载: JSON数组 [{name,type,size,mtime,path},...]） */
+    const val RSP_FS_LIST = "sflsrsp00000"
+
+    /** 删除响应（负载: 1|success|信息 或 0|failed|原因） */
+    const val RSP_FS_DELETE = "sfdelrsp0000"
+
+    /** 下载响应（负载: 大小|文件名|状态，状态=ok/not_found/error） */
+    const val RSP_FS_GET = "sfgetrsp0000"
+
+    /** 下载数据分块（二进制负载，被控端→控制端） */
+    const val CMD_FS_DATA = "sfdata000000"
+
+    /** 下载完成（被控端→控制端） */
+    const val CMD_FS_DONE = "sfdone000000"
+
     // ==================== 被控端 → 控制端（响应命令） ====================
     const val RSP_CONFIG = "sfcfgrsp0000"
     /** 心跳探测响应 */
@@ -121,6 +185,10 @@ object RelayCommands {
 
     /** 系统状态：手机控制端已断开中继 */
     const val SYS_CTRL_OFF = "ctrloff"
+
+    // ==================== 被控端设备状态上报（被控端→中继→控制端） ====================
+    /** 设备状态上报：负载 "名称|锁屏|屏幕|电量|充电"（被控端每5秒发送，中继广播给所有手机控制端） */
+    const val CMD_DEV_STATE = "devstate0000"
 
     /**
      * 解析帧命令前缀

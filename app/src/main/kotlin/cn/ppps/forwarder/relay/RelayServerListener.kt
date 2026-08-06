@@ -1,0 +1,226 @@
+package cn.ppps.forwarder.relay
+
+import cn.ppps.forwarder.utils.Log
+import java.io.IOException
+import java.net.InetSocketAddress
+import java.net.ServerSocket
+import java.net.Socket
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
+
+/**
+ * 被控端直连监听器（ZeroTier 直连模式，无需中继云服务，2026-08-04 移植自 python_version_zerotier）
+ *
+ * 监听 0.0.0.0:56786，接受手机控制端直接 TCP 连接。
+ * ★ 2026-08-05 多连接改造：acceptLoop 不再阻塞（原实现 receiveLoop 阻塞在 accept 循环内，
+ *   单个控制端连接占住后，其他控制端（ZT/局域网）连接只完成 TCP 握手、永不 accept，命令无响应）。
+ *   现在每连接独立线程处理，命令响应按来源连接回发（sendTo），设备状态/视频帧单播给最新连接（send）。
+ * 帧格式与 RelayServerClient 完全一致：
+ *   [4字节大端长度][12字节命令][负载]
+ */
+class RelayServerListener(
+    private val port: Int,
+    private val onConnected: () -> Unit,
+    private val onDisconnected: () -> Unit,
+    private val onCommand: (connId: Long, cmd: String, payload: ByteArray) -> Unit,
+) : RelaySender {
+    private val TAG = "RelayServerListener"
+    private val sendLock = Any()
+    /** 发送失败日志限流（10秒内只打一次，避免断连时大量刷屏） */
+    private var lastSendErrorLog = 0L
+
+    /** ★ 专用发送线程：所有socket写操作必须在后台线程执行，禁止主线程直发 */
+    private val sendExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "RelaySrvSend").apply { isDaemon = true }
+    }
+
+    @Volatile
+    private var serverSocket: ServerSocket? = null
+
+    /** ★ 多连接：connId → Socket（每连接独立线程处理） */
+    private val connections = ConcurrentHashMap<Long, Socket>()
+    private val connIdGen = AtomicLong(0)
+
+    @Volatile
+    private var running = false
+    private var acceptThread: Thread? = null
+
+    override fun isConnected(): Boolean {
+        return connections.values.any { s ->
+            s.isConnected && !s.isClosed && !s.isInputShutdown && !s.isOutputShutdown
+        }
+    }
+
+    /** 是否有控制端已接入 */
+    fun hasController(): Boolean = isConnected()
+
+    fun start() {
+        if (running) return
+        running = true
+        acceptThread = Thread({ acceptLoop() }, "RelayServerAccept").apply { isDaemon = true }.also { it.start() }
+    }
+
+    fun stop() {
+        running = false
+        try {
+            serverSocket?.close()
+        } catch (_: Exception) {
+        }
+        serverSocket = null
+        connections.values.forEach {
+            try {
+                it.close()
+            } catch (_: Exception) {
+            }
+        }
+        connections.clear()
+        sendExecutor.shutdownNow()
+    }
+
+    private fun acceptLoop() {
+        try {
+            val ss = ServerSocket()
+            ss.reuseAddress = true
+            ss.bind(InetSocketAddress("0.0.0.0", port))
+            serverSocket = ss
+            Log.i(TAG, "被控端已监听端口 $port（ZeroTier直连模式），等待控制端接入...")
+            while (running && !ss.isClosed) {
+                val s = try {
+                    ss.accept()
+                } catch (e: IOException) {
+                    if (running) Log.w(TAG, "accept 中断: ${e.message}")
+                    break
+                }
+                s.tcpNoDelay = true
+                val id = connIdGen.incrementAndGet()
+                connections[id] = s
+                Log.i(TAG, "控制端已接入#$id: ${s.inetAddress.hostAddress}:$port")
+                onConnected()
+                // ★ 每连接独立线程处理，acceptLoop 立即返回继续接受新连接（多控制端并发）
+                Thread({ handleConnection(id, s) }, "RelaySrvConn-$id").apply {
+                    isDaemon = true
+                    start()
+                }
+            }
+        } catch (e: Exception) {
+            if (running) Log.e(TAG, "监听异常: ${e.message}")
+        } finally {
+            running = false
+        }
+    }
+
+    private fun handleConnection(id: Long, s: Socket) {
+        val input = try {
+            s.getInputStream()
+        } catch (e: IOException) {
+            connections.remove(id)
+            return
+        }
+        val streamBuffer = StreamBuffer()
+        val tmp = ByteArray(4096)
+        try {
+            while (running && !s.isClosed) {
+                val n = input.read(tmp)
+                if (n < 0) break
+                streamBuffer.append(tmp.copyOf(n))
+                while (true) {
+                    val frame = streamBuffer.readFrame() ?: break
+                    if (frame.size <= 4) continue
+                    val (cmd, payload) = RelayCommands.parse(frame.copyOfRange(4, frame.size))
+                    if (cmd.isNotEmpty()) {
+                        try {
+                            onCommand(id, cmd, payload)
+                        } catch (e: Exception) {
+                            Log.e(TAG, "处理命令异常: ${e.message}")
+                        }
+                    }
+                }
+            }
+        } catch (e: IOException) {
+            if (running) Log.w(TAG, "接收中断#$id: ${e.message}")
+        } finally {
+            connections.remove(id)
+            try {
+                s.close()
+            } catch (_: Exception) {
+            }
+            if (running) onDisconnected()
+        }
+    }
+
+    /** 发送给最新接入的连接（视频帧/心跳等单播用途，预览控制端通常为最新连接） */
+    override fun send(cmd: String, payload: ByteArray) {
+        val s = latestConnection() ?: return
+        enqueueSend(s, cmd, payload)
+    }
+
+    /** ★ 按来源连接回发命令响应（多控制端时保证响应发回正确的控制端） */
+    fun sendTo(connId: Long, cmd: String, payload: ByteArray) {
+        val s = connections[connId] ?: return
+        enqueueSend(s, cmd, payload)
+    }
+
+    fun sendTo(connId: Long, cmd: String, payload: String) {
+        sendTo(connId, cmd, payload.toByteArray(Charsets.UTF_8))
+    }
+
+    /** ★ 广播给所有已接入控制端（设备状态上报等） */
+    fun broadcast(cmd: String, payload: ByteArray) {
+        for (s in connections.values) {
+            enqueueSend(s, cmd, payload)
+        }
+    }
+
+    fun broadcast(cmd: String, payload: String) {
+        broadcast(cmd, payload.toByteArray(Charsets.UTF_8))
+    }
+
+    private fun latestConnection(): Socket? {
+        var best: Socket? = null
+        var bestId = Long.MIN_VALUE
+        for ((id, s) in connections) {
+            if (id > bestId && s.isConnected && !s.isClosed) {
+                bestId = id
+                best = s
+            }
+        }
+        return best
+    }
+
+    private fun enqueueSend(s: Socket, cmd: String, payload: ByteArray) {
+        if (s.isClosed || !s.isConnected) return
+        val frame = FrameCodec.encode(cmd.toByteArray(Charsets.US_ASCII) + payload)
+        try {
+            sendExecutor.execute {
+                // ★ 发送前校验：连接可能已被关闭（断连后积压任务对旧socket发送会报错）
+                if (s.isClosed || !s.isConnected) return@execute
+                try {
+                    synchronized(sendLock) {
+                        val out = s.getOutputStream()
+                        out.write(frame)
+                        out.flush()
+                    }
+                } catch (e: Exception) {
+                    // ★ 日志限流：断连瞬间大量积压任务会连续报错，10秒内仅记录一次
+                    val now = System.currentTimeMillis()
+                    if (now - lastSendErrorLog > 10000) {
+                        lastSendErrorLog = now
+                        Log.w(TAG, "发送失败: ${e.javaClass.simpleName}: ${e.message}，关闭连接")
+                    }
+                    try {
+                        s.close()
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "提交发送任务失败: ${e.message}")
+        }
+    }
+
+    override fun send(cmd: String, payload: String) {
+        send(cmd, payload.toByteArray(Charsets.UTF_8))
+    }
+}

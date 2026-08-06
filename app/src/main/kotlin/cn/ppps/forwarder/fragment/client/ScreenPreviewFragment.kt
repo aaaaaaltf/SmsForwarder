@@ -5,6 +5,7 @@ import android.graphics.BitmapFactory
 import android.os.Handler
 import android.os.Looper
 import android.view.LayoutInflater
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.ImageView
@@ -29,8 +30,10 @@ import java.net.Socket
  * 控制端 - 被控端屏幕预览（远程桌面）
  *
  * 1. 向被控端发送 rdstrt000000 启动屏幕推流（payload: 0|0|FPS|24|质量|pcId）
- * 2. 被控端以 PUSHER:pcId 推流到中继 56783 端口
- * 3. 本界面连接中继 56783 发送 LISTENER:pcId 配对，接收 [4字节大端JPEG长度][JPEG] 帧实时显示
+ * 2. 被控端以 PUSHER:pcId 推流到中继 56788 端口
+ * 3. 本界面连接中继 56788 发送 LISTENER:pcId 配对，接收 [4字节大端JPEG长度][JPEG] 帧实时显示
+ * 4. ★ 远程触摸操控：手指在预览画面上滑动/点击 → 发送 md/mm/mu 命令远程操控被控端
+ * 5. ★ 点亮屏幕：发送 wakeup000000 命令点亮被控端屏幕并解锁
  */
 @Suppress("PrivatePropertyName")
 @Page(name = "屏幕预览")
@@ -45,6 +48,11 @@ class ScreenPreviewFragment : BaseFragment<FragmentClientScreenPreviewBinding?>(
     private var videoSocket: Socket? = null
     private var connectThread: Thread? = null
     private var currentBitmap: Bitmap? = null
+
+    // 触摸坐标映射（fitCenter显示时的图像实际区域）
+    private var imageWidth = 0
+    private var imageHeight = 0
+    private var lastTouchSendTime = 0L
 
     override fun viewBindingInflate(
         inflater: LayoutInflater,
@@ -68,8 +76,69 @@ class ScreenPreviewFragment : BaseFragment<FragmentClientScreenPreviewBinding?>(
         }
         binding!!.btnScreenClose.setOnClickListener { popToBack() }
         binding!!.btnScreenScreenshot.setOnClickListener { saveScreenshot() }
+        binding!!.btnScreenWakeup.setOnClickListener { sendWakeup() }
+        // ★ 触摸操控：手指在预览画面上点击/滑动 → 远程操控被控端
+        binding!!.ivScreenPreview.setOnTouchListener { _, event ->
+            handleTouch(event)
+            true
+        }
         binding!!.tvScreenStatus.text = String.format(getString(R.string.screen_preview_starting), pcId)
         startRemoteDesktop()
+    }
+
+    /** 发送点亮屏幕命令 */
+    private fun sendWakeup() {
+        val client = RelayClientHolder.client
+        if (client == null || !client.isConnected()) {
+            XToastUtils.error(R.string.relay_need_connect_and_select)
+            return
+        }
+        client.send(pcId, RelayCommands.CMD_WAKEUP_SCREEN, ByteArray(0))
+        XToastUtils.toast(R.string.wakeup_screen_sent)
+    }
+
+    /** ★ 触摸事件处理：转换为归一化坐标发送 md/mm/mu 命令 */
+    private fun handleTouch(event: MotionEvent) {
+        val client = RelayClientHolder.client
+        if (client == null || !client.isConnected() || imageWidth <= 0 || imageHeight <= 0) return
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                val norm = toNormalized(event.x, event.y) ?: return
+                client.send(pcId, RelayCommands.CMD_RD_MOUSE_DOWN, "$norm.first|$norm.second".toByteArray(Charsets.UTF_8))
+            }
+            MotionEvent.ACTION_MOVE -> {
+                // 节流：每30ms发送一次移动
+                val now = System.currentTimeMillis()
+                if (now - lastTouchSendTime < 30) return
+                lastTouchSendTime = now
+                val norm = toNormalized(event.x, event.y) ?: return
+                client.send(pcId, RelayCommands.CMD_RD_MOUSE_MOVE, "$norm.first|$norm.second".toByteArray(Charsets.UTF_8))
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                val norm = toNormalized(event.x, event.y) ?: return
+                client.send(pcId, RelayCommands.CMD_RD_MOUSE_UP, "$norm.first|$norm.second".toByteArray(Charsets.UTF_8))
+            }
+        }
+    }
+
+    /**
+     * ★ 将触摸点映射为图像归一化坐标(0.0-1.0)
+     * ImageView使用fitCenter，需计算图像实际显示区域
+     */
+    private fun toNormalized(tx: Float, ty: Float): Pair<Float, Float>? {
+        val iv = binding!!.ivScreenPreview
+        val iw = iv.width
+        val ih = iv.height
+        if (iw <= 0 || ih <= 0 || imageWidth <= 0 || imageHeight <= 0) return null
+        val scale = Math.min(iw.toFloat() / imageWidth, ih.toFloat() / imageHeight)
+        val displayW = imageWidth * scale
+        val displayH = imageHeight * scale
+        val offsetX = (iw - displayW) / 2f
+        val offsetY = (ih - displayH) / 2f
+        val gx = (tx - offsetX) / displayW
+        val gy = (ty - offsetY) / displayH
+        if (gx < 0 || gx > 1 || gy < 0 || gy > 1) return null
+        return gx to gy
     }
 
     /** 发送启动命令并连接中继视频流端口 */
@@ -173,6 +242,8 @@ class ScreenPreviewFragment : BaseFragment<FragmentClientScreenPreviewBinding?>(
     private fun showFrame(bmp: Bitmap) {
         currentBitmap?.let { if (!it.isRecycled) it.recycle() }
         currentBitmap = bmp
+        imageWidth = bmp.width
+        imageHeight = bmp.height
         binding?.ivScreenPreview?.setImageBitmap(bmp)
         binding?.tvScreenStatus?.setText(String.format(getString(R.string.screen_preview_live), pcId))
     }
