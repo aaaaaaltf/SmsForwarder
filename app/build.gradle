@@ -5,9 +5,10 @@ import groovy.json.JsonSlurper
 plugins {
     id 'com.android.application'
     id 'kotlin-android'
-    id 'kotlin-kapt'
+    id 'com.google.devtools.ksp'
     id 'kotlin-parcelize'
-    id 'img-optimizer'
+    // ★ 2026-08-10 禁用 img-optimizer：新版本 AGP/Gradle 不兼容（报错 No such property: applicationVariants for class: java.lang.String）
+    // id 'img-optimizer'
     //AspectJX: https://github.com/wurensen/gradle_plugin_android_aspectjx
     //id "io.github.wurensen.android-aspectjx" version "3.3.2"
 }
@@ -42,8 +43,11 @@ gradle.projectsEvaluated {
     }
 }
 
+// ★ 已切换到 KSP (Kotlin Symbol Processing)，无需 kapt 配置
+// kapt 配置已移除，因为 JRE 21 不支持 kapt（需要 jdk.compiler 模块）
+
 android {
-    buildToolsVersion build_versions.build_tools
+    namespace 'cn.ppps.forwarder'
     compileSdkVersion build_versions.target_sdk
 
     testOptions {
@@ -51,12 +55,13 @@ android {
     }
 
     compileOptions {
-        sourceCompatibility JavaVersion.VERSION_1_8
-        targetCompatibility JavaVersion.VERSION_1_8
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
     }
 
     buildFeatures {
         viewBinding true
+        buildConfig true
     }
 
     //编译日期
@@ -67,7 +72,10 @@ android {
     def gitCommitId = getGitCommitId()
 
     defaultConfig {
-        applicationId "cn.ppps.forwarder"
+        //打包模式：-PappMode=controller 打包控制端，-PappMode=server 打包被控端（默认被控端）
+        def appMode = project.hasProperty('appMode') ? project.property('appMode').toString() : 'server'
+        // ★ 不同模式使用不同applicationId，支持同时安装被控端和控制端
+        applicationId appMode == 'controller' ? 'cn.ppps.forwarder.ctrl' : 'cn.ppps.forwarder'
         minSdkVersion build_versions.min_sdk
         targetSdkVersion build_versions.target_sdk
         versionCode build_versions.version_code
@@ -76,18 +84,13 @@ android {
         buildConfigField "String", "BUILD_TIME", "\"${buildTime}\""
         buildConfigField "String", "GIT_COMMIT_ID", "\"${gitCommitId}\""
 
-        //打包模式：-PappMode=controller 打包控制端，-PappMode=server 打包被控端（默认被控端）
-        def appMode = project.hasProperty('appMode') ? project.property('appMode').toString() : 'server'
         buildConfigField "String", "APP_MODE", "\"${appMode}\""
 
         multiDexEnabled true
         //vectorDrawables.useSupportLibrary = true
 
-        javaCompileOptions {
-            annotationProcessorOptions {
-                arguments = [moduleName: project.getName()]
-            }
-        }
+        // AGP 8.x: annotationProcessor arguments
+        // (原来的 javaCompileOptions.annotationProcessorOptions 已废弃)
 
         ndk {
             abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64'
@@ -232,13 +235,21 @@ android {
     lint {
         abortOnError false
     }
-    namespace 'cn.ppps.forwarder'
 
     /**
      * ⚠️ Windows + XAOP 下，避免 debug/test 触发 clean
      */
     if (isNeedClean.toBoolean() && enableXaop) {
         preBuild.dependsOn clean
+    }
+}
+
+/**
+ * ★ AGP 8.x + JDK 21: 设置 Kotlin 编译 JVM 目标为 17
+ */
+tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
+    kotlinOptions {
+        jvmTarget = '17'
     }
 }
 
@@ -329,7 +340,7 @@ dependencies {
     //noinspection GradleDependency
     implementation "androidx.room:room-rxjava2:$room_version"
     //noinspection KaptUsageInsteadOfKsp
-    kapt "androidx.room:room-compiler:$room_version"
+    ksp "androidx.room:room-compiler:$room_version"
 
     //CodeView：https://github.com/AmrDeveloper/CodeView
     implementation 'io.github.amrdeveloper:codeview:1.3.9'
@@ -396,6 +407,17 @@ dependencies {
 
     //侧边栏菜单：https://github.com/yarolegovich/SlidingRootNav
     implementation 'com.yarolegovich:sliding-root-nav:1.1.1'
+
+    // ★ 2026-08-10 WebRTC 官方库：一站式集成
+    //   - 音频采集（AudioRecord底层）+ Opus 编解码
+    //   - AEC 回声消除 / NS 噪声抑制 / AGC 自动增益控制（WebRTC内置的NS/AECM/AGC全套处理）
+    //   - Jitter Buffer 抗网络抖动 + NetEQ 音频PLC丢包补偿
+    //   - 视频 VP8/H264 编码压缩（替换原来JPEG单帧传输，带宽占用减少70%+）
+    //   - PLI/FIR/NACK/RTX/RED/FEC 视频丢包恢复与冗余
+    //   - ICE/STUN/TURN NAT穿透（兼容ZT直连/中继公网/局域网三种链路）
+    //   artifact: io.github.webrtc-sdk:android（Maven Central 维护的 Chromium 稳定分支 114.x，package org.webrtc.* 与老版API完全兼容）
+    //   兼容 minSdk 21+。
+    implementation 'io.github.webrtc-sdk:android:114.5735.08.1'
 }
 //自动添加X-Library依赖
 apply from: 'x-library.gradle'

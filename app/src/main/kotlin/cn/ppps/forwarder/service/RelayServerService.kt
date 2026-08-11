@@ -145,19 +145,60 @@ class RelayServerService : Service() {
         val onDirectCommand: (Long, String, ByteArray) -> Unit = { connId: Long, cmd: String, payload: ByteArray ->
             executor?.execute {
                 try {
-                    // ★ 2026-08-06：传入按来源连接回发的sender（文件下载二进制推送发回正确控制端）
+                    // ★ 2026-08-06：修复重连后connId失效问题：
+                    //   每次发送前动态从listener中查找"该connId是否仍存在"，
+                    //   不存在则降级用"最新接入连接"发送，避免数据静默丢弃。
+                    //   同时实现sendSync同步发送，供文件下载可靠传输。
                     val directSender = object : RelaySender {
-                        override fun isConnected(): Boolean = listener?.isConnected() ?: false
+                        private fun resolveConn(): Pair<Long, java.net.Socket?>? {
+                            val directListener = listener ?: return null
+                            val s = directListener.connections[connId]
+                            if (s != null && !s.isClosed && s.isConnected) return connId to s
+                            // 原connId失效（重连后connId变了），降级使用最新连接
+                            var bestId = Long.MIN_VALUE
+                            var best: java.net.Socket? = null
+                            for ((id, sock) in directListener.connections) {
+                                if (id > bestId && sock.isConnected && !sock.isClosed) {
+                                    bestId = id
+                                    best = sock
+                                }
+                            }
+                            return if (best != null) bestId to best else null
+                        }
+                        override fun isConnected(): Boolean = resolveConn() != null
                         override fun send(cmd: String, payload: ByteArray) {
-                            listener?.sendTo(connId, cmd, payload)
+                            val (cid, _) = resolveConn() ?: return
+                            listener?.sendTo(cid, cmd, payload)
                         }
                         override fun send(cmd: String, payload: String) {
-                            listener?.sendTo(connId, cmd, payload)
+                            val (cid, _) = resolveConn() ?: return
+                            listener?.sendTo(cid, cmd, payload)
+                        }
+                        override fun sendSync(cmd: String, payload: ByteArray, timeoutMs: Long): Boolean {
+                            val (cid, _) = resolveConn() ?: return false
+                            return listener?.sendToSync(cid, cmd, payload, timeoutMs) ?: false
                         }
                     }
                     val result = RelayServerHandler.handle(cmd, payload, RelayServerHandler.CHANNEL_DIRECT, directSender)
                     if (result != null) {
-                        listener?.sendTo(connId, result.first, result.second)
+                        val (cid, _) = try {
+                            val directListener = listener
+                            val s = directListener?.connections?.get(connId)
+                            if (s != null && !s.isClosed && s.isConnected) connId to s
+                            else {
+                                var bestId = Long.MIN_VALUE
+                                var best: java.net.Socket? = null
+                                if (directListener != null) {
+                                    for ((id, sock) in directListener.connections) {
+                                        if (id > bestId && sock.isConnected && !sock.isClosed) {
+                                            bestId = id; best = sock
+                                        }
+                                    }
+                                }
+                                if (best != null) bestId to best else null
+                            }
+                        } catch (_: Exception) { null } ?: return@execute
+                        listener?.sendTo(cid, result.first, result.second)
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "直连命令处理异常: ${e.message}")

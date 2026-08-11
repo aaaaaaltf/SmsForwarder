@@ -1,7 +1,7 @@
-apply plugin: 'com.xuexiang.xrouter'
-apply plugin: 'kotlin-kapt'
+//apply plugin: 'com.xuexiang.xrouter'  // AGP 8.x不支持registerTransform API
+//apply plugin: 'kotlin-kapt'  // 已切换到 KSP
 //apply plugin: 'android-aspectjx'
-apply plugin: 'com.xuexiang.xaop'
+//apply plugin: 'com.xuexiang.xaop'  // AGP 8.x不支持registerTransform API
 
 //自动添加依赖
 configurations.each { configuration ->
@@ -35,11 +35,9 @@ configurations.each { configuration ->
         configuration.dependencies.add(dependencies.create(deps.xlibrary.xrouter_runtime))
     }
 
-    if (configuration.name.equals("kapt")) {
-        //XPage
-        configuration.dependencies.add(dependencies.create(deps.xlibrary.xpage_compiler))
-        //页面路由
-        configuration.dependencies.add(dependencies.create(deps.xlibrary.xrouter_compiler))
+    if (configuration.name.equals("ksp")) {
+        //XPage - 目前无 KSP 版本，暂不添加
+        //页面路由 - 目前无 KSP 版本，暂不添加
     }
 
     if (isNeedLeakcanary.toBoolean() && configuration.name.equals("debugImplementation")) {

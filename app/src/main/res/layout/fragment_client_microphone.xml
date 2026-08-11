@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="?attr/xui_config_color_background"
+    android:orientation="vertical"
+    android:gravity="center">
+
+    <TextView
+        android:id="@+id/tv_mic_status"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="正在连接麦克风..."
+        android:textSize="18sp"
+        android:layout_marginBottom="20dp" />
+
+    <TextView
+        android:id="@+id/tv_mic_info"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text=""
+        android:textSize="14sp"
+        android:textColor="@color/gray_text_light"
+        android:layout_marginBottom="30dp" />
+
+    <com.xuexiang.xui.widget.button.ButtonView
+        android:id="@+id/btn_mic_close"
+        style="@style/ButtonView.Gray"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:minWidth="120dp"
+        android:padding="10dp"
+        android:text="关闭" />
+
+</LinearLayout>

@@ -798,6 +798,8 @@
     <string name="api_screen_preview_tips">远程实时预览被控端手机屏幕</string>
     <string name="api_camera">远程摄像头</string>
     <string name="api_camera_tips">远程打开被控端摄像头，图像仅显示在控制端</string>
+    <string name="api_microphone">麦克风监听</string>
+    <string name="api_microphone_tips">远程监听被控端麦克风音频</string>
     <string name="screen_preview_auth_success">屏幕捕获授权成功</string>
     <string name="screen_preview_auth_denied">屏幕捕获授权被拒绝</string>
     <string name="screen_preview_auth_failed">屏幕捕获授权失败</string>
@@ -1353,4 +1355,32 @@
     <string name="relay_ctrl_link" formatted="false">控制端 ↔ 中继：%1$s</string>
     <string name="relay_ctrl_online">已连接</string>
     <string name="relay_ctrl_offline">未连接</string>
+
+    <!--================ Server permissions UI strings (English fallback) ================ -->
+    <string name="perm_mic_title">Remote Microphone</string>
+    <string name="perm_mic_tips">Record audio from the controlled device and play via WebRTC speakerphone on the controller</string>
+    <string name="perm_mic_btn">Grant Mic</string>
+
+    <string name="perm_storage_title">Storage &amp; File Access</string>
+    <string name="perm_storage_tips">Required for backup/restore, WeChat records export, logs, and file downloads</string>
+    <string name="perm_storage_btn">Grant Storage</string>
+
+    <string name="perm_notification_title">Notification Permission</string>
+    <string name="perm_notification_tips">Required for foreground service, connection status, and permission results (Android 13+)</string>
+    <string name="perm_notification_btn">Grant Notify</string>
+
+    <string name="perm_overlay_title">Display Over Other Apps</string>
+    <string name="perm_overlay_tips">Required for wake-up screen (transparent activity) and floating windows</string>
+    <string name="perm_overlay_btn">Grant Overlay</string>
+
+    <string name="perm_battery_title">Ignore Battery Optimizations</string>
+    <string name="perm_battery_tips">Whitelist the app so the system won\'t kill the background relay server service</string>
+    <string name="perm_battery_btn">Battery WL</string>
+
+    <string name="perm_screen_title">Screen Capture Permission</string>
+    <string name="perm_screen_tips">System media projection authorization for screen preview (re-grant after every app update)</string>
+    <string name="perm_screen_btn">Grant Screen</string>
+
+    <string name="perm_status_granted">Granted</string>
+    <string name="perm_status_not_granted">Not granted</string>
 </resources>

@@ -11,11 +11,19 @@ import java.util.concurrent.Executors
  * 被控端命令发送器统一接口
  * RelayServerClient（中继模式）与 RelayServerListener（ZeroTier直连模式）均实现，
  * 供 CameraStreamManager 等模块透明使用。
+ *
+ * ★ 2026-08-06 下载稳定性修复：
+ *   - 新增 sendSync 同步发送（带超时/结果），供文件下载等关键场景使用，
+ *     避免异步队列积压导致"调用方以为发送成功但实际失败"的假活问题
+ *   - 心跳包（CMD_DEV_STATE / CMD_PING）使用独立的心跳发送线程池 heartBeatExecutor，
+ *     与大流量下载数据的 sendExecutor 物理隔离，防止NAT超时断连
  */
 interface RelaySender {
     fun isConnected(): Boolean
     fun send(cmd: String, payload: ByteArray)
     fun send(cmd: String, payload: String)
+    /** 同步发送：等待实际写入完成，返回是否成功；用于文件下载等需要可靠发送的场景 */
+    fun sendSync(cmd: String, payload: ByteArray, timeoutMs: Long = 15000): Boolean
 }
 
 /**
@@ -35,9 +43,19 @@ class RelayServerClient(
     private val TAG = "RelayServerClient"
     private val sendLock = Any()
 
-    /** ★ 专用发送线程：所有socket写操作必须在后台线程执行，禁止主线程直发 */
+    /** ★ 下载/普通数据发送线程池（单线程保证顺序） */
     private val sendExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
         Thread(r, "RelayServerSend").apply { isDaemon = true }
+    }
+
+    /** ★ 心跳专用发送线程池（独立通道，不被下载大流量堵队列） */
+    private val heartBeatExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "RelayServerHb").apply { isDaemon = true }
+    }
+
+    /** 判断是否为心跳类命令（设备状态/心跳ping），走独立发送通道 */
+    private fun isHeartBeatCmd(cmd: String): Boolean {
+        return cmd == RelayCommands.CMD_DEV_STATE || cmd == RelayCommands.RSP_PONG
     }
 
     @Volatile
@@ -65,6 +83,7 @@ class RelayServerClient(
         }
         socket = null
         sendExecutor.shutdownNow()
+        heartBeatExecutor.shutdownNow()
     }
 
     private fun connectLoop() {
@@ -137,13 +156,22 @@ class RelayServerClient(
     override fun send(cmd: String, payload: ByteArray) {
         val s = socket ?: return
         val frame = FrameCodec.encode(cmd.toByteArray(Charsets.US_ASCII) + payload)
+        // ★ WebRTC/大数据命令额外打印帧长度
+        if (cmd.startsWith("wrx") || frame.size > 1024) {
+            Log.i(TAG, "★ [SEND FRAME] cmd=$cmd payloadBytes=${payload.size} frameBytes=${frame.size} socket=${s.isConnected && !s.isClosed}")
+        }
+        // ★ 心跳类命令走独立心跳线程池，不被下载大流量堵队列
+        val executor = if (isHeartBeatCmd(cmd)) heartBeatExecutor else sendExecutor
         try {
-            sendExecutor.execute {
+            executor.execute {
                 try {
                     synchronized(sendLock) {
                         val out = s.getOutputStream()
                         out.write(frame)
                         out.flush()
+                        if (cmd.startsWith("wrx")) {
+                            Log.i(TAG, "★ [SEND FRAME OK] cmd=$cmd payloadBytes=${payload.size} 已写入socket已flush ✓")
+                        }
                     }
                 } catch (e: Exception) {
                     Log.w(TAG, "发送失败: ${e.javaClass.simpleName}: ${e.message}，关闭socket触发自动重连")
@@ -154,8 +182,54 @@ class RelayServerClient(
                     }
                 }
             }
+            if (cmd.startsWith("wrx")) {
+                Log.i(TAG, "★ [SEND FRAME SUBMITTED] cmd=$cmd 已提交到 sendExecutor 等待执行 (executor=${executor.javaClass.simpleName})")
+            }
         } catch (e: Exception) {
             Log.w(TAG, "提交发送任务失败: ${e.message}")
+        }
+    }
+
+    /**
+     * ★ 同步发送：等待数据实际写入socket并flush完成，返回是否成功
+     * 参考PC端微信_download_send_file_blocked的"同步发送+失败立即终止"模式，
+     * 用于文件下载等分块数据可靠发送场景，避免"异步提交成功但实际发送失败"的假活问题。
+     */
+    override fun sendSync(cmd: String, payload: ByteArray, timeoutMs: Long): Boolean {
+        val s = socket ?: return false
+        if (!isConnected()) return false
+        val frame = FrameCodec.encode(cmd.toByteArray(Charsets.US_ASCII) + payload)
+        val future = try {
+            // ★ 心跳走心跳池，其他走普通发送池；但同步调用统一使用sendExecutor保证顺序
+            sendExecutor.submit<Boolean> {
+                try {
+                    synchronized(sendLock) {
+                        if (!isConnected()) return@submit false
+                        val out = s.getOutputStream()
+                        out.write(frame)
+                        out.flush()
+                    }
+                    true
+                } catch (e: Exception) {
+                    Log.w(TAG, "同步发送失败: ${e.javaClass.simpleName}: ${e.message}，关闭socket")
+                    try { s.close() } catch (_: Exception) {}
+                    false
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "提交同步发送任务失败: ${e.message}")
+            return false
+        }
+        return try {
+            val t0 = System.currentTimeMillis()
+            val r = future.get(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+            // ★ 调试：记录同步发送耗时（写入文件，定位发送端卡顿）
+            Log.i(TAG, "[FS调试] sendSync 完成 cmd=$cmd 负载${payload.size} 耗时${System.currentTimeMillis() - t0}ms 结果=$r")
+            r
+        } catch (e: Exception) {
+            Log.w(TAG, "同步发送超时/中断: ${e.javaClass.simpleName}: ${e.message}")
+            try { future.cancel(true) } catch (_: Exception) {}
+            false
         }
     }
 

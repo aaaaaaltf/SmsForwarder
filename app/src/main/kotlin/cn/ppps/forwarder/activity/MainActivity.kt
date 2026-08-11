@@ -2,14 +2,15 @@ package cn.ppps.forwarder.activity
 
 import android.content.Intent
 import android.os.Bundle
+import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
+import androidx.fragment.app.Fragment
 import com.google.android.material.tabs.TabLayout
-import cn.ppps.forwarder.BuildConfig
 import cn.ppps.forwarder.R
 import cn.ppps.forwarder.core.BaseActivity
+import cn.ppps.forwarder.core.BaseFragment
 import cn.ppps.forwarder.databinding.ActivityMainBinding
-import cn.ppps.forwarder.fragment.ClientFragment
 import cn.ppps.forwarder.fragment.ServerFragment
 import com.xuexiang.xui.utils.WidgetUtils
 
@@ -18,9 +19,7 @@ class MainActivity : BaseActivity<ActivityMainBinding?>() {
 
     private val TAG: String = MainActivity::class.java.simpleName
 
-    /** 打包模式：controller=控制端，server=被控端 */
-    private val isControllerMode: Boolean = BuildConfig.APP_MODE == "controller"
-
+    /** ★ 2026-08-10 简化：SmsForwarder只保留被控端模式，控制端已迁移到android_controller项目 */
     private lateinit var mTabLayout: TabLayout
 
     override fun viewBindingInflate(inflater: LayoutInflater?): ActivityMainBinding {
@@ -36,23 +35,75 @@ class MainActivity : BaseActivity<ActivityMainBinding?>() {
         get() = false
 
     private fun initViews() {
+        android.util.Log.e(TAG, "★ initViews 开始执行（纯被控端模式）★")
         WidgetUtils.clearActivityBackground(this)
         initTab()
     }
 
     private fun initTab() {
         mTabLayout = binding!!.tabs
-        //单一模式（打包控制端或被控端）隐藏标签栏，直接全屏显示对应页面
-        if (isControllerMode) {
-            WidgetUtils.addTabWithoutRipple(mTabLayout, getString(R.string.menu_client), R.drawable.selector_icon_tabbar_settings)
-            mTabLayout.visibility = View.GONE
-            switchPage(ClientFragment::class.java)
-        } else {
-            WidgetUtils.addTabWithoutRipple(mTabLayout, getString(R.string.menu_server), R.drawable.selector_icon_tabbar_settings)
-            mTabLayout.visibility = View.GONE
-            switchPage(ServerFragment::class.java)
-        }
+        // ★ 2026-08-10 纯被控端模式：直接全屏加载 ServerFragment
+        WidgetUtils.addTabWithoutRipple(mTabLayout, getString(R.string.menu_server), R.drawable.selector_icon_tabbar_settings)
+        mTabLayout.visibility = View.GONE
+        android.util.Log.e(TAG, "★ 加载 ServerFragment ★")
+        val fragment = ServerFragment()
+        loadFragmentDirect(fragment)
         WidgetUtils.setTabLayoutTextFont(mTabLayout)
+        android.util.Log.e(TAG, "★ initTab 完成 ★")
+    }
+
+    /**
+     * ★ 2026-08-10 新增：直接加载Fragment到容器（绕过XRouter路由）
+     * 当XRouter路由表未生成时，使用此方法直接添加Fragment
+     */
+    private fun loadFragmentDirect(fragment: BaseFragment<*>) {
+        android.util.Log.e(TAG, "★ loadFragmentDirect 开始: ${fragment.javaClass.simpleName}")
+        
+        // ★ 使用 resources.getIdentifier 动态获取容器 ID
+        var containerResId = binding!!.fragmentContainer.id
+        android.util.Log.e(TAG, "★ binding容器Id=$containerResId")
+        
+        // 如果 binding 方式失败（返回 0），尝试用资源名查找
+        if (containerResId == 0) {
+            containerResId = resources.getIdentifier("fragment_container", "id", packageName)
+            android.util.Log.e(TAG, "★ 通过资源名查找容器: $containerResId")
+        }
+        
+        if (containerResId == 0) {
+            android.util.Log.e(TAG, "★ 找不到容器 ID，使用 android.R.id.content 作为备选")
+            containerResId = android.R.id.content
+        }
+        
+        android.util.Log.e(TAG, "★ 使用容器ID=$containerResId 加载Fragment")
+        try {
+            supportFragmentManager.beginTransaction()
+                .replace(containerResId, fragment)
+                .commitAllowingStateLoss()
+            android.util.Log.e(TAG, "★ Fragment replace 成功: ${fragment.javaClass.simpleName}")
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "★ Fragment replace 失败: ${e.message}", e)
+        }
+        
+        // ★ XPage Fragment的initPage在onActivityCreated中自动调用
+        // 这里通过生命周期回调确保初始化完成
+        supportFragmentManager.registerFragmentLifecycleCallbacks(
+            object : androidx.fragment.app.FragmentManager.FragmentLifecycleCallbacks() {
+                override fun onFragmentActivityCreated(
+                    fm: androidx.fragment.app.FragmentManager,
+                    f: Fragment,
+                    savedInstanceState: Bundle?
+                ) {
+                    android.util.Log.e(TAG, "★ onFragmentActivityCreated: ${f.javaClass.simpleName}")
+                }
+                override fun onFragmentResumed(
+                    fm: androidx.fragment.app.FragmentManager,
+                    f: Fragment
+                ) {
+                    android.util.Log.e(TAG, "★ onFragmentResumed: ${f.javaClass.simpleName}")
+                }
+            }, false
+        )
+        android.util.Log.e(TAG, "★ loadFragmentDirect 结束")
     }
 
     //按返回键不退出回到桌面

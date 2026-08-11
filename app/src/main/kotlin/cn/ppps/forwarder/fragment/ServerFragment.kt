@@ -38,13 +38,11 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
     private val TAG: String = ServerFragment::class.java.simpleName
     private var appContext: App? = null
 
-    /** 屏幕捕获授权请求码 */
-    companion object {
-        private const val REQ_SCREEN_CAPTURE = 0x501
-    }
-
     //定时更新界面（每5秒刷新连接状态）
     private val handler: Handler = Handler(Looper.getMainLooper())
+    /** ★ 2026-08-11 防止程序化设置 isChecked 时重复触发授权弹窗 */
+    @Volatile
+    private var suppressScreenPreviewToggle = false
     private val runnable: Runnable = object : Runnable {
         override fun run() {
             handler.postDelayed(this, 5000) //每隔5秒刷新一次
@@ -71,6 +69,25 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
 
     override fun initListeners() {
         binding!!.btnToggleServer.setOnClickListener(this)
+        binding!!.btnOneClickAuth.setOnClickListener(this)
+
+        // ============ 新增 6 项独立权限授权按钮（与图片中"远程触摸"一致的样式，点击立刻授权）============
+        binding!!.btnPermMic.setOnClickListener { checkMicrophonePermission() }
+        binding!!.btnPermStorage.setOnClickListener {
+            checkStorageRuntimePermission()
+            // 基础存储权限授权成功后，跳"所有文件访问"（Android 11+）
+            handler.postDelayed({ jumpStorageSetting() }, 800)
+        }
+        binding!!.btnPermNotification.setOnClickListener { checkNotificationPermission() }
+        binding!!.btnPermOverlay.setOnClickListener { jumpOverlaySetting() }
+        binding!!.btnPermBattery.setOnClickListener { jumpBatterySetting() }
+        binding!!.btnPermScreen.setOnClickListener {
+            if (!cn.ppps.forwarder.relay.ScreenStreamManager.isReady()) {
+                requestScreenProjection()
+            } else {
+                XToastUtils.toast("屏幕预览已授权")
+            }
+        }
 
         //中继服务器地址
         binding!!.etRelayHost.setText(RelaySettings.relayHost)
@@ -143,11 +160,6 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             if (isChecked) checkContactsPermission()
         }
 
-        binding!!.sbApiWol.isChecked = HttpServerUtils.enableApiWol
-        binding!!.sbApiWol.setOnCheckedChangeListener { _: CompoundButton?, isChecked: Boolean ->
-            HttpServerUtils.enableApiWol = isChecked
-        }
-
         binding!!.sbApiLocation.isChecked = HttpServerUtils.enableApiLocation
         binding!!.sbApiLocation.setOnCheckedChangeListener { _: CompoundButton?, isChecked: Boolean ->
             // 检查系统定位服务是否开启（权限已在授权时校验），而非应用内设置项
@@ -185,6 +197,13 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         //屏幕预览授权开关（MediaProjection）
         binding!!.sbApiScreenPreview.isChecked = cn.ppps.forwarder.relay.ScreenStreamManager.isReady()
         binding!!.sbApiScreenPreview.setOnCheckedChangeListener { _: CompoundButton?, isChecked: Boolean ->
+            // ★ 2026-08-11 修复：防止 onActivityResult 程序化设置 isChecked 时重复触发授权弹窗
+            //   原BUG：onActivityResult 设置 isChecked=true → 触发监听器 → requestScreenProjection() →
+            //   再次弹出系统授权对话框 → 用户取消/重复授权导致状态混乱
+            if (suppressScreenPreviewToggle) {
+                Log.i(TAG, "★ sbApiScreenPreview 程序化设置，跳过授权弹窗触发")
+                return@setOnCheckedChangeListener
+            }
             if (isChecked) {
                 requestScreenProjection()
             } else {
@@ -216,6 +235,22 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
     override fun onResume() {
         super.onResume()
         refreshButtonText()
+        // ★ 2026-08-11 自动恢复已保存的 MediaProjection 授权（App 重启后无需再次弹窗确认）
+        //   Android 13 及以下：SP 中保存的 resultCode+Intent 可直接恢复
+        //   Android 14+：token 随系统会话管理，恢复可能失败（需重新授权），失败时静默跳过
+        if (!isScreenProjectionAuthorized()) {
+            try {
+                val restored = ScreenProjectionService.restore(requireContext())
+                Log.i(TAG, "★ onResume 自动恢复屏幕预览权限: $restored")
+                if (restored) {
+                    // 更新开关状态（使用 suppress 标志防止重复触发授权弹窗）
+                    suppressScreenPreviewToggle = true
+                    try { binding!!.sbApiScreenPreview.isChecked = true } finally { suppressScreenPreviewToggle = false }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "onResume 恢复屏幕预览权限异常: ${e.message}")
+            }
+        }
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?) {
@@ -223,12 +258,39 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         if (requestCode == REQ_SCREEN_CAPTURE) {
             if (resultCode == android.app.Activity.RESULT_OK && data != null) {
                 // 启动 mediaProjection 前台服务保存授权（Android 14+ 必需）
-                ScreenProjectionService.start(requireContext(), resultCode, data)
-                binding!!.sbApiScreenPreview.isChecked = true
-                XToastUtils.success(R.string.screen_preview_auth_success)
+                try {
+                    ScreenProjectionService.start(requireContext(), resultCode, data)
+                    // ★ 等待前台服务启动完成（1000ms），再检查真实授权状态
+                    handler.postDelayed({
+                        val ready = isScreenProjectionAuthorized()
+                        Log.i(TAG, "★ 屏幕预览授权结果: resultCode=OK, ScreenStreamManager.isReady=$ready")
+                        // ★ 2026-08-11 修复：程序化设置 isChecked 时屏蔽监听器，防止重复弹出授权对话框
+                        suppressScreenPreviewToggle = true
+                        try {
+                            if (ready) {
+                                binding!!.sbApiScreenPreview.isChecked = true
+                                XToastUtils.success("屏幕预览权限已授权（MediaProjection已生效）")
+                            } else {
+                                // ★ 授权弹窗点了"确定"，但 MediaProjection 创建失败 → 真实反馈
+                                binding!!.sbApiScreenPreview.isChecked = false
+                                XToastUtils.error("屏幕预览授权失败：MediaProjection创建未生效，请重试")
+                                Log.e(TAG, "★ 屏幕预览授权失败：用户同意但 ScreenStreamManager.isReady=false，可能原因：前台服务启动失败/Android 14 token失效/getMediaProjection返回null")
+                            }
+                        } finally {
+                            suppressScreenPreviewToggle = false
+                        }
+                    }, 1000)
+                } catch (e: Exception) {
+                    Log.e(TAG, "★ 启动ScreenProjectionService失败: ${e.message}", e)
+                    suppressScreenPreviewToggle = true
+                    try { binding!!.sbApiScreenPreview.isChecked = false } finally { suppressScreenPreviewToggle = false }
+                    XToastUtils.error("屏幕预览授权失败：${e.message}")
+                }
             } else {
+                Log.w(TAG, "★ 屏幕预览授权被用户拒绝: resultCode=$resultCode")
                 XToastUtils.error(R.string.screen_preview_auth_denied)
-                binding!!.sbApiScreenPreview.isChecked = false
+                suppressScreenPreviewToggle = true
+                try { binding!!.sbApiScreenPreview.isChecked = false } finally { suppressScreenPreviewToggle = false }
             }
         }
     }
@@ -246,6 +308,10 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                     RelayServerService.start(requireContext())
                 }
                 refreshButtonText()
+            }
+
+            R.id.btn_one_click_auth -> {
+                oneClickAuthorize()
             }
 
             else -> {}
@@ -393,6 +459,271 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             })
     }
 
+    //麦克风权限（录制音频 - 远程免提播放被控端声音）
+    private fun checkMicrophonePermission() {
+        XXPermissions.with(this)
+            .permission(PermissionLists.getRecordAudioPermission())
+            .request(object : OnPermissionCallback {
+                override fun onResult(grantedList: MutableList<IPermission>, deniedList: MutableList<IPermission>) {
+                    val allGranted = deniedList.isEmpty()
+                    if (!allGranted) {
+                        val doNotAskAgain = XXPermissions.isDoNotAskAgainPermissions(requireActivity(), deniedList)
+                        if (doNotAskAgain) {
+                            XToastUtils.error(R.string.toast_denied_never)
+                            XXPermissions.startPermissionActivity(requireContext(), deniedList)
+                        }
+                        XToastUtils.error("麦克风权限未授予，远程监听功能不可用")
+                    } else {
+                        XToastUtils.success("麦克风权限已授权")
+                    }
+                }
+            })
+    }
+
+    // ============ 权限请求码（屏幕捕获 + 新增三类原生权限弹窗） ============
+    companion object {
+        private const val REQ_SCREEN_CAPTURE = 0x501
+        private const val REQ_STORAGE_RUNTIME = 0x502
+        private const val REQ_POST_NOTIFICATION = 0x503
+        private const val REQ_CALL_PHONE = 0x504
+    }
+
+    //基础存储运行时权限（READ + WRITE_EXTERNAL_STORAGE）
+    private fun checkStorageRuntimePermission() {
+        // ★ Android 13 (API 33) 起 READ/WRITE_EXTERNAL_STORAGE 已废弃，但本项目 minSdk=21
+        //   所以低版本仍需动态授权；高版本自动授予。用系统原生 API 最稳，不依赖 XXPermissions 版本差异。
+        val needReq = mutableListOf<String>()
+        if (android.os.Build.VERSION.SDK_INT < 33) {
+            if (androidx.core.content.ContextCompat.checkSelfPermission(requireContext(),
+                    android.Manifest.permission.READ_EXTERNAL_STORAGE) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                needReq.add(android.Manifest.permission.READ_EXTERNAL_STORAGE)
+            }
+            if (androidx.core.content.ContextCompat.checkSelfPermission(requireContext(),
+                    android.Manifest.permission.WRITE_EXTERNAL_STORAGE) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                needReq.add(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            }
+        }
+        if (needReq.isEmpty()) {
+            XToastUtils.success("基础存储权限已授权（或当前系统版本无需单独授权）")
+        } else {
+            androidx.core.app.ActivityCompat.requestPermissions(
+                requireActivity(), needReq.toTypedArray(), REQ_STORAGE_RUNTIME)
+        }
+    }
+
+    //通知权限（POST_NOTIFICATIONS Android 13+ 前台服务必须）
+    private fun checkNotificationPermission() {
+        if (android.os.Build.VERSION.SDK_INT < 33) {
+            XToastUtils.toast("当前系统版本无需单独授权通知")
+            return
+        }
+        try {
+            if (androidx.core.content.ContextCompat.checkSelfPermission(requireContext(),
+                    "android.permission.POST_NOTIFICATIONS") == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                XToastUtils.success("通知权限已授权")
+                return
+            }
+            androidx.core.app.ActivityCompat.requestPermissions(
+                requireActivity(), arrayOf("android.permission.POST_NOTIFICATIONS"), REQ_POST_NOTIFICATION)
+        } catch (e: Throwable) {
+            Log.e(TAG, "checkNotificationPermission异常: ${e.message}")
+            jumpNotificationSetting()
+        }
+    }
+
+    //拨打电话权限（CALL_PHONE — 一键换新机/远程主动拨号功能）
+    private fun checkCallPhonePermission() {
+        if (androidx.core.content.ContextCompat.checkSelfPermission(requireContext(),
+                android.Manifest.permission.CALL_PHONE) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            XToastUtils.success("拨号权限已授权")
+            return
+        }
+        androidx.core.app.ActivityCompat.requestPermissions(
+            requireActivity(), arrayOf(android.Manifest.permission.CALL_PHONE), REQ_CALL_PHONE)
+    }
+
+    // ============ 新增：原生 onRequestPermissionsResult 分发（处理上面新增三类权限的弹窗结果） ============
+    override fun onRequestPermissionsResult(
+        requestCode: Int, permissions: Array<out String>, grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        val ok = grantResults.isNotEmpty() && grantResults.all { it == android.content.pm.PackageManager.PERMISSION_GRANTED }
+        when (requestCode) {
+            REQ_STORAGE_RUNTIME -> {
+                if (ok) XToastUtils.success("基础存储权限已授权")
+                else XToastUtils.error("存储权限未授予，文件读写功能不可用")
+            }
+            REQ_POST_NOTIFICATION -> {
+                if (ok) XToastUtils.success("通知权限已授权")
+                else {
+                    // 用户勾选"不再询问"时，直接跳通知设置页
+                    val rationale = androidx.core.app.ActivityCompat.shouldShowRequestPermissionRationale(
+                        requireActivity(), "android.permission.POST_NOTIFICATIONS")
+                    if (!rationale) jumpNotificationSetting()
+                    else XToastUtils.error("通知权限未授予，前台服务状态可能不显示")
+                }
+            }
+            REQ_CALL_PHONE -> {
+                if (ok) XToastUtils.success("拨号权限已授权")
+                else XToastUtils.error("拨号权限未授予，主动拨号功能不可用")
+            }
+        }
+    }
+
+    // ============ 以下为"必须跳转系统设置页"的特殊权限跳转方法 ============
+
+    /** 跳转"所有文件访问"设置页（MANAGE_EXTERNAL_STORAGE Android 11+） */
+    private fun jumpStorageSetting() {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            if (android.os.Environment.isExternalStorageManager()) {
+                XToastUtils.success("所有文件访问已授权")
+                return
+            }
+            try {
+                val intent = Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+                intent.data = android.net.Uri.parse("package:" + requireContext().packageName)
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                startActivity(intent)
+                XToastUtils.toast("请在设置中开启「所有文件访问」")
+            } catch (e: Exception) {
+                Log.w(TAG, "打开所有文件访问设置失败: ${e.message}")
+                try {
+                    val intent = Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    startActivity(intent)
+                } catch (e2: Exception) {
+                    XToastUtils.error("打开文件访问设置失败，请手动到系统设置中开启")
+                }
+            }
+        } else {
+            // Android 10及以下：基础存储权限即可覆盖
+            checkStorageRuntimePermission()
+        }
+    }
+
+    /** 跳转"悬浮窗权限"设置页（SYSTEM_ALERT_WINDOW） */
+    private fun jumpOverlaySetting() {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+            if (android.provider.Settings.canDrawOverlays(requireContext())) {
+                XToastUtils.success("悬浮窗权限已授权")
+                return
+            }
+            try {
+                val intent = Intent(android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION)
+                intent.data = android.net.Uri.parse("package:" + requireContext().packageName)
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                startActivity(intent)
+                XToastUtils.toast("请在设置中开启「悬浮窗」/「显示在其他应用的上层」")
+            } catch (e: Exception) {
+                Log.w(TAG, "打开悬浮窗设置失败: ${e.message}")
+                XToastUtils.error("打开悬浮窗设置失败，请手动到系统设置中开启")
+            }
+        } else {
+            XToastUtils.toast("当前系统版本无需单独授权悬浮窗")
+        }
+    }
+
+    /** 请求/跳转"电池优化白名单"（REQUEST_IGNORE_BATTERY_OPTIMIZATIONS → 直接弹系统确认框） */
+    private fun jumpBatterySetting() {
+        val ctx = requireContext()
+        try {
+            val pm = ctx.getSystemService(android.content.Context.POWER_SERVICE) as android.os.PowerManager
+            if (pm.isIgnoringBatteryOptimizations(ctx.packageName)) {
+                XToastUtils.success("已加入电池优化白名单")
+                return
+            }
+            try {
+                // 优先：直接弹系统"允许忽略电池优化？"确认框（无需跳设置页）
+                val intent = Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                intent.data = android.net.Uri.parse("package:" + ctx.packageName)
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                startActivity(intent)
+                XToastUtils.toast("请点击「允许」以加入电池优化白名单")
+            } catch (e: Exception) {
+                Log.w(TAG, "请求电池优化白名单失败，跳设置页: ${e.message}")
+                // 兜底：跳电池优化列表页（用户手动找到APP添加）
+                val intent = Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                startActivity(intent)
+            }
+        } catch (e: Throwable) {
+            XToastUtils.error("检查/授权电池优化白名单失败: ${e.message}")
+        }
+    }
+
+    /** 兜底：跳系统通知设置页（当POST_NOTIFICATIONS被拒绝且勾选不再询问时） */
+    private fun jumpNotificationSetting() {
+        try {
+            val intent = Intent()
+            when {
+                android.os.Build.VERSION.SDK_INT >= 26 -> {
+                    intent.action = android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS
+                    intent.putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, requireContext().packageName)
+                }
+                android.os.Build.VERSION.SDK_INT >= 21 -> {
+                    intent.action = "android.settings.APP_NOTIFICATION_SETTINGS"
+                    intent.putExtra("app_package", requireContext().packageName)
+                    intent.putExtra("app_uid", requireContext().applicationInfo.uid)
+                }
+                else -> {
+                    intent.action = android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS
+                    intent.data = android.net.Uri.fromParts("package", requireContext().packageName, null)
+                }
+            }
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(intent)
+            XToastUtils.toast("请在系统设置中开启本应用通知权限")
+        } catch (e: Throwable) {
+            XToastUtils.error("打开通知设置失败: ${e.message}")
+        }
+    }
+
+    /** ★ 若屏幕捕获尚未授权，则请求 MediaProjection 系统对话框 */
+    private fun requestScreenProjectionIfNeeded() {
+        if (isScreenProjectionAuthorized()) {
+            Log.i(TAG, "★ 屏幕预览已授权（ScreenStreamManager.isReady=true 或 SP 有效），跳过请求")
+            return
+        }
+        Log.i(TAG, "★ 屏幕预览未授权，发起 MediaProjection 系统弹窗请求")
+        requestScreenProjection()
+    }
+
+    /** ★ 判断屏幕捕获是否已授权（基于真实运行时状态，不调用有副作用的 restore） */
+    private fun isScreenProjectionAuthorized(): Boolean {
+        // 1) 优先检查运行时实际状态：ScreenStreamManager.projection 是否已设置
+        val runtimeReady = try {
+            cn.ppps.forwarder.relay.ScreenStreamManager.isReady()
+        } catch (e: Throwable) {
+            Log.w(TAG, "检查ScreenStreamManager.isReady异常: ${e.message}")
+            false
+        }
+        if (runtimeReady) {
+            Log.i(TAG, "★ 屏幕预览授权检查: ScreenStreamManager.isReady()=true（运行时有效）")
+            return true
+        }
+        // 2) 检查前台服务是否在运行（授权后服务会保持运行）
+        val serviceRunning = try {
+            val am = requireContext().getSystemService(android.content.Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+            am.getRunningServices(200).any { it.service.className == "cn.ppps.forwarder.service.ScreenProjectionService" }
+        } catch (e: Throwable) {
+            false
+        }
+        if (serviceRunning) {
+            Log.i(TAG, "★ 屏幕预览授权检查: ScreenProjectionService 正在运行")
+            return true
+        }
+        // 3) 回退：检查 SP 中是否保存过 RESULT_OK 的授权结果（仅代表"曾经授权过"）
+        try {
+            val prefs = requireContext().getSharedPreferences("screen_projection", android.content.Context.MODE_PRIVATE)
+            val resultCode = prefs.getInt("result_code", 0)
+            Log.i(TAG, "★ 屏幕预览授权检查: SP result_code=$resultCode, runtimeReady=$runtimeReady, serviceRunning=$serviceRunning")
+            return resultCode == android.app.Activity.RESULT_OK && runtimeReady  // ★ 必须运行时也有效才算授权
+        } catch (e: Throwable) {
+            Log.w(TAG, "读取屏幕预览SP授权状态失败: ${e.message}")
+        }
+        return false
+    }
+
     /** 请求屏幕捕获授权（MediaProjection 系统对话框） */
     private fun requestScreenProjection() {
         val pm = requireActivity().getSystemService(android.content.Context.MEDIA_PROJECTION_SERVICE) as android.media.projection.MediaProjectionManager
@@ -402,6 +733,194 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             Log.e(TAG, "请求屏幕捕获授权失败: ${e.message}")
             XToastUtils.error(R.string.screen_preview_auth_failed)
             binding!!.sbApiScreenPreview.isChecked = false
+        }
+    }
+
+    /**
+     * ★ 一键授权所有权限
+     * 分两步：
+     * 1. 自动授权：复用已有的分批权限请求方法（每批独立请求，避免一次请求过多权限导致崩溃）
+     * 2. 手动授权：自动打开需用户确认的设置页（所有文件访问、悬浮窗、无障碍、电池优化）
+     */
+    private fun oneClickAuthorize() {
+        XToastUtils.toast("开始一键授权，请按提示操作...")
+
+        try {
+            // 第一步：逐批请求运行时权限（复用已有方法，每批独立请求）
+            // 顺序：短信 → 电话 → 联系人 → 定位 → 相机 → 麦克风 → 存储 → 通知 → CALL_PHONE
+            // ★ 不使用一次性批量请求，因为 ACCESS_BACKGROUND_LOCATION 等权限需要单独请求，
+            //   一次请求过多权限在部分MIUI系统上会崩溃
+            checkReadSmsPermission()
+
+            // 延迟请求下一批，避免对话框冲突
+            handler.postDelayed({
+                try { checkCallPermission() } catch (e: Exception) { Log.e(TAG, "电话读取权限请求异常: ${e.message}") }
+            }, 500)
+
+            handler.postDelayed({
+                try { checkContactsPermission() } catch (e: Exception) { Log.e(TAG, "联系人权限请求异常: ${e.message}") }
+            }, 1000)
+
+            handler.postDelayed({
+                try { checkLocationPermission() } catch (e: Exception) { Log.e(TAG, "定位权限请求异常: ${e.message}") }
+            }, 1500)
+
+            handler.postDelayed({
+                try { checkCameraPermission() } catch (e: Exception) { Log.e(TAG, "相机权限请求异常: ${e.message}") }
+            }, 2000)
+
+            // ★ 新增：麦克风权限（远程免提播放被控端声音，WebRTC必需）
+            handler.postDelayed({
+                try { checkMicrophonePermission() } catch (e: Exception) { Log.e(TAG, "麦克风权限请求异常: ${e.message}") }
+            }, 2500)
+
+            // ★ 新增：基础存储运行时权限（一键换新机/微信备份/文件下载都需要）
+            handler.postDelayed({
+                try { checkStorageRuntimePermission() } catch (e: Exception) { Log.e(TAG, "存储权限请求异常: ${e.message}") }
+            }, 3000)
+
+            // ★ 新增：通知权限（Android 13+ 前台服务/被控端状态显示都需要）
+            handler.postDelayed({
+                try { checkNotificationPermission() } catch (e: Exception) { Log.e(TAG, "通知权限请求异常: ${e.message}") }
+            }, 3500)
+
+            // ★ 新增：CALL_PHONE 权限（直接拨号远程发起呼叫场景）
+            handler.postDelayed({
+                try { checkCallPhonePermission() } catch (e: Exception) { Log.e(TAG, "CALL_PHONE权限请求异常: ${e.message}") }
+            }, 4000)
+
+            // ★ 新增：屏幕预览/捕获授权（MediaProjection 系统弹窗）
+            //   - 注意：这是系统级授权弹窗(非设置页跳转)，授权结果会保存到SP并启动前台服务
+            //   - 放在运行时权限之后、手动设置页之前，与其他弹窗类权限一起处理
+            handler.postDelayed({
+                try { requestScreenProjectionIfNeeded() } catch (e: Exception) { Log.e(TAG, "屏幕预览授权请求异常: ${e.message}") }
+            }, 4500)
+
+            // 6秒后检查需手动授权的权限（逐一打开设置页）
+            handler.postDelayed({
+                try {
+                    checkManualPermissions()
+                } catch (e: Exception) {
+                    Log.e(TAG, "手动权限检查异常: ${e.message}")
+                    XToastUtils.error("权限检查异常: ${e.message}")
+                }
+            }, 6000)
+        } catch (e: Exception) {
+            Log.e(TAG, "一键授权异常: ${e.message}")
+            XToastUtils.error("授权失败: ${e.message}")
+        }
+    }
+
+    /**
+     * 检查需手动授权的权限，逐一打开设置页
+     * - 顺序：屏幕预览（系统弹窗）→ 所有文件访问 → 悬浮窗 → 无障碍服务 → 电池优化白名单
+     * - 每次只打开一个，用户返回应用后再次点"一键授权"继续下一个
+     */
+    private fun checkManualPermissions() {
+        val ctx = requireContext()
+        val pendingItems = mutableListOf<String>()
+
+        // ★ 2026-08-11 修复：屏幕预览授权已由 oneClickAuthorize() 在 4.5s 时通过 requestScreenProjectionIfNeeded() 处理，
+        //   此处不再重复请求，避免"二次授权"弹窗。
+        //   MediaProjection 是系统级安全特性，必须通过系统弹窗确认，无法自动跳过。
+        //   但授权后会保存到 SP，App 重启后通过 onResume() 中调用 ScreenProjectionService.restore() 自动恢复。
+
+        // 1. 所有文件访问权限（MANAGE_EXTERNAL_STORAGE）
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R && !android.os.Environment.isExternalStorageManager()) {
+            pendingItems.add("所有文件访问权限")
+            try {
+                val intent = Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+                intent.data = android.net.Uri.parse("package:" + requireContext().packageName)
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                startActivity(intent)
+                XToastUtils.toast("请开启「所有文件访问权限」后返回应用")
+                return // 一次只打开一个设置页，用户返回后再继续
+            } catch (e: Exception) {
+                Log.w(TAG, "打开所有文件访问设置失败: ${e.message}")
+                try {
+                    val intent = Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    startActivity(intent)
+                    return
+                } catch (e2: Exception) {
+                    Log.w(TAG, "打开通用文件访问设置也失败: ${e2.message}")
+                }
+            }
+        }
+
+        // 2. 悬浮窗权限（SYSTEM_ALERT_WINDOW）
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M && !android.provider.Settings.canDrawOverlays(ctx)) {
+            pendingItems.add("悬浮窗权限")
+            try {
+                val intent = Intent(android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION)
+                intent.data = android.net.Uri.parse("package:" + requireContext().packageName)
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                startActivity(intent)
+                XToastUtils.toast("请开启「悬浮窗权限」后返回应用")
+                return
+            } catch (e: Exception) {
+                Log.w(TAG, "打开悬浮窗设置失败: ${e.message}")
+            }
+        }
+
+        // 3. 无障碍服务（远程触摸）
+        if (cn.ppps.forwarder.relay.TouchControlService.instance == null) {
+            pendingItems.add("无障碍服务（远程触摸）")
+            try {
+                val intent = Intent("android.settings.ACCESSIBILITY_SETTINGS")
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                startActivity(intent)
+                XToastUtils.toast("请开启「无障碍服务」后返回应用")
+                return
+            } catch (e: Exception) {
+                Log.w(TAG, "打开无障碍设置失败: ${e.message}")
+            }
+        }
+
+        // 4. 电池优化白名单
+        try {
+            val pm = ctx.getSystemService(android.content.Context.POWER_SERVICE) as android.os.PowerManager
+            if (!pm.isIgnoringBatteryOptimizations(ctx.packageName)) {
+                pendingItems.add("电池优化白名单")
+                try {
+                    val intent = Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                    intent.data = android.net.Uri.parse("package:" + ctx.packageName)
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    startActivity(intent)
+                    return
+                } catch (e: Exception) {
+                    Log.w(TAG, "请求电池优化白名单失败: ${e.message}")
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "检查电池优化状态失败: ${e.message}")
+        }
+
+        // 汇总
+        if (pendingItems.isEmpty()) {
+            XToastUtils.toast("所有权限已授权！")
+        } else {
+            // 所有需手动授权的已逐一打开过设置页，此处是回到应用后的最终状态检查
+            val stillPending = mutableListOf<String>()
+            if (!isScreenProjectionAuthorized())
+                stillPending.add("屏幕预览")
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R && !android.os.Environment.isExternalStorageManager())
+                stillPending.add("所有文件访问")
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M && !android.provider.Settings.canDrawOverlays(ctx))
+                stillPending.add("悬浮窗")
+            if (cn.ppps.forwarder.relay.TouchControlService.instance == null)
+                stillPending.add("无障碍服务")
+            try {
+                val pm = ctx.getSystemService(android.content.Context.POWER_SERVICE) as android.os.PowerManager
+                if (!pm.isIgnoringBatteryOptimizations(ctx.packageName))
+                    stillPending.add("电池优化白名单")
+            } catch (_: Throwable) {}
+
+            if (stillPending.isEmpty()) {
+                XToastUtils.toast("所有权限已授权！")
+            } else {
+                XToastUtils.toast("以下权限仍需手动开启: ${stillPending.joinToString("、")}，请再次点击一键授权")
+            }
         }
     }
 

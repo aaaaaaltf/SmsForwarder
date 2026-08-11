@@ -315,3 +315,19 @@
 # 忽略所有 R8 stack map warnings
 -ignorewarnings
 -dontwarn **
+
+# ★ 2026-08-11 修复：WebRTC JNI_OnLoad 需要 org.webrtc.WebRtcClassLoader 和 livekit.org.webrtc.WebRtcClassLoader
+#   中的 getClassLoader() 静态方法（native 通过反射调用）。如果缺少下列 keep 规则，R8 会因为
+#   org.webrtc.WebRtcClassLoader 是 package-private 且没有引用（只有 native 引用），
+#   在 minifyDebugWithR8 阶段内联/删除它，导致 .so 加载时抛出：
+#     NoSuchMethodError: no static method "Lorg/webrtc/WebRtcClassLoader;.getClassLoader()Ljava/lang/Object;"
+#     → rtc Fatal error CHECK !env->ExceptionCheck() 失败 → SIGABRT (signal 6) 崩溃
+#   同时保留 livekit 前缀版本和 org 前缀版本，保证 JNI 两步查找都能命中。
+-keep class org.webrtc.WebRtcClassLoader {
+    public static java.lang.Object getClassLoader();
+}
+-keep class livekit.org.webrtc.WebRtcClassLoader {
+    public static java.lang.Object getClassLoader();
+}
+-keep class org.webrtc.** { *; }
+-dontwarn org.webrtc.**

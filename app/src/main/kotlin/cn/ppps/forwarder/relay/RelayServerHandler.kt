@@ -4,7 +4,9 @@ import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.provider.ContactsContract
+import androidx.core.content.ContextCompat
 import cn.ppps.forwarder.utils.Log
 import cn.ppps.forwarder.App
 import cn.ppps.forwarder.entity.BatteryInfo
@@ -17,18 +19,20 @@ import cn.ppps.forwarder.server.model.CallQueryData
 import cn.ppps.forwarder.server.model.ConfigData
 import cn.ppps.forwarder.server.model.ContactQueryData
 import cn.ppps.forwarder.server.model.SmsQueryData
-import cn.ppps.forwarder.server.model.WolData
 import cn.ppps.forwarder.utils.AppUtils
 import cn.ppps.forwarder.utils.BatteryUtils
 import cn.ppps.forwarder.utils.HttpServerUtils
 import cn.ppps.forwarder.utils.PhoneUtils
 import cn.ppps.forwarder.utils.RelaySettings
 import cn.ppps.forwarder.utils.SettingUtils
+import com.google.gson.Gson
+import com.google.gson.GsonBuilder
 import com.xuexiang.xutil.XUtil
 import java.io.File
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.util.Base64
 import java.util.Locale
 
 /**
@@ -38,6 +42,107 @@ import java.util.Locale
 object RelayServerHandler {
     private const val TAG = "RelayServerHandler"
 
+    /** ★ 2026-08-10 替换已删除控制端gson：使用本地Gson单例 */
+    private val gson: Gson = GsonBuilder().serializeNulls().create()
+
+    // ==================== ★ WebRTC 会话：被控端作为 ANSWERER（控制端发 OFFER） ====================
+    /** 当前活跃的 WebRTC 会话；WebRTC模式下 摄像头+麦克风 都由 WebRtcSessionManager 统一管理 */
+    @Volatile
+    private var webrtc: WebRtcSessionManager? = null
+    /** WebRTC 启动时请求的摄像头索引，用于失败回退到老 JPEG+PCM 模式 */
+    @Volatile
+    private var webrtcCameraIndex: Int = 0
+    /** ★ 2026-08-11 当前WebRTC会话是否纯音频模式（麦克风WebRTC）：回退时只启老麦克风，不启摄像头 */
+    @Volatile
+    private var webrtcAudioOnly: Boolean = false
+
+    /** 给 WebRtcSessionManager 发信令/状态：复用 sender(RelaySender) 的 sendText()/sendBin()，
+     *  因 RelayServerHandler.handle 返回 String→String，所以直接用 sender 回发包 */
+    private fun makeWebrtcSignalingCallback(sender: RelaySender): WebRtcSessionManager.SignalingCallback {
+        return object : WebRtcSessionManager.SignalingCallback {
+            override fun onSignalingMessage(cmd: String, payloadText: String) {
+                Log.i(TAG, "★ WebRTC→Ctrl 发信令 cmd=$cmd payloadLen=${payloadText.length} senderType=${sender.javaClass.simpleName} connected=${sender.isConnected()}")
+                try {
+                    // ★ 2026-08-11 关键修复：OFFER/ANSWER SDP 大帧(>4KB)必须同步发送，
+                    //   防止异步sendExecutor排队后socket异常关闭导致frame丢失
+                    val payloadBytes = payloadText.toByteArray(Charsets.UTF_8)
+                    if (cmd == RelayCommands.CMD_WEBRTC_ANSWER || cmd == RelayCommands.CMD_WEBRTC_OFFER) {
+                        val ok = sender.sendSync(cmd, payloadBytes, 10000)
+                        Log.i(TAG, "★ WebRTC→Ctrl 同步发送 $cmd 结果=$ok frameLen=${12 + payloadBytes.size}")
+                        if (!ok) {
+                            // 失败：等待重连后重试一次
+                            Log.w(TAG, "★ WebRTC→Ctrl 同步发送 $cmd 失败，等待重连后重试...")
+                            if (waitForConnection(sender, 8000)) {
+                                val ok2 = sender.sendSync(cmd, payloadBytes, 10000)
+                                Log.i(TAG, "★ WebRTC→Ctrl 重试发送 $cmd 结果=$ok2")
+                            } else {
+                                Log.w(TAG, "★ WebRTC→Ctrl 重试超时：重连未在8秒内恢复")
+                            }
+                        }
+                    } else {
+                        sender.send(cmd, payloadText)
+                    }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "WebRTC onSignalingMessage 发送失败: ${t.message}", t)
+                }
+            }
+            override fun onStatus(state: String, detail: String) {
+                Log.i(TAG, "★ WebRTC state=$state detail=$detail")
+                try {
+                    sender.send(RelayCommands.CMD_WEBRTC_STATUS, "$state|$detail")
+                } catch (_: Throwable) {}
+            }
+            override fun onError(reason: String) {
+                Log.e(TAG, "★ WebRTC 出错，尝试回退到老模式：$reason")
+                val fallbackCamera = webrtcCameraIndex
+                val fallbackSender = sender
+                // ★ 2026-08-11 判断当前会话是否纯音频模式（麦克风WebRTC）：回退时只启动老麦克风，不启动摄像头
+                val webrtcIsAudioOnly = webrtcAudioOnly
+                // 先关 WebRTC
+                try { webrtc?.close() } catch (_: Throwable) {}
+                webrtc = null
+                // ★ 优雅回退：分别启动老的 CameraStreamManager + MicrophoneStreamManager，保持控制端"无感"继续工作
+                Thread {
+                    try {
+                        // —— 1) 老摄像头：JPEG推（纯音频模式跳过，不占用摄像头）
+                        if (!webrtcIsAudioOnly) {
+                            val okCam = CameraStreamManager.start(fallbackCamera)
+                            Log.i(TAG, "★ WebRTC回退：摄像头 ${if (okCam) "成功" else "失败:${CameraStreamManager.lastError()}"}")
+                            try {
+                                fallbackSender.send(
+                                    RelayCommands.CMD_CAMERA_STATUS_REPORT,
+                                    if (okCam) "$fallbackCamera|success|摄像头流已启动(webrtc回退模式)"
+                                    else "$fallbackCamera|failed|${CameraStreamManager.lastError()}(webrtc回退失败)"
+                                )
+                            } catch (_: Throwable) {}
+                        }
+                        // —— 2) 老麦克风：PCM推（仅在权限OK时）
+                        val hasPerm = try {
+                            ContextCompat.checkSelfPermission(App.context,
+                                android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+                        } catch (_: Throwable) { false }
+                        if (hasPerm) {
+                            val sessionId = MicrophoneStreamManager.start(fallbackSender, RelaySettings.relayHost, -1, CHANNEL_RELAY)
+                            if (sessionId != null) {
+                                Log.i(TAG, "★ WebRTC回退：麦克风 数据通道 OK")
+                            } else {
+                                val okMic = MicrophoneStreamManager.start(fallbackSender)
+                                Log.i(TAG, "★ WebRTC回退：麦克风 命令通道 ${if (okMic) "OK" else "FAIL:${MicrophoneStreamManager.lastError()}"}")
+                            }
+                        }
+                        // —— 3) 通知控制端：我们回退了，控制端按老模式继续显示+播放即可
+                        try {
+                            fallbackSender.send(RelayCommands.CMD_WEBRTC_STATUS,
+                                "fallback_legacy|WebRTC失败已回退老模式: $reason")
+                        } catch (_: Throwable) {}
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "WebRTC回退到老模式时再次失败: ${t.message}")
+                    }
+                }.start()
+            }
+        }
+    }
+
     /** ★ 命令来源通道常量：供ScreenStreamManager等按通道决定推流模式 */
     const val CHANNEL_RELAY = 0    // 命令经中继连接到达（被控端→中继56786）
     const val CHANNEL_DIRECT = 1   // 命令经直连监听(56786)到达（控制端ZT/局域网直连）
@@ -45,6 +150,20 @@ object RelayServerHandler {
 
     /** ★ ZT直连启动器（由RelayServerService设置，触发后主动连接控制端56789） */
     var ztDirectLauncher: ((phoneIp: String, port: Int) -> Unit)? = null
+
+    /** ★ 文件下载取消标志（控制端发送CMD_FS_CANCEL后置为true，下载线程每块发送前检查） */
+    @Volatile
+    var fsDownloadCancelled = false
+
+    /** ★ 当前运行的文件下载线程（互斥：同一时间只允许一个下载线程，
+     *  防止旧下载残留线程与新下载并发写同一socket导致帧交错、ACK丢失） */
+    @Volatile
+    private var fsDownloadThread: Thread? = null
+
+    /** ★ 文件下载分块确认（参照PC微信分块传输）：控制端每收到一块回CMD_FS_ACK+块序号，
+     *  被控端发送后等待此序号确认，未确认不继续发送，防止中继→控制端链路拥塞丢数据 */
+    @Volatile
+    private var fsAckBlock = -1L
 
     /** ★ 本机ZeroTier IP缓存（60秒） */
     private var ownZtIpsCache: Set<String>? = null
@@ -80,7 +199,7 @@ object RelayServerHandler {
             timestamp = System.currentTimeMillis(),
             sign = "",
         )
-        return RelayClientHolder.gson.toJson(resp)
+        return gson.toJson(resp)
     }
 
     private fun error(msg: String): String {
@@ -91,7 +210,7 @@ object RelayServerHandler {
             timestamp = System.currentTimeMillis(),
             sign = "",
         )
-        return RelayClientHolder.gson.toJson(resp)
+        return gson.toJson(resp)
     }
 
     /**
@@ -136,7 +255,10 @@ object RelayServerHandler {
 
                 // ==================== 文件系统（2026-08-06新增） ====================
                 RelayCommands.CMD_FS_LIST -> {
-                    RelayCommands.RSP_FS_LIST to handleFsList(payloadText)
+                    // ★ 列目录：同步发送（参照文件下载的可靠发送），确保写入socket成功才返回
+                    //   目录JSON可能较大（几千个文件几十KB），异步send在拥塞时可能被中继丢弃导致控制端超时
+                    startFsList(payloadText, sender)
+                    null
                 }
 
                 RelayCommands.CMD_FS_DELETE -> {
@@ -147,6 +269,22 @@ object RelayServerHandler {
                     // ★ 下载：启动后台线程推送（RSP_FS_GET → CMD_FS_DATA分块 → CMD_FS_DONE），此处不返回
                     startFsDownload(payloadText, sender)
                     null
+                }
+
+                RelayCommands.CMD_FS_CANCEL -> {
+                    // ★ 取消下载：设置取消标志，下载线程在下一块发送前检测到后立即退出
+                    //   通过专用命令通道（非数据通道）发送，响应RSP_FS_CANCEL确认已停止
+                    Log.i(TAG, "★ 收到取消下载命令，设置取消标志")
+                    fsDownloadCancelled = true
+                    RelayCommands.RSP_FS_CANCEL to "1|stopped|已停止发送"
+                }
+
+                RelayCommands.CMD_FS_ACK -> {
+                    // ★ 分块确认：控制端收到数据块后回ACK，负载=块序号（被控端据此继续下一块）
+                    val ack = payloadText.trim().toLongOrNull() ?: -1L
+                    Log.i(TAG, "[FS调试] 收到ACK cmd=${RelayCommands.CMD_FS_ACK} 原始负载=[${payloadText}] 解析=$ack time=${System.currentTimeMillis()}")
+                    if (ack >= 0) fsAckBlock = ack
+                    null  // ACK无需响应
                 }
 
                 RelayCommands.CMD_SMS_QUERY -> {
@@ -184,17 +322,6 @@ object RelayServerHandler {
                 RelayCommands.CMD_LOCATION -> {
                     if (!HttpServerUtils.enableApiLocation) return RelayCommands.RSP_LOCATION to error("服务端已禁用该功能")
                     RelayCommands.RSP_LOCATION to success(handleLocation())
-                }
-
-                RelayCommands.CMD_WOL -> {
-                    if (!HttpServerUtils.enableApiWol) return RelayCommands.RSP_WOL to error("服务端已禁用该功能")
-                    val data = parseData(payloadText, WolData::class.java)
-                    if (data == null || data.mac.isNullOrEmpty()) {
-                        RelayCommands.RSP_WOL to error("mac地址为空")
-                    } else {
-                        wakeOnLAN(data.mac, data.ip, if (data.port > 0) data.port else 9)
-                        RelayCommands.RSP_WOL to success("success")
-                    }
                 }
 
                 RelayCommands.CMD_CLONE_PULL -> {
@@ -356,6 +483,152 @@ object RelayServerHandler {
                     null
                 }
 
+                // ==================== 麦克风采集推流（远程免提播放被控端声音） ====================
+                RelayCommands.CMD_MIC_START -> {
+                    val hasPermission = try {
+                        ContextCompat.checkSelfPermission(
+                            App.context,
+                            android.Manifest.permission.RECORD_AUDIO
+                        ) == PackageManager.PERMISSION_GRANTED
+                    } catch (_: Exception) { false }
+                    if (!hasPermission) {
+                        RelayCommands.RSP_ERROR to error("被控端未授予麦克风权限（录制音频），请在被控端系统设置或一键授权中开启后重试")
+                    } else {
+                        // ★ 2026-08-09 双通道：使用数据通道(PUSHER/LISTENER)传输音频
+                        // 优先尝试数据通道（中继模式连中继，直连模式监听端口），失败则回退命令通道
+                        val sessionId = MicrophoneStreamManager.start(sender, RelaySettings.relayHost, -1, channel)
+                        if (sessionId != null) {
+                            Log.i(TAG, "麦克风采集已启动（数据通道模式），session=$sessionId")
+                            null
+                        } else {
+                            // 数据通道启动失败，回退到命令通道
+                            val ok = MicrophoneStreamManager.start(sender)
+                            if (ok) {
+                                Log.i(TAG, "麦克风采集已启动（命令通道回退模式）")
+                                null
+                            } else {
+                                RelayCommands.RSP_ERROR to error("启动麦克风采集失败：${MicrophoneStreamManager.lastError()}")
+                            }
+                        }
+                    }
+                }
+
+                RelayCommands.CMD_MIC_STOP -> {
+                    MicrophoneStreamManager.stop()
+                    Log.i(TAG, "麦克风采集已停止")
+                    null  // 停止命令无需响应
+                }
+
+                // ==================== ★ WebRTC 一站式音视频（摄像头预览 + 同步麦克风音频） ====================
+
+                RelayCommands.CMD_WEBRTC_OFFER -> {
+                    val s = sender ?: return RelayCommands.RSP_ERROR to error("内部错误: RelaySender为空")
+                    Log.i(TAG, "★ [WebRTC OFFER IN] 收到 OFFER，payload总长度=${payloadText.length}，sender=$s")
+                    // ★ 2026-08-11 先解析cameraIndex与SDP，判断是否纯音频模式（麦克风WebRTC，OFFER无m=video）
+                    val firstPipeIdx = payloadText.indexOf('|')
+                    var idx = 0
+                    var offerB64 = ""
+                    var audioOnly = false
+                    if (firstPipeIdx > 0) {
+                        idx = payloadText.substring(0, firstPipeIdx).toIntOrNull() ?: 0
+                        offerB64 = payloadText.substring(firstPipeIdx + 1)
+                        try {
+                            val sdpRaw = String(Base64.getDecoder().decode(offerB64), Charsets.UTF_8)
+                            audioOnly = !sdpRaw.contains("m=video")
+                            Log.i(TAG, "★ [WebRTC OFFER IN] 解析: cameraIndex=$idx, offerB64Len=${offerB64.length}, audioOnly(纯音频麦克风)=$audioOnly")
+                        } catch (_: Throwable) {}
+                    }
+                    // 先权限检查（摄像头+麦克风；纯音频模式只要求麦克风）
+                    val permCamera = try {
+                        ContextCompat.checkSelfPermission(App.context,
+                            android.Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+                    } catch (_: Throwable) { false }
+                    val permAudio = try {
+                        ContextCompat.checkSelfPermission(App.context,
+                            android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+                    } catch (_: Throwable) { false }
+                    Log.i(TAG, "★ [WebRTC OFFER IN] 权限检查: CAMERA=$permCamera, RECORD_AUDIO=$permAudio, enableApiCamera=${HttpServerUtils.enableApiCamera}, audioOnly=$audioOnly")
+                    // ★ 2026-08-11 纯音频模式：只要求RECORD_AUDIO权限；摄像头权限/开关不要求
+                    val needCamera = !audioOnly
+                    if ((needCamera && !permCamera) || !permAudio) {
+                        // 无权限：直接走"优雅回退"，告知控制端 fallback
+                        val missing = mutableListOf<String>()
+                        if (needCamera && !permCamera) missing += "相机(CAMERA)"
+                        if (!permAudio) missing += "麦克风(RECORD_AUDIO)"
+                        Log.w(TAG, "★ WebRTC OFFER 到达但缺权限: ${missing.joinToString()}，按回退模式启动老JPEG+PCM")
+                        // 解析 cameraIndex，直接触发 onError → 回退代码
+                        webrtcCameraIndex = idx
+                        makeWebrtcSignalingCallback(s).onError("被控端缺权限: ${missing.joinToString()}")
+                        return null
+                    }
+                    if (needCamera && !HttpServerUtils.enableApiCamera) {
+                        // 禁用摄像头也回退老模式
+                        webrtcCameraIndex = idx
+                        makeWebrtcSignalingCallback(s).onError("服务端已禁用摄像头")
+                        return null
+                    }
+                    // 解析 payload = cameraIndex|offerSdpBase64
+                    if (firstPipeIdx < 0) {
+                        Log.e(TAG, "★ [WebRTC OFFER IN] OFFER格式非法: 找不到'|'分隔符")
+                        return RelayCommands.RSP_ERROR to error("OFFER格式非法: 应为 \"摄像头索引|SDP_BASE64\"")
+                    }
+                    Log.i(TAG, "★ [WebRTC OFFER IN] 解析成功: cameraIndex=$idx, offerB64Len=${offerB64.length}")
+                    webrtcCameraIndex = idx
+                    webrtcAudioOnly = audioOnly
+                    // —— 先关闭旧 WebRTC / 旧 JPEG+PCM 会话（避免冲突）
+                    try { webrtc?.close() } catch (_: Throwable) {}
+                    try { CameraStreamManager.stop() } catch (_: Throwable) {}
+                    try { MicrophoneStreamManager.stop() } catch (_: Throwable) {}
+                    webrtc = null
+                    // —— 初始化新 WebRTC 会话
+                    val mgr = WebRtcSessionManager(App.context)
+                    webrtc = mgr
+                    val cb = makeWebrtcSignalingCallback(s)
+                    Log.i(TAG, "★ [WebRTC OFFER IN] 开始异步启动 WebRtcSessionManager.startWithOffer...")
+                    // 启动放到子线程（createAnswer/setRemoteDescription 会阻塞）
+                    Thread {
+                        try {
+                            mgr.startWithOffer(idx, offerB64, cb)
+                            Log.i(TAG, "★ [WebRTC OFFER IN] startWithOffer 线程执行完毕（ANSWER 将由 signaling callback 异步发送）")
+                        } catch (t: Throwable) {
+                            Log.e(TAG, "★ [WebRTC OFFER IN] startWithOffer 异常: type=${t.javaClass.name} msg=${t.message}", t)
+                            cb.onError("startWithOffer exception: ${t.message}")
+                        }
+                    }.start()
+                    null  // OFFER不立即响应，ANSWER/STATUS 由 signaling callback 异步通过 sender 发回
+                }
+
+                RelayCommands.CMD_WEBRTC_CANDIDATE -> {
+                    // 格式: OFFERER/ANSWERER|sdpMid|sdpMLineIndex|candidateSdpBase64
+                    val parts = payloadText.split("|")
+                    if (parts.size < 4) {
+                        Log.w(TAG, "★ WebRTC ICE candidate 字段不足")
+                        return null
+                    }
+                    val sdpMid = parts[1]
+                    val lineIdx = parts[2].toIntOrNull() ?: 0
+                    val candB64 = parts[3]
+                    webrtc?.addRemoteIceCandidate(sdpMid, lineIdx, candB64)
+                    null
+                }
+
+                RelayCommands.CMD_WEBRTC_ANSWER -> {
+                    // 被控端是 ANSWERER，不会收到 ANSWER；正常忽略（除非双向通话）
+                    Log.i(TAG, "★ WebRTC 收到 ANSWER（被控端是ANSWERER，忽略）")
+                    null
+                }
+
+                RelayCommands.CMD_WEBRTC_HANGUP -> {
+                    Log.i(TAG, "★ WebRTC 挂断")
+                    try { webrtc?.close() } catch (_: Throwable) {}
+                    webrtc = null
+                    webrtcAudioOnly = false
+                    // 控制端挂断时，老模式也可能残留（如回退过），一并清理
+                    try { CameraStreamManager.stop() } catch (_: Throwable) {}
+                    try { MicrophoneStreamManager.stop() } catch (_: Throwable) {}
+                    null
+                }
+
                 else -> null
             }
         } catch (e: Exception) {
@@ -367,7 +640,7 @@ object RelayServerHandler {
     private fun <T> parseData(json: String, clazz: Class<T>): T? {
         if (json.isEmpty()) return null
         return try {
-            RelayClientHolder.gson.fromJson(json, clazz)
+            gson.fromJson(json, clazz)
         } catch (e: Exception) {
             null
         }
@@ -407,7 +680,8 @@ object RelayServerHandler {
             HttpServerUtils.enableApiContactQuery,
             HttpServerUtils.enableApiContactAdd,
             HttpServerUtils.enableApiBatteryQuery,
-            HttpServerUtils.enableApiWol,
+            // ★ 2026-08-10 删除WOL功能：字段保留(兼容旧版控制端JSON解析)，值固定为 false
+            false,
             HttpServerUtils.enableApiLocation,
             SettingUtils.extraDeviceMark,
             SettingUtils.extraSim1,
@@ -465,26 +739,38 @@ object RelayServerHandler {
             ))
         }
         try {
-            val children = file.listFiles() ?: return fsJson(list)
-            // 目录在前、文件在后，各自按名称排序（目录优先，与PC文件管理器一致）
-            // 目录需过滤系统/隐藏/无权限目录
-            children.filter { it.isDirectory && isFsVisibleDir(it) }.sortedBy { it.name.lowercase() }.forEach {
-                list.add(linkedMapOf(
-                    "name" to it.name,
-                    "type" to "D",
-                    "size" to 0L,
-                    "mtime" to it.lastModified(),
-                    "path" to it.absolutePath
-                ))
-            }
-            children.filter { it.isFile }.sortedBy { it.name.lowercase() }.forEach {
-                list.add(linkedMapOf(
-                    "name" to it.name,
-                    "type" to "F",
-                    "size" to it.length(),
-                    "mtime" to it.lastModified(),
-                    "path" to it.absolutePath
-                ))
+            val children = file.listFiles()
+            if (children != null) {
+                // 正常路径：listFiles() 可用
+                children.filter { it.isDirectory && isFsVisibleDir(it) }.sortedBy { it.name.lowercase() }.forEach {
+                    list.add(linkedMapOf(
+                        "name" to it.name,
+                        "type" to "D",
+                        "size" to 0L,
+                        "mtime" to it.lastModified(),
+                        "path" to it.absolutePath
+                    ))
+                }
+                children.filter { it.isFile }.sortedBy { it.name.lowercase() }.forEach {
+                    list.add(linkedMapOf(
+                        "name" to it.name,
+                        "type" to "F",
+                        "size" to it.length(),
+                        "mtime" to it.lastModified(),
+                        "path" to it.absolutePath
+                    ))
+                }
+            } else {
+                // ★ Fallback：listFiles() 返回 null（scoped storage 限制）
+                // Android 11+ targetSdk 30+ 下，File.listFiles() 对其他应用创建的文件返回 null
+                // 使用 ls -la 命令列目录，ls 通过 POSIX readdir() 访问文件系统
+                Log.w(TAG, "listFiles()返回null(scoped storage限制): $dir, isExternalStorageManager=${android.os.Environment.isExternalStorageManager()}")
+                val lsItems = listFilesWithLs(dir)
+                // 排序：目录在前、文件在后，各自按名称排序
+                lsItems.sortedWith(compareBy(
+                    { if (it["type"] == "D") 0 else 1 },
+                    { (it["name"] as String).lowercase() }
+                )).forEach { list.add(it) }
             }
         } catch (e: Exception) {
             Log.w(TAG, "列目录异常: $dir ${e.message}")
@@ -494,10 +780,64 @@ object RelayServerHandler {
 
     private fun fsJson(list: List<Map<String, Any>>): String {
         return try {
-            RelayClientHolder.gson.toJson(list)
+            gson.toJson(list)
         } catch (e: Exception) {
             "[]"
         }
+    }
+
+    /**
+     * ls命令fallback：当File.listFiles()因scoped storage返回null时，
+     * 使用ls -la命令列目录。ls通过POSIX readdir()访问文件系统，
+     * 在MIUI等定制系统上可能比Java File API有更广泛的访问权限。
+     */
+    private fun listFilesWithLs(dir: String): List<Map<String, Any>> {
+        val result = ArrayList<Map<String, Any>>()
+        try {
+            val proc = Runtime.getRuntime().exec(arrayOf("ls", "-la", dir))
+            val output = proc.inputStream.bufferedReader().readText()
+            val errOut = proc.errorStream.bufferedReader().readText()
+            proc.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
+
+            if (errOut.isNotEmpty()) {
+                Log.w(TAG, "ls stderr: $errOut")
+            }
+
+            // 正则匹配 ls -la 输出行：permissions links owner group size date time filename
+            // 兼容不同日期格式（YYYY-MM-DD HH:MM 或 MMM DD HH:MM）
+            val regex = Regex("^([ldrwxstST-]{10})\\s+\\d+\\s+\\S+\\s+\\S+\\s+(\\d+)\\s+\\S+\\s+\\S+\\s+(.+)$")
+
+            for (line in output.lines()) {
+                if (line.isBlank() || line.startsWith("total ")) continue
+                val m = regex.find(line.trim()) ?: continue
+
+                val perms = m.groupValues[1]
+                val isDir = perms.startsWith("d")
+                val size = m.groupValues[2].toLongOrNull() ?: 0L
+                val name = m.groupValues[3].trim()
+
+                if (name == "." || name == "..") continue
+
+                // 应用与 isFsVisibleDir 相同的目录过滤规则
+                if (isDir) {
+                    if (name.startsWith(".")) continue  // 隐藏目录
+                    if (name == "Android") continue     // Android系统目录
+                }
+
+                val path = File(dir, name).absolutePath
+                result.add(linkedMapOf(
+                    "name" to name,
+                    "type" to if (isDir) "D" else "F",
+                    "size" to if (isDir) 0L else size,
+                    "mtime" to 0L,
+                    "path" to path
+                ))
+            }
+            Log.i(TAG, "ls fallback: $dir 找到 ${result.size} 项")
+        } catch (e: Exception) {
+            Log.w(TAG, "ls fallback失败: $dir ${e.message}")
+        }
+        return result
     }
 
     /**
@@ -533,8 +873,44 @@ object RelayServerHandler {
     }
 
     /**
+     * ★ 列目录（同步发送版）：生成JSON后通过sendSync可靠写入socket。
+     * 参照文件下载的可靠发送逻辑：目录JSON较大时异步send可能因中继拥塞被丢弃，
+     * 导致控制端20秒超时报"列目录失败"。同步发送+失败重试（最多2次）。
+     */
+    private fun startFsList(path: String, sender: RelaySender?) {
+        if (sender == null) {
+            Log.w(TAG, "列目录失败: sender为空")
+            return
+        }
+        try {
+            val json = handleFsList(path)
+            // ★ 同步发送：等待实际写入socket+flush成功（参照下载分块的sendSync）
+            var ok = sender.sendSync(RelayCommands.RSP_FS_LIST, json.toByteArray(Charsets.UTF_8), 15000)
+            if (!ok) {
+                // 发送失败：等待重连后重试一次
+                Log.w(TAG, "列目录: 同步发送失败，等待重连后重试... (路径=$path)")
+                if (waitForConnection(sender, 15000)) {
+                    ok = sender.sendSync(RelayCommands.RSP_FS_LIST, json.toByteArray(Charsets.UTF_8), 15000)
+                }
+            }
+            if (!ok) {
+                Log.w(TAG, "列目录: 重试仍失败 (路径=$path, JSON大小=${json.length})")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "列目录异常: $path ${e.message}")
+        }
+    }
+
+    /**
      * 启动文件下载（后台线程）：RSP_FS_GET(大小|文件名|状态) → CMD_FS_DATA分块(128KB) → CMD_FS_DONE
      * 通过命令来源通道sender（中继client/直连listener/ZT直连）推送数据。
+     *
+     * ★ 2026-08-06 大文件下载稳定性修复（参考PC端微信_download_send_file_blocked，经过长期测试）：
+     *   1) 同步发送：每块用sendSync等待实际写入完成+flush成功，失败立即判定（不再异步假活）
+     *   2) 流控50ms：每块后sleep 50ms（与微信下载一致），避免TCP缓冲区压力过大
+     *   3) 等待重连时主动发心跳：waitForConnection内每秒发一次CMD_PING，刷新NAT映射
+     *   4) 进度日志：每10块/每10%/最后一块打印进度，便于调试定位卡顿点
+     *   5) CMD_FS_DONE也用同步发送，确保"完成"标记一定到达控制端
      */
     private fun startFsDownload(path: String, sender: RelaySender?) {
         if (sender == null) {
@@ -551,57 +927,208 @@ object RelayServerHandler {
             sender.send(RelayCommands.RSP_FS_GET, "0||error")
             return
         }
-        Thread({
+        // ★★★ 下载互斥：同一时间只允许一个下载线程（2026-08-07致命修复）
+        //   根因：旧下载（控制端超时但未发CANCEL）线程仍在等ACK重发死循环，
+        //   新下载启动后两个线程并发写同一socket → 数据帧交错 → ACK全部丢失 → 下载卡死
+        //   方案：新下载先取消旧线程并等待其退出，再启动新线程。
+        //   ★ 互斥等待放在下载线程内执行，避免阻塞命令处理线程（否则ACK无法送达旧线程）
+        // ★ 重置取消标志（每次新下载前清除上次的取消状态）
+        fsDownloadCancelled = false
+        // ★ 每个下载会话独立的ACK序号（互斥后不会互相覆盖）
+        fsAckBlock = -1
+        // ★ 连续ACK超时重发计数：超过上限自动放弃（防止控制端离线后线程永久重发占用连接）
+        val maxConsecutiveRetries = 5
+        val t = Thread({
             try {
+                // ★ 下载线程内部互斥：取消旧下载线程并等待其退出（不阻塞命令处理线程）
+                val oldThread = fsDownloadThread
+                if (oldThread != null && oldThread.isAlive) {
+                    Log.w(TAG, "★ 检测到旧下载线程仍在运行，先取消旧下载 (新文件=$p)")
+                    fsDownloadCancelled = true
+                    try {
+                        oldThread.join(3000)
+                    } catch (e: InterruptedException) {
+                        // ignore
+                    }
+                    if (oldThread.isAlive) {
+                        Log.w(TAG, "★ 旧下载线程3秒内未退出（可能阻塞在sendSync），继续启动新下载")
+                    } else {
+                        Log.i(TAG, "★ 旧下载线程已退出，开始新下载")
+                    }
+                }
+                fsDownloadCancelled = false
+                var consecutiveRetries = 0
                 val total = f.length()
                 // ★ 等待连接就绪后再发送元信息（连接断开时等待重连，最多30秒）
                 if (!waitForConnection(sender, 30000)) {
                     Log.w(TAG, "文件下载取消: 连接未恢复 $p")
                     return@Thread
                 }
-                sender.send(RelayCommands.RSP_FS_GET, "$total|${f.name}|ok")
+                // ★ 元信息(RSP_FS_GET)也同步发送，确保控制端一定收到才能显示进度条
+                Log.i(TAG, "[FS调试] 发送元信息 $total|${f.name}|ok time=${System.currentTimeMillis()}")
+                if (!sender.sendSync(RelayCommands.RSP_FS_GET, "$total|${f.name}|ok".toByteArray(Charsets.UTF_8), 15000)) {
+                    Log.w(TAG, "文件下载: 发送元信息失败 $p")
+                    return@Thread
+                }
                 val buf = ByteArray(128 * 1024)
                 var sentBytes = 0L
+                var blockIdx = 0
+                var lastLogProgress = -1
+                // ★ 分块确认：控制端每收到一块回ACK(块序号)，被控端等待确认后才发送下一块
+                //   参照PC端微信_download_send_file_blocked：发送→等待ACK→确认后继续
+                //   防止中继→控制端链路拥塞时盲目高速发送导致数据堆积丢失
                 f.inputStream().use { ins ->
                     while (true) {
+                        // ★ 检查取消标志：控制端发送CMD_FS_CANCEL后，立即停止读取和发送
+                        if (fsDownloadCancelled) {
+                            Log.i(TAG, "文件下载被取消: $p (已发送 $sentBytes/$total bytes, 块$blockIdx)")
+                            return@Thread
+                        }
                         val n = ins.read(buf)
                         if (n <= 0) break
                         val chunk = if (n == buf.size) buf else buf.copyOf(n)
-                        // ★ 每块发送前检查连接状态：断线时等待重连，避免数据丢失
+                        // ★ 数据块负载加4字节大端块序号前缀（供控制端去重，防止ACK丢失重发导致重复写盘）
+                        val framedChunk = java.nio.ByteBuffer.allocate(4 + chunk.size)
+                            .putInt(blockIdx).put(chunk).array()
+                        // ★ 每块发送前检查连接状态：断线时等待重连（最多30秒，等待期间主动发心跳刷NAT）
                         if (!sender.isConnected()) {
-                            Log.w(TAG, "文件下载: 连接中断，等待重连... (已发送 $sentBytes/$total)")
+                            Log.w(TAG, "文件下载: 连接中断，等待重连... (已发送 $sentBytes/$total, 块$blockIdx)")
                             if (!waitForConnection(sender, 30000)) {
-                                Log.w(TAG, "文件下载中止: 重连超时 $p (已发送 $sentBytes/$total)")
+                                Log.w(TAG, "文件下载中止: 重连超时 $p (已发送 $sentBytes/$total, 块$blockIdx)")
                                 return@Thread
                             }
                         }
-                        sender.send(RelayCommands.CMD_FS_DATA, chunk)
+                        // ★ 同步发送：等待实际写入socket+flush成功，返回false立即失败处理
+                        val sendT0 = System.currentTimeMillis()
+                        val sendOk = sender.sendSync(RelayCommands.CMD_FS_DATA, framedChunk, 20000)
+                        val sendCost = System.currentTimeMillis() - sendT0
+                        if (sendOk) {
+                            // ★ 调试：每块记录发送耗时与累计进度（写入文件，定位停滞丢包环节）
+                            val pct = if (total > 0) (sentBytes * 100 / total).toInt() else 0
+                            Log.i(TAG, "[FS调试] 块$blockIdx 发送OK 耗时${sendCost}ms 块大小${chunk.size} 累计$sentBytes/$total($pct%) 连接=${sender.isConnected()}")
+                        } else {
+                            // 发送失败：可能连接半开，尝试等待重连一次再发
+                            Log.w(TAG, "文件下载: 块$blockIdx 同步发送失败，等待重连后重试... (已发送 $sentBytes/$total)")
+                            if (!waitForConnection(sender, 30000)) {
+                                Log.w(TAG, "文件下载中止: 块$blockIdx 重连后仍发送失败 $p")
+                                return@Thread
+                            }
+                            // 重连后重试一次该块（失败则退出）
+                            if (!sender.sendSync(RelayCommands.CMD_FS_DATA, framedChunk, 20000)) {
+                                Log.w(TAG, "文件下载中止: 块$blockIdx 重试失败 $p")
+                                return@Thread
+                            }
+                        }
+                        // ★ 等待控制端ACK确认本块（最多15秒，参照PC微信wait_for_block_ack 60s的缩版）
+                        //   未确认说明中继→控制端链路拥塞/断开，不能继续发送下一块（否则数据堆积丢失）
+                        val ackDeadline = System.currentTimeMillis() + 15000
+                        var ackGot = false
+                        while (System.currentTimeMillis() < ackDeadline) {
+                            if (fsDownloadCancelled) {
+                                Log.i(TAG, "文件下载被取消(等ACK): $p (块$blockIdx)")
+                                return@Thread
+                            }
+                            if (fsAckBlock >= blockIdx) {
+                                ackGot = true
+                                break
+                            }
+                            Thread.sleep(50)
+                        }
+                        if (!ackGot) {
+                            // ★ ACK超时：可能(1)链路拥塞ACK在途延迟 (2)数据未到达控制端。
+                            //   先等待连接恢复并额外等待15秒让延迟ACK到达，避免重复写盘；
+                            //   仍无ACK才判定数据丢失，重发该块（与PC微信ACK重试一致）。
+                            Log.w(TAG, "文件下载: 块$blockIdx ACK超时(15s)，等待连接恢复与延迟ACK... (已发送 $sentBytes/$total)")
+                            val connOk = waitForConnection(sender, 30000)
+                            if (!connOk) {
+                                Log.w(TAG, "文件下载中止: 块$blockIdx ACK超时且连接未恢复 $p")
+                                return@Thread
+                            }
+                            // 连接恢复后再等待15秒（延迟ACK可能已在中继队列）
+                            val ack2Deadline = System.currentTimeMillis() + 15000
+                            var ack2Got = false
+                            while (System.currentTimeMillis() < ack2Deadline) {
+                                if (fsDownloadCancelled) {
+                                    Log.i(TAG, "文件下载被取消(等延迟ACK): $p (块$blockIdx)")
+                                    return@Thread
+                                }
+                                if (fsAckBlock >= blockIdx) {
+                                    ack2Got = true
+                                    break
+                                }
+                                Thread.sleep(50)
+                            }
+                            if (!ack2Got) {
+                                // 数据块确认丢失：重发该块（控制端未收到才可能发生，写盘不会重复）
+                                consecutiveRetries++
+                                if (consecutiveRetries >= maxConsecutiveRetries) {
+                                    Log.w(TAG, "文件下载中止: 块$blockIdx 连续${consecutiveRetries}次ACK超时（控制端可能已离线），自动放弃 $p")
+                                    return@Thread
+                                }
+                                Log.w(TAG, "文件下载: 块$blockIdx 数据确认丢失，重发该块... (已发送 $sentBytes/$total, 连续${consecutiveRetries}次)")
+                                if (!sender.sendSync(RelayCommands.CMD_FS_DATA, framedChunk, 20000)) {
+                                    Log.w(TAG, "文件下载中止: 块$blockIdx ACK超时后重发失败 $p")
+                                    return@Thread
+                                }
+                                Log.i(TAG, "文件下载: 块$blockIdx 重发OK")
+                            } else {
+                                consecutiveRetries = 0
+                                Log.i(TAG, "文件下载: 块$blockIdx 延迟ACK已到达")
+                            }
+                        } else {
+                            consecutiveRetries = 0
+                            Log.i(TAG, "[FS调试] 块$blockIdx 已确认(ACK)")
+                        }
                         sentBytes += n
-                        // ★ 流控：每块间隔20ms，防止发送队列积压过多分块导致内存暴涨
-                        Thread.sleep(20)
+                        blockIdx++
+                        // ★ 进度日志（每10块 或 每10% 或 最后一块），参考微信下载的调试能力
+                        val progress = if (total > 0) (sentBytes * 100 / total).toInt() else 0
+                        if (blockIdx % 10 == 0 || progress >= lastLogProgress + 10 || sentBytes >= total) {
+                            lastLogProgress = progress
+                            Log.i(TAG, "文件下载进度: $p 块$blockIdx, $sentBytes/$total bytes ($progress%)")
+                        }
+                        // ★ 流控延迟50ms（与PC端微信下载_send_file_blocked一致），
+                        //   让出CPU+避免TCP发送缓冲区积压过多数据导致ACK超时
+                        Thread.sleep(50)
                     }
                 }
-                // ★ 等待连接就绪后再发送完成标记
+                // ★ 等待连接就绪后再同步发送完成标记（确保控制端收到后关闭进度条）
                 if (!waitForConnection(sender, 30000)) {
                     Log.w(TAG, "文件下载完成但连接断开，无法发送完成标记: $p")
                     return@Thread
                 }
-                sender.send(RelayCommands.CMD_FS_DONE, "")
-                Log.i(TAG, "fs download done: $p ($total bytes)")
+                if (!sender.sendSync(RelayCommands.CMD_FS_DONE, ByteArray(0), 15000)) {
+                    Log.w(TAG, "文件下载: 发送完成标记CMD_FS_DONE失败 $p")
+                    return@Thread
+                }
+                Log.i(TAG, "fs download done: $p ($total bytes, $blockIdx blocks)")
             } catch (e: Exception) {
                 Log.w(TAG, "文件下载异常: $p ${e.message}")
                 try {
                     sender.send(RelayCommands.RSP_FS_GET, "0||error")
                 } catch (ignored: Exception) {
                 }
+            } finally {
+                // ★ 清除当前下载线程引用（互斥锁释放，允许下一次下载）
+                if (fsDownloadThread === Thread.currentThread()) {
+                    fsDownloadThread = null
+                }
             }
-        }, "FsDownload").apply { isDaemon = true }.start()
+        }, "FsDownload").apply {
+            isDaemon = true
+            fsDownloadThread = this
+        }.start()
     }
 
-    /** ★ 等待sender连接就绪（用于文件下载断线重连），返回是否在超时内恢复 */
+    /**
+     * ★ 等待sender连接就绪（用于文件下载断线重连），返回是否在超时内恢复。
+     *   等待期间每秒主动发送一次CMD_PING心跳（即使失败也无害），
+     *   一旦连接恢复立即触发出站数据，刷新运营商NAT映射防止静默断连。
+     */
     private fun waitForConnection(sender: RelaySender?, timeoutMs: Long): Boolean {
         if (sender == null) return false
         if (sender.isConnected()) return true
+        Log.w(TAG, "[FS调试] waitForConnection 开始等待连接恢复 timeout=${timeoutMs}ms time=${System.currentTimeMillis()}")
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
             try {
@@ -609,8 +1136,17 @@ object RelayServerHandler {
             } catch (_: InterruptedException) {
                 return false
             }
-            if (sender.isConnected()) return true
+            // ★ 每1秒尝试发送一次心跳：恢复的瞬间立刻有出站数据，刷新NAT映射
+            try {
+                sender.send(RelayCommands.CMD_PING, "ping")
+            } catch (_: Exception) {
+            }
+            if (sender.isConnected()) {
+                Log.i(TAG, "[FS调试] waitForConnection 连接已恢复 time=${System.currentTimeMillis()}")
+                return true
+            }
         }
+        Log.w(TAG, "[FS调试] waitForConnection 等待超时")
         return false
     }
 
@@ -640,40 +1176,6 @@ object RelayServerHandler {
             values.put(ContactsContract.CommonDataKinds.Phone.NUMBER, phoneNumber)
             values.put(ContactsContract.CommonDataKinds.Phone.TYPE, ContactsContract.CommonDataKinds.Phone.TYPE_MOBILE)
             XUtil.getContentResolver().insert(ContactsContract.Data.CONTENT_URI, values)
-        }
-    }
-
-    private fun wakeOnLAN(macAddress: String, broadcastAddress: String? = null, port: Int = 9) {
-        try {
-            val macBytes = macAddress.replace("-", ":").split(":").map { it.uppercase(Locale.getDefault()).toInt(16).toByte() }.toByteArray()
-            val magicPacket = ByteArray(102)
-
-            // 首先添加6个0xFF字节
-            for (i in 0 until 6) {
-                magicPacket[i] = 0xFF.toByte()
-            }
-
-            // 之后添加16次MAC地址
-            for (i in 6 until magicPacket.size step macBytes.size) {
-                macBytes.copyInto(magicPacket, i, 0, macBytes.size)
-            }
-
-            val broadcastIP = if (broadcastAddress != null) {
-                InetAddress.getByName(broadcastAddress)
-            } else {
-                InetAddress.getByName("255.255.255.255")
-            }
-
-            // 创建 UDP 数据包
-            val packet = DatagramPacket(magicPacket, magicPacket.size, broadcastIP, port)
-
-            // 发送数据包
-            val socket = DatagramSocket()
-            socket.send(packet)
-            socket.close()
-            Log.d(TAG, "WOL packet sent successfully.")
-        } catch (e: Exception) {
-            Log.d(TAG, "Error sending WOL packet: ${e.message}")
         }
     }
 }

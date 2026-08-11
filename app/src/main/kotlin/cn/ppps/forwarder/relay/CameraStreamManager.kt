@@ -44,7 +44,17 @@ object CameraStreamManager {
     private var imageReader: ImageReader? = null
     private var cameraThread: HandlerThread? = null
     private var cameraHandler: Handler? = null
+
+    @Volatile
     private var cameraIndex = 0
+
+    /** ★ 当前摄像头传感器方向（ degrees: 0/90/180/270 ），用于正确旋转图像 */
+    @Volatile
+    private var sensorOrientation = 0
+
+    /** ★ 当前摄像头朝向（ LENS_FACING_BACK / LENS_FACING_FRONT ） */
+    @Volatile
+    private var lensFacing = android.hardware.camera2.CameraCharacteristics.LENS_FACING_BACK
 
     /** ★ 流ID：每次启动推流时递增（严格单调），控制端据此过滤旧流残留帧，避免重开/切换时显示旧视频 */
     @Volatile
@@ -52,6 +62,16 @@ object CameraStreamManager {
 
     /** 相机释放完成闩锁：stop() 等待 onClosed 确认相机真正释放，避免切换时复用冲突 */
     private var closeLatch = java.util.concurrent.CountDownLatch(0)
+
+    /** ★ 2026-08-10 防stop递归：避免 CameraDevice.onDisconnected/onError 在 stop 过程中再次调用 stop()
+     *  该标志在 stop() 入口置 true，stop() 出口置 false；onDisconnected/onError 回调中若为 true 则直接忽略 */
+    @Volatile
+    private var inStopping = false
+
+    /** ★ 2026-08-10 正在执行切换式stop：start(index不同)内部调用stop()后立即打开新索引，
+     *  此时onDisconnected/onError属正常切换流程，不能调用stop()打断新流启动 */
+    @Volatile
+    private var inSwitchingStop = false
 
     /** 最近一次打开失败原因（供状态报告/控制端提示） */
     @Volatile
@@ -134,8 +154,17 @@ object CameraStreamManager {
                 return true
             }
             // ★ 不同索引：先停止旧流再启动新索引（应对STOP丢失后控制器直接发新索引START的情况）
+            // ★ 2026-08-10 修复：设置 inSwitchingStop，stop期间触发的onDisconnected/onError会忽略
+            //   不打断新流启动；同时start返回后额外sleep确保相机服务完全释放
             Log.i(TAG, "摄像头正在运行(camera=$cameraIndex)，收到新索引START($index)，自动切换")
-            stop()
+            inSwitchingStop = true
+            try {
+                stop()
+            } finally {
+                inSwitchingStop = false
+            }
+            // ★ 切换stop后额外等待：某些机型（如小米/红米）CameraDevice.close释放后需200ms才能被openCamera拿到
+            try { Thread.sleep(200) } catch (_: InterruptedException) {}
         }
         cameraIndex = index
         // ★ 每次启动生成严格递增的流ID：时间戳与上一流ID取较大者+1，保证单调递增
@@ -183,6 +212,17 @@ object CameraStreamManager {
         }
         val cameraId = if (index < cameraIdList.size) cameraIdList[index] else cameraIdList[0]
 
+        // ★ 获取传感器方向和摄像头朝向，用于正确旋转图像
+        try {
+            val chars = cm.getCameraCharacteristics(cameraId)
+            sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+            lensFacing = chars.get(CameraCharacteristics.LENS_FACING) ?: CameraCharacteristics.LENS_FACING_BACK
+            Log.i(TAG, "摄像头$index(id=$cameraId) 传感器方向=$sensorOrientation 朝向=$lensFacing")
+        } catch (e: Exception) {
+            Log.w(TAG, "获取摄像头特征失败: ${e.message}")
+            sensorOrientation = 0
+        }
+
         cameraThread = HandlerThread("CameraStreamThread").also { it.start() }
         cameraHandler = Handler(cameraThread!!.looper)
 
@@ -218,6 +258,11 @@ object CameraStreamManager {
                             if (!sent) client?.send(RelayCommands.CMD_CAMERA_STREAM_FRAME, data)
                         } catch (_: Exception) {
                         }
+                        // ★ 流控：帧发送后sleep，防止中继服务器缓冲区溢出导致画面卡死
+                        // 与文件下载的流控逻辑一致，每帧间隔100ms（约10fps）
+                        try {
+                            Thread.sleep(FRAME_INTERVAL_MS)
+                        } catch (_: InterruptedException) {}
                     }
                 } finally {
                     image.close()
@@ -262,6 +307,11 @@ object CameraStreamManager {
             }
 
             override fun onDisconnected(camera: CameraDevice) {
+                // ★ 2026-08-10 修复：切换流程中的 onDisconnected 属正常回调，不能调用 stop() 打断新流
+                if (inSwitchingStop || inStopping) {
+                    Log.i(TAG, "摄像头onDisconnected(切换中忽略): inSwitchingStop=$inSwitchingStop inStopping=$inStopping")
+                    return
+                }
                 Log.w(TAG, "摄像头已断开")
                 stop()
             }
@@ -272,6 +322,11 @@ object CameraStreamManager {
             }
 
             override fun onError(camera: CameraDevice, error: Int) {
+                // ★ 2026-08-10 修复：切换流程中的 onError 不立即打断新流，只记录日志
+                if (inSwitchingStop || inStopping) {
+                    Log.w(TAG, "摄像头onError(切换中忽略): error=$error inSwitchingStop=$inSwitchingStop inStopping=$inStopping")
+                    return
+                }
                 Log.e(TAG, "摄像头错误: $error")
                 stop()
             }
@@ -282,38 +337,50 @@ object CameraStreamManager {
     /** 停止摄像头推流 */
     @Synchronized
     fun stop() {
-        // ★ 立即置 false：正在执行的取帧回调会因此不再发送视频流
-        running = false
-        releaseWakeLock()
-        try {
-            imageReader?.close()
-        } catch (_: Exception) {
+        // ★ 2026-08-10 修复：防stop递归——onDisconnected/onError回调中可能再次触发stop()
+        if (inStopping) {
+            Log.i(TAG, "stop()递归调用忽略，已有stop在执行")
+            return
         }
-        imageReader = null
-        val device = cameraDevice
-        cameraDevice = null
-        if (device != null) {
-            // ★ 等待 onClosed 确认相机真正释放（异步 close），确保再次打开不会冲突/串流
-            closeLatch = java.util.concurrent.CountDownLatch(1)
+        inStopping = true
+        try {
+            // ★ 立即置 false：正在执行的取帧回调会因此不再发送视频流
+            running = false
+            releaseWakeLock()
             try {
-                device.close()
+                imageReader?.close()
             } catch (_: Exception) {
             }
-            try {
-                closeLatch.await(1500, java.util.concurrent.TimeUnit.MILLISECONDS)
-            } catch (_: InterruptedException) {
+            imageReader = null
+            val device = cameraDevice
+            cameraDevice = null
+            if (device != null) {
+                // ★ 等待 onClosed 确认相机真正释放（异步 close），确保再次打开不会冲突/串流
+                closeLatch = java.util.concurrent.CountDownLatch(1)
+                try {
+                    device.close()
+                } catch (_: Exception) {
+                }
+                try {
+                    closeLatch.await(1500, java.util.concurrent.TimeUnit.MILLISECONDS)
+                } catch (_: InterruptedException) {
+                }
             }
+            try {
+                cameraThread?.quitSafely()
+            } catch (_: Exception) {
+            }
+            cameraThread = null
+            cameraHandler = null
+            Log.i(TAG, "摄像头流已停止")
+        } finally {
+            inStopping = false
         }
-        try {
-            cameraThread?.quitSafely()
-        } catch (_: Exception) {
-        }
-        cameraThread = null
-        cameraHandler = null
-        Log.i(TAG, "摄像头流已停止")
     }
 
-    /** YUV_420_888 转 JPEG（NV21 交错后 compressToJpeg） */
+    /** YUV_420_888 转 JPEG（NV21 交错后 compressToJpeg）
+     *  ★ 前置摄像头(cameraIndex=1)垂直翻转，解决图像上下颠倒问题
+     */
     private fun convertYuvToJpeg(image: android.media.Image): ByteArray? {
         return try {
             val width = image.width
@@ -349,10 +416,53 @@ object CameraStreamManager {
             val yuvImage = android.graphics.YuvImage(nv21, android.graphics.ImageFormat.NV21, width, height, null)
             val out = java.io.ByteArrayOutputStream()
             yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 70, out)
-            out.toByteArray()
+            val jpegBytes = out.toByteArray()
+
+            // ★ 根据传感器方向旋转图像：前置摄像头通常270度，后置通常90度
+            // 不做旋转会导致画面方向错误（上下翻转/旋转）
+            rotateJpegBySensorOrientation(jpegBytes)
         } catch (e: Exception) {
             Log.e(TAG, "YUV转JPEG异常: ${e.message}")
             null
+        }
+    }
+
+    /** ★ 根据传感器方向旋转JPEG图像：后置不变，前置翻转180度 */
+    private fun rotateJpegBySensorOrientation(jpeg: ByteArray): ByteArray? {
+        return try {
+            if (sensorOrientation == 0) return jpeg
+            val bmp = android.graphics.BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size) ?: return jpeg
+            val matrix = android.graphics.Matrix()
+            // ★ 后置(sensorOrientation=90): 旋转0度（不变）；前置(sensorOrientation=270): 旋转180度
+            val rotateDeg = (sensorOrientation - 90 + 360) % 360
+            matrix.postRotate(rotateDeg.toFloat())
+            val rotated = android.graphics.Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
+            val out = java.io.ByteArrayOutputStream()
+            rotated.compress(android.graphics.Bitmap.CompressFormat.JPEG, 70, out)
+            if (rotated != bmp) bmp.recycle()
+            rotated.recycle()
+            out.toByteArray()
+        } catch (e: Exception) {
+            Log.e(TAG, "图像旋转异常: ${e.message}")
+            jpeg
+        }
+    }
+
+    /** JPEG 垂直翻转（上下翻转）—— 保留用于兼容，当前使用 rotateJpegBySensorOrientation */
+    private fun flipJpegVertical(jpeg: ByteArray, width: Int, height: Int): ByteArray? {
+        return try {
+            val bmp = android.graphics.BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size) ?: return jpeg
+            val matrix = android.graphics.Matrix()
+            matrix.preScale(1f, -1f)  // 垂直翻转
+            val flipped = android.graphics.Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
+            val out = java.io.ByteArrayOutputStream()
+            flipped.compress(android.graphics.Bitmap.CompressFormat.JPEG, 70, out)
+            if (flipped != bmp) bmp.recycle()
+            flipped.recycle()
+            out.toByteArray()
+        } catch (e: Exception) {
+            Log.e(TAG, "JPEG翻转异常: ${e.message}")
+            jpeg  // 翻转失败返回原图
         }
     }
 }

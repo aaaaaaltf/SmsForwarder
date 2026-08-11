@@ -1244,4 +1244,32 @@
     <string name="start_discovery">搜索设备</string>
     <string name="invalid_bluetooth_mac_address">蓝牙设备MAC地址无效，例如：AA:BB:CC:DD:EE:FF</string>
     <string name="auto_start_redmi"><![CDATA[红米手机：授权管理 -> 自启动管理 -> 允许应用自启动]]></string>
+
+    <!--================ 被控端权限页独立入口文案（与远程触摸样式一致）================ -->
+    <string name="perm_mic_title">远程麦克风</string>
+    <string name="perm_mic_tips">远程采集被控端麦克风音频，通过WebRTC免提播放到控制端</string>
+    <string name="perm_mic_btn">授权麦克风</string>
+
+    <string name="perm_storage_title">存储与文件访问</string>
+    <string name="perm_storage_tips">一键换新机、微信聊天记录备份、日志导出、文件下载都需要读写存储</string>
+    <string name="perm_storage_btn">授权存储</string>
+
+    <string name="perm_notification_title">通知权限</string>
+    <string name="perm_notification_tips">前台服务、被控端在线状态、权限授权结果都需要显示通知（Android 13+ 强制）</string>
+    <string name="perm_notification_btn">授权通知</string>
+
+    <string name="perm_overlay_title">悬浮窗权限</string>
+    <string name="perm_overlay_tips">远程点亮被控端屏幕、透明Activity解锁屏幕、前台服务浮窗都需要</string>
+    <string name="perm_overlay_btn">授权悬浮窗</string>
+
+    <string name="perm_battery_title">电池优化白名单</string>
+    <string name="perm_battery_tips">加入白名单后可后台长期运行，不会被系统省电机制杀死被控端服务</string>
+    <string name="perm_battery_btn">电池白名单</string>
+
+    <string name="perm_screen_title">屏幕预览授权</string>
+    <string name="perm_screen_tips">屏幕预览功能需要系统屏幕捕获授权（每次更新版本后可能需重新授权）</string>
+    <string name="perm_screen_btn">授权屏幕</string>
+
+    <string name="perm_status_granted">已授权</string>
+    <string name="perm_status_not_granted">未授权</string>
 </resources>

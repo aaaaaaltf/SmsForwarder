@@ -26,9 +26,19 @@ class ZtDirectClient(
     private val TAG = "ZtDirectClient"
     private val sendLock = Any()
 
-    /** ★ 专用发送线程：所有socket写操作必须在后台线程执行，禁止主线程直发 */
+    /** ★ 下载/普通数据发送线程池（单线程保证顺序） */
     private val sendExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
         Thread(r, "ZtDirectSend").apply { isDaemon = true }
+    }
+
+    /** ★ 心跳专用发送线程池（独立通道，不被下载大流量堵队列） */
+    private val heartBeatExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "ZtDirectHb").apply { isDaemon = true }
+    }
+
+    /** 判断是否为心跳类命令（设备状态/心跳ping），走独立发送通道 */
+    private fun isHeartBeatCmd(cmd: String): Boolean {
+        return cmd == RelayCommands.CMD_DEV_STATE || cmd == RelayCommands.RSP_PONG
     }
 
     @Volatile
@@ -59,6 +69,7 @@ class ZtDirectClient(
         }
         socket = null
         sendExecutor.shutdownNow()
+        heartBeatExecutor.shutdownNow()
     }
 
     private fun connectLoop() {
@@ -135,8 +146,10 @@ class ZtDirectClient(
     override fun send(cmd: String, payload: ByteArray) {
         val s = socket ?: return
         val frame = FrameCodec.encode(cmd.toByteArray(Charsets.US_ASCII) + payload)
+        // ★ 心跳类命令走独立心跳线程池，不被下载大流量堵队列
+        val executor = if (isHeartBeatCmd(cmd)) heartBeatExecutor else sendExecutor
         try {
-            sendExecutor.execute {
+            executor.execute {
                 try {
                     synchronized(sendLock) {
                         val out = s.getOutputStream()
@@ -153,6 +166,40 @@ class ZtDirectClient(
             }
         } catch (e: Exception) {
             Log.w(TAG, "提交ZT直连发送任务失败: ${e.message}")
+        }
+    }
+
+    /** ★ 同步发送：等待数据实际写入socket+flush成功，返回结果，供文件下载可靠发送使用 */
+    override fun sendSync(cmd: String, payload: ByteArray, timeoutMs: Long): Boolean {
+        val s = socket ?: return false
+        if (!isConnected()) return false
+        val frame = FrameCodec.encode(cmd.toByteArray(Charsets.US_ASCII) + payload)
+        val future = try {
+            sendExecutor.submit<Boolean> {
+                try {
+                    synchronized(sendLock) {
+                        if (!isConnected()) return@submit false
+                        val out = s.getOutputStream()
+                        out.write(frame)
+                        out.flush()
+                    }
+                    true
+                } catch (e: Exception) {
+                    Log.w(TAG, "ZT直连同步发送失败: ${e.javaClass.simpleName}: ${e.message}")
+                    try { s.close() } catch (_: Exception) {}
+                    false
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "提交ZT直连同步发送任务失败: ${e.message}")
+            return false
+        }
+        return try {
+            future.get(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+        } catch (e: Exception) {
+            Log.w(TAG, "ZT直连同步发送超时/中断: ${e.javaClass.simpleName}: ${e.message}")
+            try { future.cancel(true) } catch (_: Exception) {}
+            false
         }
     }
 

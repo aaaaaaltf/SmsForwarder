@@ -25,8 +25,8 @@ object RelayCommands {
     /** 控制端连接中继的端口（本项目专用，原56782） */
     const val RELAY_CONTROLLER_PORT = 56787
 
-    /** 中继视频流端口（屏幕预览推流/收流，本项目专用，原56783） */
-    const val RELAY_VIDEO_PORT = 56788
+    /** 中继视频流端口（屏幕预览推流/收流，本项目专用，原56783 → 56888与服务器一致） */
+    const val RELAY_VIDEO_PORT = 56888
 
     /** 控制端类型标识：手机控制端 */
     const val CTRL_TYPE_PHONE: Byte = 0x01
@@ -96,6 +96,19 @@ object RelayCommands {
     /** 摄像头视频帧（二进制负载: 索引|JPEG） */
     const val CMD_CAMERA_STREAM_FRAME = "vcdfrm000000"
 
+    // ==================== 被控端麦克风音频流（控制端免提播放） ====================
+    // ★ 2026-08-10 修复：所有命令严格12字符（与CMD_PREFIX_LEN=12一致），否则parse只取前12字符前缀导致匹配失败！
+    /** 启动麦克风采集并推流，负载空 */
+    const val CMD_MIC_START = "sfmicstr0000"
+    /** 停止麦克风采集，负载空 */
+    const val CMD_MIC_STOP = "sfmicstp0000"
+    /** 麦克风音频帧（二进制=PCM 16bit/单声道/8000Hz）——命令通道回退用 */
+    const val CMD_MIC_FRAME = "sfmicfrm0000"
+    /** ★ 2026-08-09 麦克风数据通道端口（独立于命令通道56786和视频流56788，避开relay_control的56790） */
+    const val MIC_DATA_PORT = 56791
+    /** ★ 2026-08-09 麦克风数据通道就绪通知（负载: host|port），控制端收到后连接数据通道 */
+    const val CMD_MIC_DATA_READY = "sfmicdr00000"
+
     // ==================== 控制端 → 被控端（请求命令） ====================
     /** 心跳探测（控制端每5秒发送，用于连接保活与在线检测；负载可为空） */
     const val CMD_PING = "sfping000000"
@@ -120,9 +133,6 @@ object RelayCommands {
 
     /** 查询定位 */
     const val CMD_LOCATION = "sflocqry0000"
-
-    /** 远程WOL唤醒（负载: WolData JSON） */
-    const val CMD_WOL = "sfwolsnd0000"
 
     /** 一键换新机-拉取配置（负载: "pull" 或 CloneInfo JSON） */
     const val CMD_CLONE_PULL = "sfclone00000"
@@ -155,6 +165,29 @@ object RelayCommands {
     /** 下载完成（被控端→控制端） */
     const val CMD_FS_DONE = "sfdone000000"
 
+    /** ★ 取消下载（控制端→被控端，通过专用命令通道发送，被控端立即停止发送数据） */
+    const val CMD_FS_CANCEL = "sfcancel0000"
+
+    /** ★ 取消下载确认（被控端→控制端，负载: 1|stopped|已停止 或 0|failed|原因） */
+    const val RSP_FS_CANCEL = "sfcancelrsp0"
+
+    /** ★ 数据块接收确认（控制端→被控端，负载: 空；被控端每块发送后等待此ACK，参照PC微信分块确认） */
+    const val CMD_FS_ACK = "sfack0000000"
+
+    // ==================== ★ WebRTC 信令命令（2026-08-10新增，复用现有命令通道传SDP/ICE） ★ ====================
+    // ★ 摄像头预览 + 麦克风同步的WebRTC模式：控制端发送CMD_WEBRTC_OFFER(而非分开的vcdstr/sfmicstr)，
+    //   被控端回ANSWER+ICE+CANDIDATES，两端建立PeerConnection后音视频由WebRTC传输（VP8/H264+Opus+AEC/NS/AGC+抗抖动）
+    /** 控制端 → 被控端：WebRTC OFFER SDP（负载: 摄像头索引|SDP_BASE64） */
+    const val CMD_WEBRTC_OFFER    = "wrxoffer0000"
+    /** 被控端 → 控制端：WebRTC ANSWER SDP（负载: SDP_BASE64） */
+    const val CMD_WEBRTC_ANSWER   = "wrxanswer000"
+    /** 双向：WebRTC ICE Candidate（负载: 方向(OFFERER/ANSWERER)|SDP_MID|SDP_MLINE_INDEX|CANDIDATE_SDP_BASE64） */
+    const val CMD_WEBRTC_CANDIDATE = "wrxcand00000"
+    /** 双向：WebRTC 结束/挂断（负载可空） */
+    const val CMD_WEBRTC_HANGUP   = "wrxhangup000"
+    /** 被控端 → 控制端：WebRTC 状态报告（负载: creating_offer|creating_answer|connecting|connected|failed|closed|reason） */
+    const val CMD_WEBRTC_STATUS   = "wrxstatus000"
+
     // ==================== 被控端 → 控制端（响应命令） ====================
     const val RSP_CONFIG = "sfcfgrsp0000"
     /** 心跳探测响应 */
@@ -165,7 +198,6 @@ object RelayCommands {
     const val RSP_CONTACT_QUERY = "sfconqrsp000"
     const val RSP_CONTACT_ADD = "sfcadrsp0000"
     const val RSP_LOCATION = "sflocrsp0000"
-    const val RSP_WOL = "sfwolrsp0000"
     const val RSP_CLONE = "sfclonersp00"
     const val RSP_ERROR = "sferrrsp0000"
 

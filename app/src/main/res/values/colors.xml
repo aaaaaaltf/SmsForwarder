@@ -145,4 +145,10 @@
     <color name="tooltip_background_dark">#e6616161</color>
     <color name="tooltip_background_light">#e6ffffff</color>
     <color name="white">#ffffffff</color>
+
+    <!-- ★ 补充 XUI 库缺失的颜色资源 -->
+    <color name="xui_config_color_white">#ffffffff</color>
+    <color name="xui_config_color_main_theme">#299EE3</color>
+    <color name="xui_config_color_red">#FFFF0000</color>
+    <color name="xui_config_color_waring">#FFFFC107</color>
 </resources>

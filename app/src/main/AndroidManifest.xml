@@ -51,6 +51,11 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- 后台启动点亮屏幕Activity（远程点亮被控端屏幕） -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!-- 远程麦克风采集（被控端采集麦克风音频推送到控制端免提播放） -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <!-- Android 14+ 后台录制音频必须声明 microphone 类型前台服务 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
 
     <application
         android:name=".App"
@@ -96,14 +101,6 @@
             android:name=".activity.MainActivity"
             android:configChanges="screenSize|keyboardHidden|orientation|keyboard"
             android:exported="true"
-            android:screenOrientation="portrait"
-            android:windowSoftInputMode="adjustPan|stateHidden"
-            tools:ignore="DiscouragedApi" />
-        <activity
-            android:name=".activity.ClientActivity"
-            android:configChanges="screenSize|keyboardHidden|orientation|keyboard"
-            android:exported="true"
-            android:launchMode="singleInstance"
             android:screenOrientation="portrait"
             android:windowSoftInputMode="adjustPan|stateHidden"
             tools:ignore="DiscouragedApi" />
@@ -186,7 +183,7 @@
             android:name=".service.RelayServerService"
             android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="camera"
+            android:foregroundServiceType="camera|microphone"
             tools:targetApi="s" />
         <!--屏幕捕获授权服务（Android 14+ 需要 mediaProjection 前台服务）-->
         <service

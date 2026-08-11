@@ -31,16 +31,26 @@ class RelayServerListener(
     /** 发送失败日志限流（10秒内只打一次，避免断连时大量刷屏） */
     private var lastSendErrorLog = 0L
 
-    /** ★ 专用发送线程：所有socket写操作必须在后台线程执行，禁止主线程直发 */
+    /** ★ 下载/普通数据发送线程池（单线程保证顺序） */
     private val sendExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
         Thread(r, "RelaySrvSend").apply { isDaemon = true }
+    }
+
+    /** ★ 心跳专用发送线程池（独立通道，不被下载大流量堵队列） */
+    private val heartBeatExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "RelaySrvHb").apply { isDaemon = true }
+    }
+
+    /** 判断是否为心跳类命令（设备状态/心跳ping），走独立发送通道 */
+    private fun isHeartBeatCmd(cmd: String): Boolean {
+        return cmd == RelayCommands.CMD_DEV_STATE || cmd == RelayCommands.RSP_PONG
     }
 
     @Volatile
     private var serverSocket: ServerSocket? = null
 
-    /** ★ 多连接：connId → Socket（每连接独立线程处理） */
-    private val connections = ConcurrentHashMap<Long, Socket>()
+    /** ★ 多连接：connId → Socket（每连接独立线程处理）；internal供RelayServerService动态解析connId使用 */
+    internal val connections = ConcurrentHashMap<Long, Socket>()
     private val connIdGen = AtomicLong(0)
 
     @Volatile
@@ -77,6 +87,7 @@ class RelayServerListener(
         }
         connections.clear()
         sendExecutor.shutdownNow()
+        heartBeatExecutor.shutdownNow()
     }
 
     private fun acceptLoop() {
@@ -162,11 +173,49 @@ class RelayServerListener(
         enqueueSend(s, cmd, payload)
     }
 
+    /** ★ 同步发送（按connId指定连接），等待实际写入完成返回是否成功，供文件下载可靠发送使用 */
+    fun sendToSync(connId: Long, cmd: String, payload: ByteArray, timeoutMs: Long = 15000): Boolean {
+        val s = connections[connId] ?: return false
+        if (s.isClosed || !s.isConnected) return false
+        val frame = FrameCodec.encode(cmd.toByteArray(Charsets.US_ASCII) + payload)
+        val future = try {
+            sendExecutor.submit<Boolean> {
+                try {
+                    synchronized(sendLock) {
+                        if (s.isClosed || !s.isConnected) return@submit false
+                        val out = s.getOutputStream()
+                        out.write(frame)
+                        out.flush()
+                    }
+                    true
+                } catch (e: Exception) {
+                    val now = System.currentTimeMillis()
+                    if (now - lastSendErrorLog > 10000) {
+                        lastSendErrorLog = now
+                        Log.w(TAG, "同步发送失败: ${e.javaClass.simpleName}: ${e.message}，关闭连接")
+                    }
+                    try { s.close() } catch (_: Exception) {}
+                    false
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "提交同步发送任务失败: ${e.message}")
+            return false
+        }
+        return try {
+            future.get(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+        } catch (e: Exception) {
+            Log.w(TAG, "同步发送超时/中断: ${e.javaClass.simpleName}: ${e.message}")
+            try { future.cancel(true) } catch (_: Exception) {}
+            false
+        }
+    }
+
     fun sendTo(connId: Long, cmd: String, payload: String) {
         sendTo(connId, cmd, payload.toByteArray(Charsets.UTF_8))
     }
 
-    /** ★ 广播给所有已接入控制端（设备状态上报等） */
+    /** ★ 广播给所有已接入控制端（设备状态上报等）：心跳走独立池，避免下载堵队列 */
     fun broadcast(cmd: String, payload: ByteArray) {
         for (s in connections.values) {
             enqueueSend(s, cmd, payload)
@@ -192,8 +241,10 @@ class RelayServerListener(
     private fun enqueueSend(s: Socket, cmd: String, payload: ByteArray) {
         if (s.isClosed || !s.isConnected) return
         val frame = FrameCodec.encode(cmd.toByteArray(Charsets.US_ASCII) + payload)
+        // ★ 心跳类命令走独立心跳线程池，不被下载大流量堵队列
+        val executor = if (isHeartBeatCmd(cmd)) heartBeatExecutor else sendExecutor
         try {
-            sendExecutor.execute {
+            executor.execute {
                 // ★ 发送前校验：连接可能已被关闭（断连后积压任务对旧socket发送会报错）
                 if (s.isClosed || !s.isConnected) return@execute
                 try {
@@ -222,5 +273,40 @@ class RelayServerListener(
 
     override fun send(cmd: String, payload: String) {
         send(cmd, payload.toByteArray(Charsets.UTF_8))
+    }
+
+    /**
+     * ★ 同步发送：等待数据实际写入socket并flush完成，返回是否成功
+     * 对Listener来说，sendSync用于无connId场景（一般不会用到，直连下载都用sendToSync），
+     * 这里复用latestConnection的同步发送逻辑。
+     */
+    override fun sendSync(cmd: String, payload: ByteArray, timeoutMs: Long): Boolean {
+        val s = latestConnection() ?: return false
+        if (s.isClosed || !s.isConnected) return false
+        val frame = FrameCodec.encode(cmd.toByteArray(Charsets.US_ASCII) + payload)
+        val future = try {
+            sendExecutor.submit<Boolean> {
+                try {
+                    synchronized(sendLock) {
+                        if (s.isClosed || !s.isConnected) return@submit false
+                        val out = s.getOutputStream()
+                        out.write(frame)
+                        out.flush()
+                    }
+                    true
+                } catch (e: Exception) {
+                    try { s.close() } catch (_: Exception) {}
+                    false
+                }
+            }
+        } catch (e: Exception) {
+            return false
+        }
+        return try {
+            future.get(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+        } catch (e: Exception) {
+            try { future.cancel(true) } catch (_: Exception) {}
+            false
+        }
     }
 }
