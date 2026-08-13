@@ -120,6 +120,10 @@ object RelayCommands {
     const val CMD_SETTINGS_SET = "sfset0000000"
     /** ★ 2026-08-11 设置参数响应（被控端→控制端，负载: 1|success|设置成功 或 0|failed|原因） */
     const val RSP_SETTINGS_SET = "sfsetrsp0000"
+    /** ★ 2026-08-13 查询被控端当前设置（控制端打开设置窗口时同步真实状态，负载空） */
+    const val CMD_SETTINGS_GET = "sfsetget0000"
+    /** ★ 2026-08-13 设置查询响应（被控端→控制端，负载: JSON，如 {"callRecord":true}） */
+    const val RSP_SETTINGS_GET = "sfsetgrsp000"
 
     /** 查询电量 */
     const val CMD_BATTERY = "sfbatqry0000"

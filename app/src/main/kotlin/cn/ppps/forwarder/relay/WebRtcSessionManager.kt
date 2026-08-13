@@ -193,6 +193,19 @@ class WebRtcSessionManager(
             false
         }
 
+        // ★★★ 2026-08-13 纯音频(麦克风录音)会话预检：麦克风被其他应用占用（如微信视频通话）时，
+        //   立即拒绝并明确反馈控制端"为什么没有声音"，不再走复杂的初始化/回退流程。
+        if (audioOnly) {
+            val busyPkg = MicrophoneStreamManager.micBusyByOtherApp()
+            if (busyPkg != null) {
+                val reason = "被控端麦克风被【$busyPkg】占用（可能正在视频通话），无法录音"
+                Log.e(TAG, "$stepTag ★ 麦克风被占用，拒绝启动纯音频会话: $reason")
+                cb.onStatus("mic_failed", reason)
+                closeInternal(false)
+                return
+            }
+        }
+
         // ★ 1. 初始化音频设备模块：开启 AEC/NS/AGC + Opus + NetEQ（一站式音频处理链）
         val adm = try {
             Log.i(TAG, "$stepTag [3/8] JavaAudioDeviceModule.builder 开始")
@@ -961,6 +974,14 @@ class WebRtcSessionManager(
                 override fun onCapturerStarted(success: Boolean) {
                     lastMonotonicTsNs = 0L
                     tsOffsetNs = 0L
+                    // ★★★ 2026-08-13 摄像头打开失败（被其他应用占用如视频通话/权限不足）→ 明确反馈控制端"为什么没有图像"
+                    if (!success) {
+                        val reason = "被控端摄像头无法打开（被其他应用占用如视频通话，或摄像头权限被收回）"
+                        Log.e(TAG, "$tag ★★★ [v6] 摄像头打开失败(onCapturerStarted=false) → $reason")
+                        try { signalingCallback?.onError(reason) } catch (_: Throwable) {}
+                        try { realObserver.onCapturerStarted(false) } catch (_: Throwable) {}
+                        return
+                    }
                     realObserver.onCapturerStarted(success)
                 }
                 override fun onCapturerStopped() { realObserver.onCapturerStopped() }

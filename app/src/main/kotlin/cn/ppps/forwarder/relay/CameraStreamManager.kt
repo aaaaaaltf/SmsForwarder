@@ -312,7 +312,10 @@ object CameraStreamManager {
                     Log.i(TAG, "摄像头onDisconnected(切换中忽略): inSwitchingStop=$inSwitchingStop inStopping=$inStopping")
                     return
                 }
-                Log.w(TAG, "摄像头已断开")
+                val reason = "被控端摄像头连接中断（可能被其他应用抢占，如正在视频通话）"
+                Log.w(TAG, reason)
+                lastError = reason
+                reportCameraErrorToControl(reason)
                 stop()
             }
 
@@ -327,11 +330,47 @@ object CameraStreamManager {
                     Log.w(TAG, "摄像头onError(切换中忽略): error=$error inSwitchingStop=$inSwitchingStop inStopping=$inStopping")
                     return
                 }
-                Log.e(TAG, "摄像头错误: $error")
+                // ★★★ 2026-08-13 明确反馈：摄像头打开失败原因（被占用/服务异常等）→ 控制端显示"为什么没有图像"
+                val reason = when (error) {
+                    CameraDevice.StateCallback.ERROR_CAMERA_IN_USE ->
+                        "被控端摄像头被其他应用占用（如正在视频通话），无法开启预览"
+                    CameraDevice.StateCallback.ERROR_CAMERA_DISABLED ->
+                        "被控端摄像头被系统策略禁用"
+                    CameraDevice.StateCallback.ERROR_CAMERA_SERVICE ->
+                        "被控端摄像头服务不可用"
+                    CameraDevice.StateCallback.ERROR_MAX_CAMERAS_IN_USE ->
+                        "被控端摄像头已达并发使用上限"
+                    else -> "被控端摄像头打开失败（错误码$error）"
+                }
+                lastError = reason
+                Log.e(TAG, "摄像头错误: $error → $reason")
+                reportCameraErrorToControl(reason)
                 stop()
             }
         }, cameraHandler!!)
         return true
+    }
+
+    /** ★★★ 2026-08-13 摄像头打开失败/中断时，向所有已连接通道发送状态报告，让控制端明确看到失败原因 */
+    private fun reportCameraErrorToControl(reason: String) {
+        try {
+            val data = "0|failed|$reason".toByteArray(Charsets.UTF_8)
+            synchronized(senders) {
+                var sent = false
+                for (s in senders) {
+                    if (s.isConnected()) {
+                        try {
+                            s.send(RelayCommands.CMD_CAMERA_STATUS_REPORT, data)
+                            sent = true
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
+                if (!sent) {
+                    try { client?.send(RelayCommands.CMD_CAMERA_STATUS_REPORT, data) } catch (_: Exception) {}
+                }
+            }
+        } catch (_: Throwable) {}
     }
 
     /** 停止摄像头推流 */

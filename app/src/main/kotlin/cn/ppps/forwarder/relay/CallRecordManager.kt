@@ -3,6 +3,7 @@ package cn.ppps.forwarder.relay
 import android.Manifest
 import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.MediaRecorder
 import android.net.Uri
@@ -32,7 +33,8 @@ import java.util.Locale
  * 3. 通话结束（IDLE）后：
  *    - 优先以通讯录中的名称为文件名 + 时间；不在通讯录则以电话号码 + 时间
  *    - 文件名标注呼入/呼出（如 张三_20260811_213000_呼入.m4a）
- *    - 保存到手机录音文件夹（Music/Recordings/CallRecord，Android 10+ 走 MediaStore）
+ *    - ★ 2026-08-13 保存到手机自带录音APP的相同目录（MIUI: MIUI/sound_recorder/call_rec），
+ *      未检测到系统目录时回退 MediaStore Music/Recordings/CallRecord
  */
 object CallRecordManager {
     private const val TAG = "CallRecord"
@@ -273,9 +275,31 @@ object CallRecordManager {
         }
     }
 
-    /** 复制到公共录音文件夹：Android 10+ 用 MediaStore，Android 9- 直接写外部存储 */
+    /** 复制到录音目录：★ 2026-08-13 优先写入手机自带录音APP的相同目录，失败/未检测到再回退MediaStore/公共目录 */
     private fun saveToRecordings(src: File, fileName: String) {
         val ctx = App.context
+        // ★★★ 2026-08-13 需求：保存目录与手机自带录音APP目录相同。
+        //   优先检测系统录音APP已有的通话录音目录（红米/MIUI: /storage/emulated/0/MIUI/sound_recorder/call_rec）
+        val sysDir = findSystemCallRecordDir()
+        if (sysDir != null) {
+            try {
+                val dir = File(sysDir)
+                if (!dir.exists()) dir.mkdirs()
+                if (dir.canWrite()) {
+                    val dst = File(dir, fileName)
+                    FileInputStream(src).use { inp -> FileOutputStream(dst).use { out -> inp.copyTo(out) } }
+                    Log.i(TAG, "录音已保存到系统录音APP目录: ${dst.absolutePath}")
+                    // 通知媒体库扫描，确保系统录音APP/文件管理器能立刻看到
+                    try {
+                        ctx.sendBroadcast(Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE, Uri.fromFile(dst)))
+                    } catch (_: Throwable) {}
+                    return
+                }
+                Log.w(TAG, "系统录音目录不可写($sysDir)，回退MediaStore保存")
+            } catch (t: Throwable) {
+                Log.w(TAG, "写入系统录音目录失败($sysDir)，回退MediaStore: ${t.message}")
+            }
+        }
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 val values = ContentValues().apply {
@@ -312,6 +336,56 @@ object CallRecordManager {
             Log.e(TAG, "保存录音到公共目录失败: ${t.message}，保留在私有目录")
             keepInPrivate(src, fileName)
         }
+    }
+
+    /**
+     * ★★★ 2026-08-13 查找手机自带录音APP的通话录音目录（保证保存目录与自带录音APP一致）
+     * 查找顺序：
+     * 1. 扫描媒体库中已存在的路径含 call_rec 的音频 → 直接复用其所在目录（最准确，任何品牌适用）
+     * 2. 小米/红米(MIUI) → 系统录音机固定目录 /storage/emulated/0/MIUI/sound_recorder/call_rec
+     * 3. 其他品牌 → 返回null（走MediaStore回退）
+     */
+    private fun findSystemCallRecordDir(): String? {
+        // 1. 优先复用系统录音APP已有通话录音所在目录
+        try {
+            val uri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+            } else {
+                MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+            }
+            val cursor = App.context.contentResolver.query(
+                uri,
+                arrayOf(MediaStore.Audio.Media.DATA),
+                "${MediaStore.Audio.Media.DATA} LIKE ?",
+                arrayOf("%/call_rec/%"),
+                "${MediaStore.Audio.Media.DATE_MODIFIED} DESC")
+            if (cursor != null) {
+                try {
+                    if (cursor.moveToFirst()) {
+                        val data = cursor.getString(0)
+                        if (!data.isNullOrEmpty()) {
+                            val dir = File(data).parent
+                            if (dir != null && dir.contains("call_rec", ignoreCase = true)) {
+                                Log.i(TAG, "检测到系统录音APP已有录音目录: $dir")
+                                return dir
+                            }
+                        }
+                    }
+                } finally {
+                    cursor.close()
+                }
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "扫描媒体库系统录音目录失败: ${t.message}")
+        }
+        // 2. 品牌默认：小米/红米(MIUI) 录音机通话录音目录
+        val brand = (Build.MANUFACTURER + " " + Build.BRAND).lowercase(Locale.ROOT)
+        if (brand.contains("xiaomi") || brand.contains("redmi") || brand.contains("mi ")) {
+            val dir = "/storage/emulated/0/MIUI/sound_recorder/call_rec"
+            Log.i(TAG, "小米/红米设备默认系统录音目录: $dir")
+            return dir
+        }
+        return null
     }
 
     /** 保存失败时的兜底：保留在app私有目录（后续可从文件系统下载） */
@@ -356,9 +430,11 @@ object CallRecordManager {
             val projection = arrayOf(CallLog.Calls.NUMBER)
             val selection = "${CallLog.Calls.TYPE}=?"
             val selectionArgs = arrayOf(type.toString())
+            // ★ 2026-08-13 修复：CallLog provider不支持sortOrder中的"LIMIT 1"（报 Invalid token LIMIT 导致号码查不到→文件名"未知号码"）。
+            //   moveToFirst()本身只取第一行（按DATE DESC最新一条），无需LIMIT。
             val cursor = App.context.contentResolver.query(
                 CallLog.Calls.CONTENT_URI, projection, selection, selectionArgs,
-                "${CallLog.Calls.DATE} DESC LIMIT 1")
+                "${CallLog.Calls.DATE} DESC")
             if (cursor != null && cursor.moveToFirst()) {
                 val n = cursor.getString(0) ?: ""
                 cursor.close()

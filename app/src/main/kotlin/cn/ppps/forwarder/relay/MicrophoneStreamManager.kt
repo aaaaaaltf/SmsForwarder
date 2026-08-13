@@ -58,6 +58,39 @@ object MicrophoneStreamManager {
 
     fun lastError(): String = lastErrMsg ?: "未知错误"
 
+    /**
+     * ★★★ 2026-08-13 检测是否有其他应用正在使用麦克风（如微信视频通话）→ 返回占用应用的包名，无占用返回null。
+     *  Android 10+ 通过 AudioManager.activeRecordingConfigurations 查询当前正在录音的应用。
+     *  用于：启动麦克风前预检，被占用时给控制端明确反馈"为什么没有声音"。
+     */
+    fun micBusyByOtherApp(): String? {
+        return try {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                val am = App.context.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+                val configs = am.activeRecordingConfigurations ?: return null
+                for (c in configs) {
+                    // Android 14+ 将 AudioRecordingConfiguration.getClientUid() 隐藏为非公开，
+                    // 编译SDK中无法直接引用，用反射获取（运行时可取到占用应用的uid）
+                    var uid = -1
+                    try {
+                        val m = c.javaClass.getDeclaredMethod("getClientUid")
+                        if (!m.isAccessible) m.isAccessible = true
+                        val v = m.invoke(c)
+                        if (v is Int) uid = v
+                    } catch (_: Throwable) {}
+                    if (uid <= 0 || uid == android.os.Process.myUid()) continue
+                    val pkg = try {
+                        App.context.packageManager.getNameForUid(uid)
+                    } catch (_: Throwable) { null }
+                    if (pkg != null && pkg != App.context.packageName) return pkg
+                }
+            }
+            null
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
     /** 获取本机IPv4地址（用于直连模式通知控制端）
      *  ★ 2026-08-10 修复：ZT直连模式优先返回 172.26.x.x 的ZeroTier IP，
      *  其次返回 192.168.x.x / 10.x.x.x 的局域网IP，最后回退到第一个非回环IP。
@@ -136,6 +169,13 @@ object MicrophoneStreamManager {
         }
         if (s == null) {
             lastErrMsg = "发送通道无效"
+            return null
+        }
+        // ★★★ 2026-08-13 预检：麦克风被其他应用占用（如微信视频通话）→ 明确反馈，不让控制端误以为"无声正常"
+        val busyPkg = micBusyByOtherApp()
+        if (busyPkg != null) {
+            lastErrMsg = "被控端麦克风被【$busyPkg】占用（可能正在视频通话），无法录音"
+            Log.w(TAG, "麦克风启动失败: $lastErrMsg")
             return null
         }
         try {
@@ -295,6 +335,13 @@ object MicrophoneStreamManager {
         }
         if (s == null) {
             lastErrMsg = "发送通道无效"
+            return false
+        }
+        // ★★★ 2026-08-13 预检：麦克风被其他应用占用（如微信视频通话）→ 明确反馈
+        val busyPkg = micBusyByOtherApp()
+        if (busyPkg != null) {
+            lastErrMsg = "被控端麦克风被【$busyPkg】占用（可能正在视频通话），无法录音"
+            Log.w(TAG, "麦克风启动失败: $lastErrMsg")
             return false
         }
         try {

@@ -128,6 +128,13 @@ object RelayServerHandler {
                             } else {
                                 val okMic = MicrophoneStreamManager.start(fallbackSender)
                                 Log.i(TAG, "★ WebRTC回退：麦克风 命令通道 ${if (okMic) "OK" else "FAIL:${MicrophoneStreamManager.lastError()}"}")
+                                // ★★★ 2026-08-13 老麦克风也启动失败（如被视频通话占用）→ 明确反馈控制端"为什么没有声音"
+                                if (!okMic) {
+                                    try {
+                                        fallbackSender.send(RelayCommands.CMD_WEBRTC_STATUS,
+                                            "mic_failed|${MicrophoneStreamManager.lastError()}")
+                                    } catch (_: Throwable) {}
+                                }
                             }
                         }
                         // —— 3) 通知控制端：我们回退了，控制端按老模式继续显示+播放即可
@@ -232,6 +239,10 @@ object RelayServerHandler {
                     if (ok) RelayCommands.RSP_SETTINGS_SET to "1|success|设置成功"
                     else RelayCommands.RSP_SETTINGS_SET to "0|failed|设置保存失败"
                 }
+
+                // ★ 2026-08-13 设置参数查询（控制端打开设置窗口时同步真实状态）：返回当前配置JSON
+                RelayCommands.CMD_SETTINGS_GET -> RelayCommands.RSP_SETTINGS_GET to
+                    "{\"callRecord\":${RelaySettings.callRecord}}"
 
                 // ★ ZeroTier直连请求（中继在线时触发）：负载 "目标ZT IP|控制端ZT IP|端口"
                 RelayCommands.CMD_ZT_DIRECT_CONNECT -> {
