@@ -56,6 +56,30 @@ class WebRtcSessionManager(
             PeerConnection.IceServer.builder("stun:stun3.l.google.com:19302").createIceServer(),
             PeerConnection.IceServer.builder("stun:stun4.l.google.com:19302").createIceServer()
         )
+
+        // ★★★ 2026-08-12 中继优先TURN：自建coturn TURN服务器（云服务器106.12.48.88:3478）。
+        //   背景：WebRTC媒体流默认P2P直连（仅STUN），公网NAT下打洞失败→只传1帧就停。
+        //   修复：部署coturn提供relay候选 → 中继服务在线时媒体经中继服务器转发（中继优先）；
+        //         中继离线时relay候选不可用，退化为ZT/WiFi host直连（兜底）。
+        const val TURN_SERVER_URL = "turn:106.12.48.88:3478"
+        const val TURN_USERNAME = "remote"
+        const val TURN_PASSWORD = "admin123456"
+
+        private fun buildIceServers(relayPreferred: Boolean): List<PeerConnection.IceServer> {
+            val servers = STUN_SERVERS.toMutableList()
+            if (relayPreferred) {
+                try {
+                    servers.add(PeerConnection.IceServer.builder(TURN_SERVER_URL)
+                        .setUsername(TURN_USERNAME)
+                        .setPassword(TURN_PASSWORD)
+                        .createIceServer())
+                    Log.i(TAG, "★ [TURN] 已添加TURN relay候选 $TURN_SERVER_URL（中继优先模式）")
+                } catch (t: Throwable) {
+                    Log.w(TAG, "★ [TURN] 添加TURN失败(忽略): ${t.message}")
+                }
+            }
+            return servers
+        }
     }
 
     interface SignalingCallback {
@@ -72,6 +96,7 @@ class WebRtcSessionManager(
     @Volatile private var videoCapturer: VideoCapturer? = null
     @Volatile private var videoSource: VideoSource? = null
     @Volatile private var surfaceTextureHelper: SurfaceTextureHelper? = null
+    @Volatile private var audioThreadTunerStop: java.util.concurrent.atomic.AtomicBoolean? = null   // ★★★ 2026-08-12 采集线程调优停止标志
     /** ★ 2026-08-11 摄像头采集专用EglBase：必须保存强引用！
      *    原代码 SurfaceTextureHelper.create("...", EglBase.create().eglBaseContext) 中临时EglBase
      *    没有引用，被GC回收导致EGL context失效 → SurfaceTextureHelper无法消费纹理 →
@@ -85,6 +110,8 @@ class WebRtcSessionManager(
     @Volatile private var signalingCallback: SignalingCallback? = null
     @Volatile private var currentCameraIndex: Int = 0
     @Volatile private var running = false
+    /** ★★★ 2026-08-12 中继优先模式：true=中继服务在线，媒体走TURN relay（中继转发）；false=ZT/WiFi直连兜底 */
+    @Volatile private var relayPreferred: Boolean = true
 
     // ★ 2026-08-11 ICE连接宽容策略v2：
     //   - 之前：everConnected + 15秒 → 失败案例：ICE瞬时CONNECTED(选到了一个假候选对)后立即FAILED，
@@ -101,15 +128,20 @@ class WebRtcSessionManager(
      * @param cameraIndex 0=后, 1=前 (与原 CameraStreamManager 索引一致)
      * @param offerSdpBase64 Base64(UTF-8(SDP)) — 控制端 encode 后的 SDP
      * @param cb 信令/状态/错误回调
+     * @param relayPreferred ★ 2026-08-12 中继优先模式：true=中继服务在线，媒体走TURN relay（中继转发）；
+     *   false=中继离线/直连模式，媒体走ZT/WiFi host直连兜底。
      */
     @Synchronized
-    fun startWithOffer(cameraIndex: Int, offerSdpBase64: String, cb: SignalingCallback) {
+    fun startWithOffer(cameraIndex: Int, offerSdpBase64: String, cb: SignalingCallback,
+                       relayPreferred: Boolean = true) {
         val stepTag = "[WebRTC-INIT]"
         if (running) {
             Log.w(TAG, "$stepTag 已在运行中，先关闭旧会话")
             closeInternal(false)
         }
         running = true
+        this.relayPreferred = relayPreferred
+        Log.i(TAG, "$stepTag ★ 中继优先模式 relayPreferred=$relayPreferred（true=媒体走TURN中继转发 / false=ZT直连兜底）")
         this.signalingCallback = cb
         this.currentCameraIndex = cameraIndex
         cb.onStatus("initializing", "初始化PeerConnectionFactory+音频设备")
@@ -147,21 +179,43 @@ class WebRtcSessionManager(
             return
         }
 
+        // ★★★ 2026-08-12 啸叫(呼啸声)修复：提前解析 OFFER SDP，判断是否纯音频(麦克风)会话。
+        //   纯音频会话中被控端只是"采集端"，扬声器必须静音——否则 WebRTC 播放路径激活，
+        //   扬声器→麦克风形成声学反馈环路 → 啸叫(呼啸声)。(原来 audioOnly 在 [7.0/8] 才计算，ADM 已创建)
+        val audioOnly = try {
+            val rawSdp = Base64.getDecoder().decode(offerSdpBase64)
+            val sdpStr = String(rawSdp, StandardCharsets.UTF_8)
+            val isAudioOnly = !sdpStr.contains("m=video")
+            Log.i(TAG, "$stepTag [3/8] ★ 提前解析OFFER: audioOnly=$isAudioOnly（${if (isAudioOnly) "纯音频麦克风会话→被控端扬声器静音防啸叫" else "摄像头会话→扬声器正常"}）")
+            isAudioOnly
+        } catch (t: Throwable) {
+            Log.w(TAG, "$stepTag [3/8] OFFER提前解析失败(按非纯音频处理): ${t.message}")
+            false
+        }
+
         // ★ 1. 初始化音频设备模块：开启 AEC/NS/AGC + Opus + NetEQ（一站式音频处理链）
         val adm = try {
             Log.i(TAG, "$stepTag [3/8] JavaAudioDeviceModule.builder 开始")
             val b = JavaAudioDeviceModule.builder(appContext)
             Log.i(TAG, "$stepTag [3/8] builder 创建成功，开始配置参数...")
+            // ★★★ 2026-08-12 麦克风"机器人声"修复：
+            //   【根因】VOICE_COMMUNICATION音频源是通话优化源，厂商(尤其华为EMUI)会施加
+            //     窄带滤波/响度增强/动态压缩等通话处理链 → 声音变成"机器人声"。
+            //   【修复】改回原始MIC源 + 关闭硬件AEC/NS（硬件处理同样会整形音色）。
+            //     WebRTC软件AEC/NS/AGC保留（由MediaConstraints控制），对音色影响远小于
+            //     厂商VOICE_COMMUNICATION链路。
             val builtAdm = b
-                .setUseHardwareAcousticEchoCanceler(true)
-                .setUseHardwareNoiseSuppressor(true)
-                .setAudioSource(android.media.MediaRecorder.AudioSource.VOICE_COMMUNICATION)
+                .setUseHardwareAcousticEchoCanceler(false)
+                .setUseHardwareNoiseSuppressor(false)
+                .setAudioSource(android.media.MediaRecorder.AudioSource.MIC)
                 .setSamplesReadyCallback(null)
                 .createAudioDeviceModule()
-            Log.i(TAG, "$stepTag [3/8] createAudioDeviceModule 成功 ✓")
-            builtAdm.setSpeakerMute(false)
+            Log.i(TAG, "$stepTag [3/8] createAudioDeviceModule 成功 ✓（音频源=原始MIC，硬件AEC/NS已关闭→原声修复）")
+            // ★★★ 2026-08-12 啸叫(呼啸声)修复：纯音频(麦克风)会话中被控端是纯采集端，扬声器必须静音，
+            //   否则扬声器→麦克风声学反馈 → 啸叫。摄像头会话(可能双向对讲)保留扬声器。
+            builtAdm.setSpeakerMute(audioOnly)
             builtAdm.setMicrophoneMute(false)
-            Log.i(TAG, "$stepTag [3/8] 静音标志已设置 ✓")
+            Log.i(TAG, "$stepTag [3/8] 静音标志已设置 ✓ speakerMute=$audioOnly(纯音频防啸叫) micMute=false")
             builtAdm
         } catch (t: Throwable) {
             Log.e(TAG, "$stepTag [3/8] AudioDeviceModule 失败 type=${t.javaClass.name} msg=${t.message}", t)
@@ -171,14 +225,80 @@ class WebRtcSessionManager(
 
         // ★ 2. 初始化 PeerConnectionFactory：
         val options = PeerConnectionFactory.Options()
+        // ★★★ 2026-08-12 ZT直连视频修复（核心v2）：
+        //   【根因】Android网络监控把ZeroTier VPN(tun0)网络报告给WebRTC，但UDP共享socket
+        //   绑定到底层WiFi地址(192.168.31.x)，生成的host候选IP是WiFi IP而非ZT IP(172.26.x)，
+        //   导致跨设备ZT直连时ICE两端候选都不含ZT IP → 无法选路 → ICE=FAILED，视频完全不显示。
+        //   【验证】v1用networkIgnoreMask保留VPN接口——实测无效(Android JNI网络监控不应用该掩码,
+        //   Count of networks仍=8)。v2改用 NetworkMonitor.setNetworkChangeDetectorFactory 注入
+        //   自定义NetworkChangeDetector：getActiveNetworkList()只返回【修正IP后的tun0网络】，
+        //   → WebRTC唯一网络=tun0(172.26.x) → UDP socket绑定ZT IP → host候选为正确ZT IP。
+        // ★★★ 2026-08-12 网络检测器策略：
+        //   - relayPreferred=true（中继优先）：【不注入ZT专用网络检测器】！
+        //     使用系统默认NetworkMonitor（真实网络列表：WiFi+蜂窝）→ host候选=真实IP，
+        //     + TURN relay候选(106.12.48.88:3478) → 媒体经中继服务器转发。
+        //     【根因】注入ZtOnlyNetworkDetectorFactory后native basic_port_allocator仍用
+        //     NetworkMonitorAutoDetect全量列表(含loopback)建socket → UDP绑定127.0.0.x →
+        //     STUN/TURN全部"error 22 Invalid argument" → ICE=FAILED无法连通。
+        //   - relayPreferred=false（ZT直连兜底）：注入ZT专用检测器 → host候选=ZT IP(172.26.x)。
+        if (!relayPreferred) {
+            try {
+                val ztIp = findZtIpAddress()
+                if (ztIp != null) {
+                    org.webrtc.NetworkMonitor.getInstance()
+                        .setNetworkChangeDetectorFactory(ZtOnlyNetworkDetectorFactory(ztIp, false))
+                    Log.i(TAG, "$stepTag [4/8] ★ 已注册ZT专用网络检测器 ztIp=$ztIp（直连兜底：返回WiFi+tun0→媒体走ZT直连）")
+                } else {
+                    Log.w(TAG, "$stepTag [4/8] 未找到本机ZT IP(172.16-31.x)，使用默认网络检测器")
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "$stepTag [4/8] 注册ZT网络检测器失败(继续默认): ${t.message}")
+            }
+        } else {
+            Log.i(TAG, "$stepTag [4/8] ★ 中继优先模式：不注入ZT检测器，使用系统默认网络（host候选=真实IP + TURN relay中继转发）")
+        }
+        // ★ 2026-08-12 网络过滤策略：
+        //   - relayPreferred=true（中继优先）：networkIgnoreMask=0，不过滤任何网络！
+        //     → WiFi host候选 + TURN relay候选都参与，媒体经中继转发。
+        //     【根因】之前无条件忽略所有网络(仅保留VPN)，而中继优先模式网络检测器
+        //     只返回WiFi(不含tun0) → 全部被过滤 → "Machine has no networks" → 无候选 → ICE=CHECKING卡死。
+        //   - relayPreferred=false（直连兜底）：保留"仅VPN"掩码 → host候选为正确ZT IP，ZT直连选路。
+        try {
+            options.networkIgnoreMask = if (relayPreferred) {
+                // 中继优先：忽略loopback/unknown（避免UDP绑定127.0.0.x），保留WiFi+蜂窝 → host+relay全参与
+                Log.i(TAG, "$stepTag ★ 中继优先模式: networkIgnoreMask=忽略loopback/unknown（WiFi host + TURN relay 全参与）")
+                (PeerConnectionFactory.Options.ADAPTER_TYPE_LOOPBACK
+                    or PeerConnectionFactory.Options.ADAPTER_TYPE_UNKNOWN)
+            } else {
+                Log.i(TAG, "$stepTag ★ 直连兜底: networkIgnoreMask=仅保留VPN（ZT直连候选修复）")
+                (PeerConnectionFactory.Options.ADAPTER_TYPE_UNKNOWN
+                    or PeerConnectionFactory.Options.ADAPTER_TYPE_ETHERNET
+                    or PeerConnectionFactory.Options.ADAPTER_TYPE_WIFI
+                    or PeerConnectionFactory.Options.ADAPTER_TYPE_CELLULAR
+                    or PeerConnectionFactory.Options.ADAPTER_TYPE_LOOPBACK
+                    or PeerConnectionFactory.Options.ADAPTER_TYPE_ANY)
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "$stepTag 设置networkIgnoreMask失败(忽略): ${t.message}")
+        }
         try {
             Log.i(TAG, "$stepTag [4/8] PeerConnectionFactory.initialize(...) 开始")
+            // ★ 2026-08-11 视频停帧修复：
+            //   1) 禁用WebRTC帧丢弃器(FrameDropper)——GoogCC拥塞控制反馈异常时把码率/帧率压到0
+            //   2) ★★★ 禁用质量缩放器(QualityScaler)——根因修复：编码器在480x360↔640x480之间动态缩放，
+            //      缩放切换后发送的640x480关键帧控制端无法解码(dequeueOutputBuffer=-1, Frames received:0)，
+            //      导致视频"仅2帧后停止"。固定分辨率不再缩放。
+            //   3) 固定sender码率 min=max=800kbps（下方RtpParameters设置）
             PeerConnectionFactory.initialize(
                 PeerConnectionFactory.InitializationOptions.builder(appContext)
-                    .setFieldTrials("WebRTC-H264HighProfile/Enabled/")
+                    .setFieldTrials("WebRTC-H264HighProfile/Enabled/WebRTC-VideoFrameDropper/Disabled/WebRTC-VideoQualityScaler/Disabled/")
                     .setEnableInternalTracer(false)
                     .createInitializationOptions()
             )
+            // ★ 2026-08-11 诊断：开启WebRTC内部详细日志（定位视频帧在采集/编码/发送链路的断点）
+            try {
+                org.webrtc.Logging.enableLogToDebugOutput(org.webrtc.Logging.Severity.LS_VERBOSE)
+            } catch (_: Throwable) {}
             Log.i(TAG, "$stepTag [4/8] PeerConnectionFactory.initialize 成功 ✓")
         } catch (alreadyInit: IllegalStateException) {
             Log.w(TAG, "$stepTag [4/8] 已初始化过(进程级单例)，跳过二次initialize: ${alreadyInit.message}")
@@ -217,6 +337,12 @@ class WebRtcSessionManager(
                 .setOptions(options)
                 .setAudioDeviceModule(adm)
                 .setVideoEncoderFactory(
+                    // ★★★ 2026-08-11 视频停帧根因修复（surface模式+统一EglBase）：
+                    //   实验证明【null context字节流模式】虽让编码器Qinput正常(86)，但RTP发送异常——
+                    //   rtp_sender_video仅处理第一帧，控制端每10秒只收到1个RTP包(seq+1000)，
+                    //   视频"2帧后停止"。回退到【surface模式+统一rootEgl】：
+                    //   capture/encode共享同一EGL context → 编码器正确消费Camera2 OES纹理，
+                    //   白/局域网直连实测15fps稳定。配合禁用QualityScaler/FrameDropper+固定码率800k。
                     DefaultVideoEncoderFactory(rootEgl, true, true)
                 )
                 .setVideoDecoderFactory(DefaultVideoDecoderFactory(rootEgl))
@@ -319,6 +445,31 @@ class WebRtcSessionManager(
                 val sdp64 = Base64.getEncoder().encodeToString(candidate.sdp.toByteArray(StandardCharsets.UTF_8))
                 val payload = "ANSWERER|${candidate.sdpMid}|${candidate.sdpMLineIndex}|$sdp64"
                 cb.onSignalingMessage(RelayCommands.CMD_WEBRTC_CANDIDATE, payload)
+                // ★★★ 2026-08-12 ZT直连修复：host候选的IP是底层WiFi/蜂窝IP而非ZT IP(172.26.x)，
+                //   跨设备ZT直连ICE两端候选都不含ZT IP → 无法选路。将host候选IP改写为本机ZT IP
+                //   额外发送一份，对端即可通过ZT虚拟网直连本机tun0。
+                // ★★★ 2026-08-12 中继优先模式：relayPreferred=true 时不发送ZT改写候选！
+                //   —— 中继服务在线时媒体必须走TURN relay（中继转发），若同时发ZT候选，
+                //      ICE按优先级(host>srflx>relay)会优先选ZT host → 违背"中继优先"原则。
+                //   —— relayPreferred=false（中继离线/直连模式）才发送ZT候选兜底。
+                if ("host" == candType && !relayPreferred) {
+                    try {
+                        val ztIp = findZtIpAddress()
+                        if (ztIp != null && ztIp != candIp) {
+                            val parts = candidate.sdp.split(" ").toMutableList()
+                            if (parts.size > 5) {
+                                parts[4] = ztIp
+                                val ztSdp = parts.joinToString(" ")
+                                val ztCand = IceCandidate(candidate.sdpMid, candidate.sdpMLineIndex, ztSdp)
+                                val ztSdp64 = Base64.getEncoder().encodeToString(
+                                    ztCand.sdp.toByteArray(StandardCharsets.UTF_8))
+                                val ztPayload = "ANSWERER|${candidate.sdpMid}|${candidate.sdpMLineIndex}|$ztSdp64"
+                                cb.onSignalingMessage(RelayCommands.CMD_WEBRTC_CANDIDATE, ztPayload)
+                                Log.i(TAG, "★ [ZT修复] host候选IP ${candIp}:${candPort} 改写为ZT IP $ztIp 发送")
+                            }
+                        }
+                    } catch (_: Throwable) {}
+                }
             }
             override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>?) {}
             override fun onAddStream(stream: MediaStream?) {}
@@ -329,11 +480,24 @@ class WebRtcSessionManager(
         }
 
         // —— ★ [6/8] 创建 PeerConnection
-        val rtcConfig = PeerConnection.RTCConfiguration(STUN_SERVERS).apply {
+        // ★★★ 2026-08-12 同设备loopback"只传1帧"根因修复（v6）：
+        //   【根因】红米双端（控制端+被控端同机）时，ICE 总是优先选中 host 候选(192.168.31.177 本机IP)，
+        //     RTP/UDP 走 loopback 路径 → 控制端 rtp_video_stream_receiver2 的包 arrival time 未设置
+        //     (= -inf ms) → FrameBuffer/Timing 帧播放调度失败 → MediaCodec 解码输出全 Drop(Render 0/Drop 100)
+        //     → 视频只传1帧后停止。跨设备(华为+红米)走真实网络路径正常(15fps)。
+        //   【修复】中继优先模式(relayPreferred=true)下 iceTransportsType=RELAY：只允许 TURN relay 候选，
+        //     强制媒体走云服务器TURN转发(真实网络路径，非loopback) → arrival time 正常 → 视频持续渲染。
+        //     直连兜底模式(relayPreferred=false)保持 ALL（host/srflx/relay 全参与，ZT/局域网直连）。
+        val rtcConfig = PeerConnection.RTCConfiguration(buildIceServers(relayPreferred)).apply {
             bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE
             rtcpMuxPolicy = PeerConnection.RtcpMuxPolicy.REQUIRE
             continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
-            iceTransportsType = PeerConnection.IceTransportsType.ALL
+            iceTransportsType = if (relayPreferred) {
+                Log.i(TAG, "$stepTag ★★★ [6/8] 中继优先模式：iceTransportsType=RELAY（强制TURN relay转发，避免同设备loopback导致arrival time=-inf）")
+                PeerConnection.IceTransportsType.RELAY
+            } else {
+                PeerConnection.IceTransportsType.ALL
+            }
         }
         val pc = try {
             Log.i(TAG, "$stepTag [6/8] createPeerConnection 开始...")
@@ -347,6 +511,61 @@ class WebRtcSessionManager(
             return
         }
         peerConnection = pc
+
+        // ★★★ 2026-08-12 音频覆盖率20%根因诊断：周期性 getStats 打印 audio sender 发送包数/字节。
+        //   目的：区分"发送端只产出了20%音频" vs "接收端丢弃80%"。
+        //   理论值：48kHz单声道10ms块，Opus 20ms一帧 → 每秒50包；若sender实际只有~10包/秒则发送端问题。
+        try {
+            val statsHandler = Handler(Looper.getMainLooper())
+            val statsRunnable = object : Runnable {
+                var counter = 0
+                override fun run() {
+                    try {
+                        val p = peerConnection ?: return
+                        try {
+                            p.getStats(object : org.webrtc.RTCStatsCollectorCallback {
+                                override fun onStatsDelivered(report: org.webrtc.RTCStatsReport) {
+                                    try {
+                                        val statsMap = report.statsMap
+                                        for ((key, stats) in statsMap) {
+                                            val type = stats.type
+                                            if (type == "outbound-rtp" || type == "inbound-rtp" || type == "remote-inbound-rtp") {
+                                                val kind = stats.members["kind"] as? String ?: ""
+                                                if (kind == "audio") {
+                                                    val packetsSent = stats.members["packetsSent"]
+                                                    val packetsReceived = stats.members["packetsReceived"]
+                                                    val bytesSent = stats.members["bytesSent"]
+                                                    val bytesReceived = stats.members["bytesReceived"]
+                                                    val lost = stats.members["packetsLost"]
+                                                    val jitter = stats.members["jitter"]
+                                                    val fps = stats.members["framesPerSecond"]
+                                                    val codec = stats.members["codecId"]
+                                                    Log.i(TAG, "★ [getStats-audio] type=$type id=$key kind=$kind " +
+                                                            "pktSent=$packetsSent pktRecv=$packetsReceived " +
+                                                            "byteSent=$bytesSent byteRecv=$bytesReceived lost=$lost jitter=$jitter fps=$fps codec=$codec")
+                                                }
+                                            }
+                                        }
+                                    } catch (e: Throwable) {
+                                        Log.w(TAG, "★ [getStats-audio] 解析失败: ${e.message}")
+                                    }
+                                }
+                            })
+                        } catch (e: Throwable) {
+                            Log.w(TAG, "★ [getStats-audio] getStats调用失败: ${e.message}")
+                        }
+                        counter++
+                        if (counter < 30) statsHandler.postDelayed(this, 2000)  // 60秒内每2秒打印
+                    } catch (e: Throwable) {
+                        Log.w(TAG, "★ [getStats-audio] 调度异常: ${e.message}")
+                    }
+                }
+            }
+            statsHandler.postDelayed(statsRunnable, 3000)
+            Log.i(TAG, "$stepTag ★★ [getStats-audio] 诊断定时器已启动（每2秒打印audio收发统计）")
+        } catch (t: Throwable) {
+            Log.w(TAG, "$stepTag [getStats-audio] 启动失败: ${t.message}")
+        }
 
         // —— ★ [7.0/8] 先解析 OFFER SDP（提前到addTracks之前），判断是否纯音频模式（麦克风WebRTC）
         //   ★ 2026-08-11 新增：控制端"开麦克风"按钮改为WebRTC纯音频模式时，
@@ -362,7 +581,6 @@ class WebRtcSessionManager(
             cb.onError("OFFER base64 decode failed: ${t.message}")
             return
         }
-        val audioOnly = !offerSdp.contains("m=video")
         Log.i(TAG, "$stepTag [7.0/8] ★ 纯音频模式(麦克风WebRTC)=$audioOnly (SDP含m=video=${offerSdp.contains("m=video")})")
 
         // —— ★ [7/8] 创建本地音视频轨道并加入 PeerConnection（audioOnly时仅麦克风）
@@ -395,48 +613,85 @@ class WebRtcSessionManager(
                             cb.onError("createAnswer returned null")
                             return
                         }
-                        Log.i(TAG, "$stepTag [8/8] createAnswer 成功 ✓ sdp len=${sdp.description.length}")
-                        val preferSdp = preferOpusAndVp8(preferAudioFec(sdp.description))
-                        val finalSdp = SessionDescription(sdp.type, preferSdp)
-                        pc.setLocalDescription(object : SdpObserverAdapter() {
-                            override fun onSetSuccess() {
-                                // ★ 2026-08-11 视频码率下限修复：防止WebRTC码率自适应把视频压到几乎不可见
-                                //   现象：链路抖动/RTCP反馈差时，编码器连续重配 640x480→480x360→320x240，
-                                //   最终OMX-VENC bitrate被压到3~12kbps → 画面近似黑屏 → "只有声音没有图像"。
-                                //   设置video sender的minBitrateBps=400kbps，保证视频始终有可用码率。
-                                try {
-                                    val senders = pc.senders
-                                    for (sender in senders) {
-                                        val track = sender.track()
-                                        if (track is VideoTrack) {
-                                            val p = sender.parameters
-                                            val encs = p.encodings
-                                            for (enc in encs) {
-                                                enc.minBitrateBps = 400_000
-                                                try { enc.maxFramerate = 20 } catch (_: Throwable) {}
-                                                if (enc.maxBitrateBps == null || enc.maxBitrateBps!! <= 0) {
-                                                    enc.maxBitrateBps = 2_500_000
-                                                }
-                                            }
-                                            sender.parameters = p
-                                            Log.i(TAG, "$stepTag ★ 视频sender码率下限已设置 min=400kbps max=2500kbps（防止码率饥饿黑屏）")
+                        Log.i(TAG, "$stepTag [8/8] createAnswer 成功 ✓ sdp len=${sdp.description.length} type=${sdp.type}")
+                        // ★★★ 2026-08-12 诊断日志：定位 setLocalDescription 报 "SessionDescription is NULL." 的根因
+                        //   （该错误=WebRTC native ParseSessionDescription 失败返回null描述）
+                        Log.i(TAG, "$stepTag [8/8] ★ANSWER原始SDP完整:\n${sdp.description}")
+                        // ★★★ 2026-08-12 临时修复：跳过 preferAudioFec/stripAbsSendTime 的 SDP 内容修改，
+                        //   直接使用 createAnswer 原始 SDP setLocalDescription。
+                        //   原因：修改后 SDP 触发 native "Failed to parse: '' (Invalid SDP line)"，
+                        //   setLocalDescription 失败 → 无法发 ANSWER → 控制端"未收到视频流"。
+                        //   原 SDP 由 WebRTC 生成保证合法，修改反而引入解析问题。
+                        // ★★★ 2026-08-12 录制音画同步修复（DTX禁用）：仅做 usedtx=1→usedtx=0 的等长子串替换
+                        //   （不删行/不加行，不会破坏SDP结构），并在失败时自动回退原始SDP，双重保险。
+                        val rawSdp: SessionDescription = sdp
+                        var useSdp: SessionDescription = sdp
+                        var dtxModified = false
+                        try {
+                            val desc = sdp.description.replace("usedtx=1", "usedtx=0")
+                            if (desc != sdp.description) {
+                                dtxModified = true
+                                useSdp = SessionDescription(sdp.type, desc)
+                                Log.i(TAG, "$stepTag [8/8] ★★★禁用DTX：usedtx=1→usedtx=0（Opus静音期不发包→录制音频覆盖率仅20%，禁用后静音期也持续发舒适音）")
+                            } else {
+                                Log.i(TAG, "$stepTag [8/8] SDP中未发现usedtx=1（DTX未启用，无需修改）")
+                            }
+                        } catch (t: Throwable) {
+                            Log.w(TAG, "$stepTag [8/8] SDP修改usedtx异常(用原始): ${t.message}")
+                        }
+                        // 提取"answer就绪"动作（视频码率下限修复+发送ANSWER），供正常路径与回退路径复用
+                        val onAnswerReady: (SessionDescription) -> Unit = { sd ->
+                            try {
+                                val senders = pc.senders
+                                for (sender in senders) {
+                                    val track = sender.track()
+                                    if (track is VideoTrack) {
+                                        val p = sender.parameters
+                                        try {
+                                            p.degradationPreference =
+                                                org.webrtc.RtpParameters.DegradationPreference.MAINTAIN_RESOLUTION
+                                        } catch (_: Throwable) {}
+                                        val encs = p.encodings
+                                        for (enc in encs) {
+                                            try { enc.scaleResolutionDownBy = 1.0 } catch (_: Throwable) {}
+                                            enc.minBitrateBps = 100_000
+                                            enc.maxBitrateBps = 800_000
+                                            try { enc.maxFramerate = 10 } catch (_: Throwable) {} // ★★★ 2026-08-12 20→10 配合采集降帧
                                         }
+                                        sender.parameters = p
+                                        Log.i(TAG, "$stepTag ★ 视频sender已设置 degradationPreference=MAINTAIN_RESOLUTION scaleResolutionDownBy=1.0 min=100k max=800kbps fps=10（禁用QualityScaler，分辨率固定640x480不重建编码器）")
                                     }
-                                } catch (t: Throwable) {
-                                    Log.w(TAG, "$stepTag 设置视频码率下限失败(忽略): ${t.message}")
                                 }
-                                val answerB64 = Base64.getEncoder().encodeToString(
-                                    finalSdp.description.toByteArray(StandardCharsets.UTF_8)
-                                )
-                                Log.i(TAG, "$stepTag [8/8] setLocalDescription 成功 ✓，发送 ANSWER(len=${answerB64.length})")
-                                cb.onSignalingMessage(RelayCommands.CMD_WEBRTC_ANSWER, answerB64)
-                                cb.onStatus("ready", "ANSWER已发送，等待ICE连通")
+                            } catch (t: Throwable) {
+                                Log.w(TAG, "$stepTag 设置视频码率下限失败(忽略): ${t.message}")
                             }
+                            val answerB64 = Base64.getEncoder().encodeToString(
+                                sd.description.toByteArray(StandardCharsets.UTF_8)
+                            )
+                            Log.i(TAG, "$stepTag [8/8] setLocalDescription 成功 ✓，发送 ANSWER(len=${answerB64.length})")
+                            cb.onSignalingMessage(RelayCommands.CMD_WEBRTC_ANSWER, answerB64)
+                            cb.onStatus("ready", "ANSWER已发送，等待ICE连通")
+                        }
+                        pc.setLocalDescription(object : SdpObserverAdapter() {
+                            override fun onSetSuccess() { onAnswerReady(useSdp) }
                             override fun onSetFailure(e: String?) {
-                                Log.e(TAG, "$stepTag [8/8] setLocalDescription 失败: $e")
-                                cb.onError("setLocalDescription failed: $e")
+                                if (dtxModified) {
+                                    // ★ DTX修改后解析失败：回退原始SDP重试（历史教训：SDP修改可能触发"Invalid SDP line"）
+                                    Log.w(TAG, "$stepTag [8/8] ★修改SDP setLocalDescription失败($e)，回退原始SDP重试")
+                                    pc.setLocalDescription(object : SdpObserverAdapter() {
+                                        override fun onSetSuccess() { onAnswerReady(rawSdp) }
+                                        override fun onSetFailure(e2: String?) {
+                                            Log.e(TAG, "$stepTag [8/8] setLocalDescription 失败(原始SDP): $e2")
+                                            cb.onError("setLocalDescription failed: $e2")
+                                        }
+                                    }, rawSdp)
+                                } else {
+                                    Log.e(TAG, "$stepTag [8/8] setLocalDescription 失败: $e")
+                                    Log.e(TAG, "$stepTag [8/8] ★失败时useSdp type=${useSdp.type} len=${useSdp.description.length} 内容(前700):\n${useSdp.description.take(700)}")
+                                    cb.onError("setLocalDescription failed: $e")
+                                }
                             }
-                        }, finalSdp)
+                        }, useSdp)
                     }
                     override fun onCreateFailure(e: String?) {
                         Log.e(TAG, "$stepTag [8/8] createAnswer 失败: $e")
@@ -535,7 +790,16 @@ class WebRtcSessionManager(
         val tag = "[addTracks]"
         Log.i(TAG, "$tag [a1] createAudioSource 开始...")
         val audioSource = try {
-            f.createAudioSource(MediaConstraints())
+            // ★★★ 2026-08-12 啸叫(呼啸声)修复：显式启用 WebRTC 软件 AEC/NS/AGC。
+            //   【根因】createAudioSource(空MediaConstraints) → 软件音频处理未启用 → 麦克风采集
+            //     无回声消除/噪声抑制/增益控制 → 声学反馈增益过大 → 啸叫(呼啸声)。
+            //   【方案】保持 MIC 源+关闭硬件AEC/NS(防机器人声)，软件AEC/NS/AGC保留启用(抑制啸叫)。
+            val audioConstraints = MediaConstraints()
+            audioConstraints.mandatory.add(MediaConstraints.KeyValuePair("googEchoCancellation", "true"))
+            audioConstraints.mandatory.add(MediaConstraints.KeyValuePair("googNoiseSuppression", "true"))
+            audioConstraints.mandatory.add(MediaConstraints.KeyValuePair("googAutoGainControl", "true"))
+            audioConstraints.mandatory.add(MediaConstraints.KeyValuePair("googHighpassFilter", "true"))
+            f.createAudioSource(audioConstraints)
         } catch (t: Throwable) {
             Log.e(TAG, "$tag [a1] createAudioSource 失败 type=${t.javaClass.name} msg=${t.message}", t)
             throw t
@@ -558,6 +822,87 @@ class WebRtcSessionManager(
             throw t
         }
         Log.i(TAG, "$tag [a3] 音频轨道添加成功 ✓ ret=$audioRet")
+
+        // ★★★ 2026-08-12 音频采集饥饿修复：守护线程周期性提升采集线程优先级并绑定大核。
+        //   【根因】红米CPU过载(相机HAL+视频编码) → WebRTC AudioRecord采集线程(10ms周期)被CFS调度器饿，
+        //     实际每~54ms才唤醒一次 → 音频覆盖率仅18.6%。采集线程优先级/绑核后即使CPU忙也能按时唤醒。
+        try {
+            val tunerStop = java.util.concurrent.atomic.AtomicBoolean(false)
+            audioThreadTunerStop = tunerStop
+            val tuner = Thread {
+                var tunedCount = 0
+                while (!tunerStop.get()) {
+                    try {
+                        val threads = Thread.getAllStackTraces().keys
+                        for (t in threads) {
+                            val n = t.name ?: ""
+                            if (n.contains("AudioRecordJavaThread") || n.contains("AudioRecord")) {
+                                try {
+                                    // 1) 提升线程优先级为 URGENT_AUDIO(-19)
+                                    val tidField = Thread::class.java.getDeclaredField("tid")
+                                    tidField.isAccessible = true
+                                    val tid = (tidField.getLong(t)).toInt()
+                                    android.os.Process.setThreadPriority(tid, android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
+                                    // 2) 绑定大核 CPU0-3（骁龙870 Kryo585大核组，掩码0x0F）
+                                    try {
+                                        val osClass = Class.forName("libcore.io.Libcore")
+                                        val osField = osClass.getField("os")
+                                        val os = osField.get(null)
+                                        val m = os.javaClass.getMethod("sched_setaffinity", Int::class.javaPrimitiveType, LongArray::class.java)
+                                        m.invoke(os, tid, longArrayOf(0x0FL))
+                                        Log.i(TAG, "$tag ★★ [采集线程调优] $n tid=$tid 已提优先级(-19)+绑定大核CPU0-3")
+                                    } catch (affErr: Throwable) {
+                                        Log.w(TAG, "$tag [采集线程调优] 绑核失败(忽略): ${affErr.message}")
+                                    }
+                                    tunedCount++
+                                } catch (e: Throwable) {
+                                    // 线程刚创建时tid字段可能不可读，下次循环再试
+                                }
+                                if (tunedCount > 4) tunerStop.set(true) // 成功调优2个音频线程后停止
+                            }
+                        }
+                    } catch (_: Throwable) {}
+                    try { Thread.sleep(1000) } catch (_: InterruptedException) { break }
+                }
+            }
+            tuner.name = "AudioCaptureTuner"
+            tuner.isDaemon = true
+            tuner.start()
+            Log.i(TAG, "$tag ★★ [采集线程调优] 守护线程已启动（检测AudioRecord*线程并提优先级+绑大核）")
+        } catch (t: Throwable) {
+            Log.w(TAG, "$tag [采集线程调优] 守护线程启动失败: ${t.message}")
+        }
+
+        // ★★★ 2026-08-12 录制音视频同步诊断：给本地音频轨挂AudioTrackSink统计采集速率。
+        //   控制端录制的音频只有21%实时(47ms回调1次)，需确认是否被控端采集端本身投递稀疏。
+        //   每5秒打印一次采集速率/帧数 → 若≈100Hz(10ms块)说明采集实时，问题在传输/接收端；若≈21Hz则被控端采集端问题。
+        try {
+            val sinkStats = object {
+                var frames: Long = 0
+                var bytes: Long = 0
+                var lastLogMs: Long = 0
+            }
+            localAudioTrack.addSink(object : org.webrtc.AudioTrackSink {
+                override fun onData(audioData: java.nio.ByteBuffer?, bitsPerSample: Int, sampleRate: Int,
+                                    numberOfChannels: Int, numberOfFrames: Int, absCaptureTimeUs: Long) {
+                    if (audioData == null || !audioData.hasRemaining()) return
+                    sinkStats.frames += numberOfFrames
+                    sinkStats.bytes += audioData.remaining().toLong()
+                    val now = System.currentTimeMillis()
+                    if (sinkStats.lastLogMs == 0L) sinkStats.lastLogMs = now
+                    if (now - sinkStats.lastLogMs >= 5000) {
+                        val secs = (now - sinkStats.lastLogMs) / 1000.0
+                        val fps = sinkStats.frames / secs / 1000.0 // kHz
+                        Log.i(TAG, "$tag ★★ [录制诊断] 本地音频采集 rate=${sampleRate}Hz ch=$numberOfChannels bit=$bitsPerSample " +
+                                "捕获速率=${"%.2f".format(fps)}kHz(48kHz实时应≈48) 回调间隔=${"%.1f".format(secs * 1000 / Math.max(1, (sinkStats.frames / numberOfFrames)))}ms 累计帧=${sinkStats.frames} 字节=${sinkStats.bytes}")
+                        sinkStats.frames = 0; sinkStats.bytes = 0; sinkStats.lastLogMs = now
+                    }
+                }
+            })
+            Log.i(TAG, "$tag ★★ [录制诊断] 本地音频轨AudioTrackSink已挂载（每5秒打印采集速率）")
+        } catch (t: Throwable) {
+            Log.w(TAG, "$tag [录制诊断] 本地音频sink挂载失败: ${t.message}")
+        }
 
         // ★ 2026-08-11 纯音频模式(麦克风WebRTC)：只采集麦克风，不启动摄像头（避免Camera2占用与权限问题）
         if (audioOnly) {
@@ -603,14 +948,53 @@ class WebRtcSessionManager(
         videoCapturer = capturer
         Log.i(TAG, "$tag [v6] capturer.initialize 开始...")
         try {
-            capturer.initialize(surfaceTextureHelper, appContext, videoSource!!.capturerObserver)
+            // ★★★ 2026-08-12 华为等设备 Camera2 SENSOR_TIMESTAMP 异常修复：
+            //   Camera2Capturer 输出帧时间戳直接来自传感器，部分ROM(华为EMUI)传感器时间戳会回退/跳变，
+            //   导致：1) RTP时间戳乱序 → 控制端接收端全部丢弃(仅首帧显示，"只有一帧") 
+            //        2) VideoStreamEncoder 周期关键帧失效(88秒仅1个关键帧) → 丢帧后无法恢复
+            //   用代理 CapturerObserver 矫正时间戳为单调递增(回退时自动累加偏移)，
+            //   同时保持帧 buffer 引用计数正确(retain→构造新帧→release原帧)。
+            val realObserver = videoSource!!.capturerObserver
+            val tsFixObserver = object : CapturerObserver {
+                private var lastMonotonicTsNs = 0L
+                private var tsOffsetNs = 0L
+                override fun onCapturerStarted(success: Boolean) {
+                    lastMonotonicTsNs = 0L
+                    tsOffsetNs = 0L
+                    realObserver.onCapturerStarted(success)
+                }
+                override fun onCapturerStopped() { realObserver.onCapturerStopped() }
+                override fun onFrameCaptured(frame: VideoFrame) {
+                    try {
+                        val rawTs = frame.timestampNs
+                        if (lastMonotonicTsNs == 0L) {
+                            tsOffsetNs = 0L
+                        } else if (rawTs + tsOffsetNs <= lastMonotonicTsNs) {
+                            // 传感器时间戳回退/跳变 → 修正偏移，保证单调递增(+100ms最小步进)
+                            tsOffsetNs = lastMonotonicTsNs - rawTs + 100_000_000L
+                            Log.w(TAG, "★ [时间戳矫正] 帧时间戳回退 rawTs=$rawTs offset+=${tsOffsetNs}ns，已矫正为单调递增")
+                        }
+                        val fixedTs = rawTs + tsOffsetNs
+                        lastMonotonicTsNs = fixedTs
+                        // 复用原buffer构造矫正帧(retain+1)，随后释放原帧引用
+                        frame.buffer.retain()
+                        val fixed = VideoFrame(frame.buffer, frame.rotation, fixedTs)
+                        realObserver.onFrameCaptured(fixed)
+                        frame.release()
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "★ [时间戳矫正] 矫正异常，原样转发: ${t.message}")
+                        try { realObserver.onFrameCaptured(frame) } catch (_: Throwable) {}
+                    }
+                }
+            }
+            capturer.initialize(surfaceTextureHelper, appContext, tsFixObserver)
         } catch (t: Throwable) {
             Log.e(TAG, "$tag [v6] capturer.initialize 失败 type=${t.javaClass.name} msg=${t.message}", t)
             throw t
         }
-        Log.i(TAG, "$tag [v7] capturer.startCapture(640x480@20) 开始...")
+        Log.i(TAG, "$tag [v7] capturer.startCapture(640x480@10) 开始...（★★★ 2026-08-12 饥饿修复：20fps→10fps降低相机HAL+编码CPU负载）")
         try {
-            capturer.startCapture(640, 480, 20)
+            capturer.startCapture(640, 480, 10)
         } catch (t: Throwable) {
             Log.e(TAG, "$tag [v7] startCapture 失败 type=${t.javaClass.name} msg=${t.message}", t)
             throw t
@@ -631,6 +1015,46 @@ class WebRtcSessionManager(
             throw t
         }
         Log.i(TAG, "$tag [v9] 视频轨道添加成功 ✓ ret=$videoRet")
+
+        // ★★★ 2026-08-12 中继"只传1帧"根因修复（v5）：RtpParameters 层面移除时间类RTP扩展！
+        //   【根因】仅修改 SDP 字符串无效——WebRTC 内部 sender 的 RtpParameters 仍注册
+        //     abs-send-time/toffset/playout-delay → createAnswer 生成的 SDP 仍包含这些扩展 →
+        //     发送端 RTP 包仍携带时间扩展(经TURN relay后值异常，如 toffset=9360ms) →
+        //     控制端 rtp_video_stream_receiver2 计算 arrival time=-inf → VideoReceiveStream2
+        //     帧播放调度失败 → 解码输出全部丢弃(MediaCodec Render 2/Drop 84) → 只有1帧。
+        //   【修复】addTrack 后立即修改 video sender 的 RtpParameters.headerExtensions，
+        //     真正移除 abs-send-time/transmission-offset/playout-delay → createAnswer 生成的
+        //     SDP 不再协商这些扩展 → 发送端 RTP 包不再携带 → 控制端用本地到达时间 → 正常渲染。
+        try {
+            val senders = pc.senders
+            for (sender in senders) {
+                val trk = sender.track()
+                if (trk is VideoTrack) {
+                    val p = sender.parameters
+                    val it = p.headerExtensions.iterator()
+                    var removedCnt = 0
+                    while (it.hasNext()) {
+                        val ext = it.next()
+                        if (ext.uri.contains("abs-send-time")
+                            || ext.uri.contains("rtp-hdrext:toffset")
+                            || ext.uri.contains("rtp-hdrext:playout-delay")) {
+                            it.remove()
+                            removedCnt++
+                            Log.i(TAG, "$tag ★★★ [v10] 视频sender移除时间类RTP扩展: uri=${ext.uri} id=${ext.id}")
+                        }
+                    }
+                    if (removedCnt > 0) {
+                        sender.parameters = p
+                        Log.i(TAG, "$tag ★★★ [v10] 视频sender RtpParameters 已移除 $removedCnt 个时间类扩展（abs-send-time/toffset/playout-delay）→ 修复中继只传1帧")
+                        Log.i(TAG, "$tag ★★★ [v10] 移除后视频sender剩余扩展: ${p.headerExtensions.map { it.uri + "#" + it.id }.joinToString()}")
+                    } else {
+                        Log.i(TAG, "$tag [v10] 视频sender未发现时间类RTP扩展（无需移除）")
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "$tag [v10] 移除视频sender时间类扩展失败(忽略): ${t.message}")
+        }
     }
 
     /** ★ 让 SDP 中 Opus 成为 0 号 Payload（音频首选），并把 FEC/RED/DTX 都打开 */
@@ -645,7 +1069,36 @@ class WebRtcSessionManager(
     private fun preferOpusAndVp8(sdp: String): String {
         // 99%场景下默认已经是 Opus(111)/VP8(96) 在前；这里保持原样即可，除非遇到特定运营商/设备；
         // 保留函数入口，以便后续扩展
-        return sdp
+        // ★★★ 2026-08-12 中继"只传1帧"修复：移除 abs-send-time RTP 扩展（与控制端 OFFER 保持一致）。
+        //   【根因】中继(TURN)路径下 abs-send-time 异常(加速43分钟/回退) → 接收端 arrival time=-inf
+        //     → 帧播放调度失败 → 解码输出被丢弃(Render 2/Drop 49) → 只有关键帧能显示。
+        //   【修复】ANSWER 同样删除 abs-send-time 扩展 → 两端都不协商该扩展 → 用本地到达时间估计。
+        return stripAbsSendTime(sdp)
+    }
+
+    /** ★ 2026-08-12 从SDP中移除 abs-send-time 扩展行（a=extmap:N ...abs-send-time） */
+    private fun stripAbsSendTime(sdp: String): String {
+        if (sdp.isBlank()) return sdp
+        try {
+            val lines = sdp.split("\n")
+            val sb = StringBuilder()
+            var removed = 0
+            for (line in lines) {
+                val trimmed = line.trim()
+                if (trimmed.startsWith("a=extmap:") && trimmed.contains("abs-send-time")) {
+                    removed++
+                    continue
+                }
+                sb.append(line).append('\n')
+            }
+            if (removed > 0) {
+                Log.i(TAG, "★ stripAbsSendTime: 移除 $removed 行 abs-send-time 扩展 → 修复中继视频渲染调度")
+            }
+            return sb.toString()
+        } catch (t: Throwable) {
+            Log.w(TAG, "stripAbsSendTime failed: ${t.message}")
+            return sdp
+        }
     }
 
     /** 简化 SdpObserver：避免每次复写所有方法 */
@@ -654,5 +1107,186 @@ class WebRtcSessionManager(
         override fun onSetFailure(e: String?) { Log.e(TAG, "SdpObserver onSetFailure: $e") }
         override fun onCreateSuccess(sdp: SessionDescription?) {}
         override fun onCreateFailure(e: String?) { Log.e(TAG, "SdpObserver onCreateFailure: $e") }
+    }
+}
+
+// ==================== ★★★ 2026-08-12 ZT直连候选修复辅助类 ====================
+
+/** 查找本机ZeroTier虚拟网段IP(172.16.0.0/12) */
+fun findZtIpAddress(): String? {
+    return try {
+        val nis = java.net.NetworkInterface.getNetworkInterfaces()
+        while (nis.hasMoreElements()) {
+            val ni = nis.nextElement()
+            if (!ni.isUp || ni.isLoopback) continue
+            val addrs = ni.inetAddresses
+            while (addrs.hasMoreElements()) {
+                val a = addrs.nextElement()
+                if (a !is java.net.Inet4Address) continue
+                val ip = a.hostAddress ?: continue
+                val parts = ip.split(".")
+                if (parts.size == 4 && parts[0] == "172") {
+                    try {
+                        val b = parts[1].toInt()
+                        if (b in 16..31) return ip
+                    } catch (_: Exception) {}
+                }
+            }
+        }
+        null
+    } catch (t: Throwable) {
+        null
+    }
+}
+
+/** ★★★ ZT专用网络检测器工厂：getActiveNetworkList()根据模式返回候选网络。
+ *  - relayPreferred=true（中继优先）：只返回WiFi（不含tun0）→ 媒体经TURN relay中继转发
+ *  - relayPreferred=false（直连兜底）：返回 WiFi + tun0(修正IP) → 媒体走ZT直连
+ *  背景：Android网络监控给ZeroTier VPN(tun0)生成的UDP host候选是底层WiFi IP而非ZT IP(172.26.x)，
+ *  跨设备ZT直连ICE两端候选都不含ZT IP → ICE=FAILED。v2注入NetworkChangeDetector修正。 */
+class ZtOnlyNetworkDetectorFactory(
+    private val ztIp: String,
+    private val relayPreferred: Boolean
+) : NetworkChangeDetectorFactory {
+    private val TAG = "WebRtcSessionMgr"
+    override fun create(observer: NetworkChangeDetector.Observer, context: Context): NetworkChangeDetector {
+        val base = NetworkMonitorAutoDetect(observer, context)
+        val ztIpBytes = parseIpv4(ztIp)
+        return object : NetworkChangeDetector {
+            override fun getCurrentConnectionType(): NetworkChangeDetector.ConnectionType =
+                base.currentConnectionType
+
+            override fun supportNetworkCallback(): Boolean = base.supportNetworkCallback()
+
+            override fun getActiveNetworkList(): MutableList<NetworkChangeDetector.NetworkInformation> {
+                val orig = base.activeNetworkList
+                var zt: NetworkChangeDetector.NetworkInformation? = null
+                if (orig != null) {
+                    for (ni in orig) {
+                        if (isZtNetwork(ni)) { zt = ni; break }
+                    }
+                }
+                // ★★★ 2026-08-12 兜底：部分ROM(华为EMUI等) NetworkMonitorAutoDetect 不报告
+                //   ZeroTier VPN(tun0)网络 → orig里找不到ZT网络 → zt==null 返回全部网络
+                //   → WebRTC socket绑定蜂窝/WiFi IP，host候选不含ZT IP → ICE=FAILED。
+                //   用ConnectivityManager遍历系统网络找TRANSPORT_VPN/接口tun开头的真实handle。
+                if (zt == null) {
+                    zt = findZtViaConnectivityManager(context, ztIpBytes)
+                    if (zt != null) {
+                        Log.i(TAG, "★ [ZT修复] orig无tun0，ConnectivityManager兜底找到VPN网络 name=${zt.name} handle=${zt.handle}")
+                    }
+                }
+                // ★★★ 2026-08-12 中继环境修复：不再"只返回tun0"——
+                //   返回 tun0(修正IP) + WiFi 两个网络，保证：
+                //   1) ZT直连环境：tun0候选(172.26.x)可用 → 跨设备ZT直连ICE选ZT路径
+                //   2) 中继/同WiFi环境：即使对端ZeroTier离线(无tun0)，仍可通过WiFi host候选直连
+                //   过滤无用的蜂窝/以太网/loopback(私网蜂窝IP会干扰ICE选路，且公网环境不可达)。
+                // ★★★ 2026-08-12 中继优先模式：relayPreferred=true 时【不返回tun0】，
+                //   只返回WiFi → host候选不含ZT IP → ICE无法选ZT host路径 → 只能走TURN relay(中继转发)。
+                //   这样保证"中继服务在线时媒体必走中继"，不被ZT host候选抢占。
+                val out = mutableListOf<NetworkChangeDetector.NetworkInformation>()
+                orig?.forEach { ni ->
+                    if (ni.type == NetworkChangeDetector.ConnectionType.CONNECTION_WIFI) out.add(ni)
+                }
+                if (!relayPreferred && zt != null && ztIpBytes != null) {
+                    // 直连兜底模式：修正IP后的ZT网络（tun0 → 172.26.x）
+                    val fixed = NetworkChangeDetector.NetworkInformation(
+                        zt.name, zt.type, zt.underlyingTypeForVpn, zt.handle,
+                        arrayOf(NetworkChangeDetector.IPAddress(ztIpBytes)))
+                    out.add(fixed)
+                    Log.i(TAG, "★ [ZT修复] 直连兜底模式: WiFi=${countWifi(orig)} + tun0(${zt.name}→$ztIp) ✓")
+                } else if (relayPreferred) {
+                    Log.i(TAG, "★ [中继优先] 候选网络仅WiFi（不含tun0），媒体将走TURN relay中继转发")
+                }
+                if (out.isEmpty()) return orig ?: mutableListOf() // 兜底：退回默认
+                return out
+            }
+
+            override fun destroy() { base.destroy() }
+        }
+    }
+
+    private fun isZtNetwork(ni: NetworkChangeDetector.NetworkInformation): Boolean {
+        if (ni.type == NetworkChangeDetector.ConnectionType.CONNECTION_VPN) return true
+        if (ni.name != null && ni.name.startsWith("tun")) return true
+        ni.ipAddresses?.forEach { a ->
+            if (a?.address != null && a.address.size == 4
+                && (a.address[0].toInt() and 0xFF) == 172) {
+                val b = a.address[1].toInt() and 0xFF
+                if (b in 16..31) return true
+            }
+        }
+        return false
+    }
+
+    /** 统计网络列表中WiFi网络个数（调试日志用） */
+    private fun countWifi(list: List<NetworkChangeDetector.NetworkInformation>?): Int {
+        var n = 0
+        list?.forEach { if (it.type == NetworkChangeDetector.ConnectionType.CONNECTION_WIFI) n++ }
+        return n
+    }
+
+    /** ★★★ 2026-08-12 华为/部分ROM ZT修复：用ConnectivityManager兜底查找ZeroTier VPN(tun0)网络。
+     *  NetworkMonitorAutoDetect.getActiveNetworkList()在部分ROM上不报告VPN网络，
+     *  导致WebRTC无法用tun0做ICE候选。直接遍历系统所有网络：
+     *  1) TRANSPORT_VPN 且接口名以tun开头（最典型ZeroTier）
+     *  2) 或 LinkProperties 链路地址含 172.16-31.x（ZT虚拟网段）
+     *  命中后取其真实NetworkHandle构造NetworkInformation。 */
+    private fun findZtViaConnectivityManager(
+        ctx: Context, ztIpBytes: ByteArray?): NetworkChangeDetector.NetworkInformation? {
+        return try {
+            val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
+                ?: return null
+            cm.allNetworks.forEach { n ->
+                val caps = cm.getNetworkCapabilities(n) ?: return@forEach
+                val lp = cm.getLinkProperties(n) ?: return@forEach
+                val iface = lp.interfaceName
+                val isVpnTransport = caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)
+                val isTunName = iface?.startsWith("tun") == true
+                var hasZtAddr = false
+                try {
+                    lp.linkAddresses.forEach { la ->
+                        val a = la.address
+                        if (a is java.net.Inet4Address) {
+                            val ip = a.hostAddress
+                            val p = ip?.split(".")
+                            if (p != null && p.size == 4 && p[0] == "172") {
+                                val b = p[1].toIntOrNull()
+                                if (b != null && b in 16..31) { hasZtAddr = true; return@forEach }
+                            }
+                        }
+                    }
+                } catch (_: Throwable) {}
+                if (isVpnTransport || isTunName || hasZtAddr) {
+                    val name = iface ?: "tun0"
+                    val handle = n.networkHandle
+                    val ips = if (ztIpBytes != null) {
+                        arrayOf(NetworkChangeDetector.IPAddress(ztIpBytes))
+                    } else {
+                        emptyArray<NetworkChangeDetector.IPAddress>()
+                    }
+                    return NetworkChangeDetector.NetworkInformation(
+                        name,
+                        NetworkChangeDetector.ConnectionType.CONNECTION_VPN,
+                        NetworkChangeDetector.ConnectionType.CONNECTION_UNKNOWN,
+                        handle,
+                        ips)
+                }
+            }
+            null
+        } catch (t: Throwable) {
+            Log.w(TAG, "★ [ZT修复] ConnectivityManager兜底查找VPN网络失败: ${t.message}")
+            null
+        }
+    }
+
+    private fun parseIpv4(ip: String): ByteArray? {
+        return try {
+            val p = ip.split(".")
+            if (p.size != 4) return null
+            byteArrayOf(
+                p[0].toInt().toByte(), p[1].toInt().toByte(),
+                p[2].toInt().toByte(), p[3].toInt().toByte())
+        } catch (t: Throwable) { null }
     }
 }

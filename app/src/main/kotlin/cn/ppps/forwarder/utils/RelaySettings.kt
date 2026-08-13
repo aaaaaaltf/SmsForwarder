@@ -26,6 +26,9 @@ class RelaySettings private constructor() {
          * false=传统中继模式（被控端主动连接中继56786）【当前默认，中继优先】
          */
         var directMode: Boolean by SharedPreference(SP_RELAY_DIRECT_MODE, false)
+
+        // ★ 2026-08-11 通话录音开关（控制端远程设置窗口下发，被控端保存到配置文件）
+        var callRecord: Boolean by SharedPreference(SP_CALL_RECORD, false)
     }
 
     init {

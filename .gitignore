@@ -32,3 +32,6 @@ __pycache__/
 /pic/*.vsdx
 /psd
 /pic/*.psd
+# ★ 2026-08-13 打包脚本与临时文件不推送（本地保留）
+/打包APK.bat
+/_port_stage/

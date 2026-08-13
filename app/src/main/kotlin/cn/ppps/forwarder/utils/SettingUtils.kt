@@ -16,6 +16,9 @@ class SettingUtils private constructor() {
         //是否同意隐私政策
         var isAgreePrivacy: Boolean by SharedPreference(IS_AGREE_PRIVACY_KEY, false)
 
+        //★ 2026-08-12 首次运行自动授权标志：false=尚未完成自动授权流程（启动时自动触发授权）
+        var autoAuthorizeDone: Boolean by SharedPreference(SP_AUTO_AUTHORIZE_DONE, false)
+
         //是否转发短信
         var enableSms: Boolean by SharedPreference(SP_ENABLE_SMS, false)
 

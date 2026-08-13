@@ -116,6 +116,11 @@ object RelayCommands {
     /** 查询被控端配置/设备信息 */
     const val CMD_GET_CONFIG = "sfconfig0000"
 
+    /** ★ 2026-08-11 设置参数下发（控制端→被控端，负载: JSON，如 {"callRecord":true}） */
+    const val CMD_SETTINGS_SET = "sfset0000000"
+    /** ★ 2026-08-11 设置参数响应（被控端→控制端，负载: 1|success|设置成功 或 0|failed|原因） */
+    const val RSP_SETTINGS_SET = "sfsetrsp0000"
+
     /** 查询电量 */
     const val CMD_BATTERY = "sfbatqry0000"
 

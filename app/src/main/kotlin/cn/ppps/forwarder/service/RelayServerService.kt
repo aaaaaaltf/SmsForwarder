@@ -17,6 +17,7 @@ import cn.ppps.forwarder.utils.Log
 import cn.ppps.forwarder.App
 import cn.ppps.forwarder.R
 import cn.ppps.forwarder.activity.MainActivity
+import cn.ppps.forwarder.relay.CallRecordManager
 import cn.ppps.forwarder.relay.RelayCommands
 import cn.ppps.forwarder.relay.RelaySender
 import cn.ppps.forwarder.relay.RelayServerClient
@@ -88,9 +89,12 @@ class RelayServerService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        // Android 11+ 需要按 manifest 声明的前台服务类型启动（camera 类型用于后台摄像头推流）
+        // Android 11+ 需要按 manifest 声明的前台服务类型启动（camera 类型用于后台摄像头推流，
+        // ★ 2026-08-11 补充 microphone 类型用于通话录音（Android 14+ 后台录音要求该fgst类型））
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            startForeground(FRONT_NOTIFY_ID, buildNotification(), android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA)
+            startForeground(FRONT_NOTIFY_ID, buildNotification(),
+                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+                        or android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
         } else {
             startForeground(FRONT_NOTIFY_ID, buildNotification())
         }
@@ -117,13 +121,47 @@ class RelayServerService : Service() {
             Log.i(TAG, "已恢复屏幕捕获授权，远程屏幕控制可用")
         }
 
+        // ★ 2026-08-11 通话录音：配置开启时启动通话状态监听（控制端设置窗口可远程开关）
+        if (RelaySettings.callRecord) {
+            CallRecordManager.start(this)
+        }
+
         val onConnected: () -> Unit = {
             isConnected = true
             Log.i(TAG, "被控端已连接中继 ${RelaySettings.relayHost}:${RelaySettings.relayServerPort}")
+            // ★★★ 2026-08-13 需求：中继连接成功时关闭 ZeroTier（自动点击开关断开VPN + force-stop），节省资源。
+            //   中继断开时再由 onDisconnected 重新启动 ZeroTier 直连。
+            executor?.execute {
+                try {
+                    if (cn.ppps.forwarder.relay.ZeroTierHelper.isZeroTierUp()
+                            || cn.ppps.forwarder.relay.ZeroTierHelper.isZeroTierInstalled(this)) {
+                        Log.i(TAG, "★ 中继已连接，自动断开/关闭 ZeroTier 节省资源")
+                        cn.ppps.forwarder.relay.ZeroTierHelper.disconnectZt(this)
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "中继连接后关闭ZeroTier异常: ${e.message}")
+                }
+            }
         }
         val onDisconnected: () -> Unit = {
             isConnected = false
             Log.i(TAG, "被控端连接已断开")
+            // ★★★ 2026-08-13 需求：中继服务关闭/断开时，检测并开启 ZeroTier（自动点击开关建立VPN），
+            //   开启成功后 ZtDirectScanner 会自动发现控制端并建立 ZT 直连（扫描器每15秒探测）。
+            executor?.execute {
+                try {
+                    if (!cn.ppps.forwarder.relay.ZeroTierHelper.isZeroTierUp()) {
+                        Log.i(TAG, "★ 中继断开，检测到 ZeroTier 未开启，自动启动并连接 ZeroTier One...")
+                        cn.ppps.forwarder.relay.ZeroTierHelper.ensureZeroTierUp(this) { up ->
+                            Log.i(TAG, "★ ZeroTier 开启结果: $up（中继断开后直连模式就绪）")
+                        }
+                    } else {
+                        Log.i(TAG, "★ 中继断开，ZeroTier 已开启，直连模式可立即使用")
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "中继断开后启动ZeroTier异常: ${e.message}")
+                }
+            }
         }
         // ★ 中继连接的命令处理：响应经中继回传（控制端经中继56782/56787接收）
         val onRelayCommand: (String, ByteArray) -> Unit = { cmd: String, payload: ByteArray ->
@@ -403,6 +441,8 @@ class RelayServerService : Service() {
         RelayServerHandler.ztDirectLauncher = null
         cn.ppps.forwarder.relay.CameraStreamManager.setClient(null)
         cn.ppps.forwarder.relay.ScreenStreamManager.releaseProjection()
+        // ★ 2026-08-11 停止通话录音监听
+        cn.ppps.forwarder.relay.CallRecordManager.stop()
         // ★ 停止屏幕捕获前台服务（与投影释放同步，避免常驻）
         ScreenProjectionService.stop(this)
         executor?.shutdownNow()
