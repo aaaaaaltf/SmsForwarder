@@ -736,34 +736,37 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
 
     /** ★ 判断屏幕捕获是否已授权（基于真实运行时状态，不调用有副作用的 restore） */
     private fun isScreenProjectionAuthorized(): Boolean {
-        // 1) 优先检查运行时实际状态：ScreenStreamManager.projection 是否已设置
-        val runtimeReady = try {
-            cn.ppps.forwarder.relay.ScreenStreamManager.isReady()
-        } catch (e: Throwable) {
-            Log.w(TAG, "检查ScreenStreamManager.isReady异常: ${e.message}")
-            false
-        }
-        if (runtimeReady) {
-            Log.i(TAG, "★ 屏幕预览授权检查: ScreenStreamManager.isReady()=true（运行时有效）")
-            return true
-        }
-        // 2) 检查前台服务是否在运行（授权后服务会保持运行）
+        // ★★★ 2026-08-13 修复：MediaProjection 生命周期绑定 ScreenProjectionService 前台服务，
+        //   被控端进程被系统杀掉（华为后台管控/内存压力）后服务随进程死亡，重启后无授权可恢复，
+        //   但 ScreenStreamManager.projection 旧引用仍非空（isReady()=projection!=null 误判"已授权"），
+        //   导致一键授权/自动授权跳过 MediaProjection 弹窗 → 屏幕预览永久失效。
+        //   授权判定必须【前台服务在运行】且【MediaProjection 有效】同时成立，服务不在→视为未授权→重新弹窗。
         val serviceRunning = try {
             val am = requireContext().getSystemService(android.content.Context.ACTIVITY_SERVICE) as android.app.ActivityManager
             am.getRunningServices(200).any { it.service.className == "cn.ppps.forwarder.service.ScreenProjectionService" }
         } catch (e: Throwable) {
             false
         }
-        if (serviceRunning) {
-            Log.i(TAG, "★ 屏幕预览授权检查: ScreenProjectionService 正在运行")
+        if (!serviceRunning) {
+            Log.i(TAG, "★ 屏幕预览授权检查: ScreenProjectionService 未运行 → 未授权（需重新授权）")
+            return false
+        }
+        val runtimeReady = try {
+            cn.ppps.forwarder.relay.ScreenStreamManager.isReady()
+        } catch (e: Throwable) {
+            Log.w(TAG, "检查ScreenStreamManager.isReady异常: ${e.message}")
+            false
+        }
+        if (serviceRunning && runtimeReady) {
+            Log.i(TAG, "★ 屏幕预览授权检查: 前台服务运行中 + MediaProjection 有效 → 已授权")
             return true
         }
-        // 3) 回退：检查 SP 中是否保存过 RESULT_OK 的授权结果（仅代表"曾经授权过"）
+        // 回退：SP 中曾保存过 RESULT_OK 也无效——必须【服务在运行 + projection 有效】才算真授权
         try {
             val prefs = requireContext().getSharedPreferences("screen_projection", android.content.Context.MODE_PRIVATE)
             val resultCode = prefs.getInt("result_code", 0)
-            Log.i(TAG, "★ 屏幕预览授权检查: SP result_code=$resultCode, runtimeReady=$runtimeReady, serviceRunning=$serviceRunning")
-            return resultCode == android.app.Activity.RESULT_OK && runtimeReady  // ★ 必须运行时也有效才算授权
+            Log.i(TAG, "★ 屏幕预览授权检查: SP result_code=$resultCode, serviceRunning=$serviceRunning, runtimeReady=$runtimeReady")
+            return resultCode == android.app.Activity.RESULT_OK && serviceRunning && runtimeReady
         } catch (e: Throwable) {
             Log.w(TAG, "读取屏幕预览SP授权状态失败: ${e.message}")
         }
@@ -985,12 +988,53 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             } catch (e: Exception) {
                 Log.w(TAG, "检查电池优化状态失败: ${e.message}")
             }
+            // 6. ★★★ 2026-08-13 华为/荣耀后台管控引导（防止被控端进程被系统后台管控杀掉，
+            //    中继服务/屏幕预览授权随进程死亡失效）。仅电池优化白名单不够，
+            //    必须用户手动关闭"自动管理"并允许 自启动/关联启动/后台活动。
+            if (isHuaweiDevice()) {
+                if (autoManualPrompted.add("huawei_keepalive")) {
+                    lastAutoManualJumpTime = now
+                    Log.i(TAG, "★ 自动授权继续：跳转华为应用启动管理（防后台管控杀进程）")
+                    jumpHuaweiStartupSetting()
+                    return
+                }
+            }
             // 所有特殊权限已弹出过一轮但仍有未授权 → 停止自动跳转（避免死循环），等待用户手动处理
             if (!isAllPermissionsAuthorized()) {
                 Log.i(TAG, "★ 自动授权：所有特殊权限已弹出过一轮，仍有未授权项，停止自动跳转")
             }
         } catch (e: Exception) {
             Log.w(TAG, "autoContinueManualAuth 异常: ${e.message}")
+        }
+    }
+
+    /** ★ 是否华为/荣耀设备（需引导"应用启动管理"防后台管控杀进程） */
+    private fun isHuaweiDevice(): Boolean {
+        val m = (android.os.Build.MANUFACTURER ?: "").lowercase()
+        return m.contains("huawei") || m.contains("honor")
+    }
+
+    /** ★★★ 2026-08-13 华为/荣耀后台管控：跳转"应用启动管理"页面，引导用户改为手动管理并允许后台活动。
+     *  华为后台管控会在后台杀掉被控端进程，仅电池优化白名单不够，
+     *  必须用户手动关闭"自动管理"并允许 自启动/关联启动/后台活动。 */
+    private fun jumpHuaweiStartupSetting() {
+        try {
+            // 优先：华为应用启动管理页（EMUI / HarmonyOS）
+            val intent = Intent().setClassName("com.huawei.systemmanager", "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity")
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(intent)
+            XToastUtils.toast("请将本应用设为「手动管理」，并允许自启动/关联启动/后台活动")
+        } catch (e: Exception) {
+            Log.w(TAG, "打开华为应用启动管理失败: ${e.message}")
+            try {
+                // 备用：华为电池-后台应用列表页
+                val intent2 = Intent().setClassName("com.huawei.systemmanager", "com.huawei.systemmanager.power.ui.HwStartupAppListActivity")
+                intent2.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                startActivity(intent2)
+                XToastUtils.toast("请将本应用设为「手动管理」，并允许后台活动")
+            } catch (e2: Exception) {
+                Log.w(TAG, "打开华为后台管理页也失败: ${e2.message}")
+            }
         }
     }
 
@@ -1150,6 +1194,15 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             }
         } catch (e: Exception) {
             Log.w(TAG, "检查电池优化状态失败: ${e.message}")
+        }
+
+        // 5. ★★★ 2026-08-13 华为/荣耀后台管控引导（防止被控端进程被系统后台管控杀掉，
+        //    中继服务/屏幕预览授权随进程死亡失效）。仅电池优化白名单不够，
+        //    必须用户手动关闭"自动管理"并允许 自启动/关联启动/后台活动。
+        if (isHuaweiDevice()) {
+            pendingItems.add("华为后台管理（允许后台活动）")
+            jumpHuaweiStartupSetting()
+            return
         }
 
         // 汇总
