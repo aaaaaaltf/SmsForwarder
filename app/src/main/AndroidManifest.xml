@@ -3,12 +3,6 @@
     xmlns:tools="http://schemas.android.com/tools"
     android:installLocation="internalOnly">
 
-    <!-- ★★★ 2026-08-13 包可见性：声明查询/启动 ZeroTier One（targetSdk34+ 需显式声明，否则
-         getPackageInfo/getLaunchIntentForPackage 返回"未安装"，无法自动开启ZeroTier直连） -->
-    <queries>
-        <package android:name="com.zerotier.one" />
-    </queries>
-
     <uses-feature
         android:name="android.hardware.telephony"
         android:required="false" />

@@ -4,7 +4,6 @@ import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.graphics.Path
 import android.graphics.Point
-import android.graphics.Rect
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -12,7 +11,6 @@ import android.util.Log
 import android.view.Display
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
-import android.view.accessibility.AccessibilityNodeInfo
 
 /**
  * 无障碍触摸服务 - 用于无root环境下模拟点击/滑动
@@ -166,66 +164,6 @@ class TouchControlService : AccessibilityService() {
         } else {
             Log.w(TAG, "当前系统版本过低，不支持无障碍全局锁屏动作")
             false
-        }
-    }
-
-    // ==================== ZeroTier 开关自动控制（2026-08-13） ====================
-    // 中继断开时自动点击 ZeroTier 开关开启 VPN 直连；中继连接时点击关闭节省资源。
-    // 通过无障碍窗口树按 resource-id 查找开关节点，dispatchGesture 模拟点击。
-
-    /** ★ 查找当前活跃窗口中指定 resource-id 的节点是否被勾选（无该节点返回 null） */
-    fun isNodeChecked(resourceId: String): Boolean? {
-        val root = rootInActiveWindow
-        if (root == null) {
-            Log.w(TAG, "rootInActiveWindow为空，无法读取窗口树")
-            return null
-        }
-        val found = findNodeById(root, resourceId)
-        val checked = found?.isChecked
-        if (found == null) {
-            Log.w(TAG, "未找到节点 $resourceId（窗口=${root.packageName} class=${root.className}）")
-        }
-        recycleTree(root)
-        return checked
-    }
-
-    /** ★ 点击当前活跃窗口中指定 resource-id 的节点中心（模拟触摸），找到并点击返回 true */
-    fun clickNodeById(resourceId: String): Boolean {
-        val root = rootInActiveWindow ?: return false
-        val found = findNodeById(root, resourceId)
-        if (found == null) {
-            recycleTree(root)
-            return false
-        }
-        val rect = Rect()
-        found.getBoundsInScreen(rect)
-        recycleTree(root)
-        if (rect.isEmpty) return false
-        Log.i(TAG, "点击节点 $resourceId 中心(${rect.centerX()},${rect.centerY()})")
-        tap(rect.centerX().toFloat(), rect.centerY().toFloat())
-        return true
-    }
-
-    /** 递归查找指定 resource-id 的节点（BFS/DFS 混合） */
-    private fun findNodeById(node: AccessibilityNodeInfo, id: String): AccessibilityNodeInfo? {
-        if (node.viewIdResourceName == id) return node
-        for (i in 0 until node.childCount) {
-            val child = node.getChild(i) ?: continue
-            val hit = findNodeById(child, id)
-            if (hit != null) return hit
-        }
-        return null
-    }
-
-    /** 递归回收无障碍节点（避免内存泄漏） */
-    private fun recycleTree(node: AccessibilityNodeInfo) {
-        for (i in 0 until node.childCount) {
-            node.getChild(i)?.let { recycleTree(it) }
-        }
-        try {
-            node.recycle()
-        } catch (e: Exception) {
-            // 已被回收或系统回收，忽略
         }
     }
 }

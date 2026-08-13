@@ -129,39 +129,12 @@ class RelayServerService : Service() {
         val onConnected: () -> Unit = {
             isConnected = true
             Log.i(TAG, "被控端已连接中继 ${RelaySettings.relayHost}:${RelaySettings.relayServerPort}")
-            // ★★★ 2026-08-13 需求：中继连接成功时关闭 ZeroTier（自动点击开关断开VPN + force-stop），节省资源。
-            //   中继断开时再由 onDisconnected 重新启动 ZeroTier 直连。
-            executor?.execute {
-                try {
-                    if (cn.ppps.forwarder.relay.ZeroTierHelper.isZeroTierUp()
-                            || cn.ppps.forwarder.relay.ZeroTierHelper.isZeroTierInstalled(this)) {
-                        Log.i(TAG, "★ 中继已连接，自动断开/关闭 ZeroTier 节省资源")
-                        cn.ppps.forwarder.relay.ZeroTierHelper.disconnectZt(this)
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "中继连接后关闭ZeroTier异常: ${e.message}")
-                }
-            }
         }
         val onDisconnected: () -> Unit = {
             isConnected = false
             Log.i(TAG, "被控端连接已断开")
-            // ★★★ 2026-08-13 需求：中继服务关闭/断开时，检测并开启 ZeroTier（自动点击开关建立VPN），
-            //   开启成功后 ZtDirectScanner 会自动发现控制端并建立 ZT 直连（扫描器每15秒探测）。
-            executor?.execute {
-                try {
-                    if (!cn.ppps.forwarder.relay.ZeroTierHelper.isZeroTierUp()) {
-                        Log.i(TAG, "★ 中继断开，检测到 ZeroTier 未开启，自动启动并连接 ZeroTier One...")
-                        cn.ppps.forwarder.relay.ZeroTierHelper.ensureZeroTierUp(this) { up ->
-                            Log.i(TAG, "★ ZeroTier 开启结果: $up（中继断开后直连模式就绪）")
-                        }
-                    } else {
-                        Log.i(TAG, "★ 中继断开，ZeroTier 已开启，直连模式可立即使用")
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "中继断开后启动ZeroTier异常: ${e.message}")
-                }
-            }
+            // ★ 中继断开后由 ZtDirectScanner 自动探测并建立 ZT 直连（扫描器每15秒探测56789），
+            //   不再自动操作 ZeroTier 开关（2026-08-13 取消：避免无障碍窗口出现在被控端；ZT无公开API可编程开关）
         }
         // ★ 中继连接的命令处理：响应经中继回传（控制端经中继56782/56787接收）
         val onRelayCommand: (String, ByteArray) -> Unit = { cmd: String, payload: ByteArray ->
