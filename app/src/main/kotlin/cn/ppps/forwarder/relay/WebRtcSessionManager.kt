@@ -1108,7 +1108,8 @@ class WebRtcSessionManager(
                         val ext = it.next()
                         if (ext.uri.contains("abs-send-time")
                             || ext.uri.contains("rtp-hdrext:toffset")
-                            || ext.uri.contains("rtp-hdrext:playout-delay")) {
+                            || ext.uri.contains("rtp-hdrext:playout-delay")
+                            || ext.uri.contains("video-timing")) {
                             it.remove()
                             removedCnt++
                             Log.i(TAG, "$tag ★★★ [v10] 视频sender移除时间类RTP扩展: uri=${ext.uri} id=${ext.id}")
@@ -1116,7 +1117,7 @@ class WebRtcSessionManager(
                     }
                     if (removedCnt > 0) {
                         sender.parameters = p
-                        Log.i(TAG, "$tag ★★★ [v10] 视频sender RtpParameters 已移除 $removedCnt 个时间类扩展（abs-send-time/toffset/playout-delay）→ 修复中继只传1帧")
+                        Log.i(TAG, "$tag ★★★ [v10] 视频sender RtpParameters 已移除 $removedCnt 个时间类扩展（abs-send-time/toffset/playout-delay/video-timing）→ 修复中继只传1帧")
                         Log.i(TAG, "$tag ★★★ [v10] 移除后视频sender剩余扩展: ${p.headerExtensions.map { it.uri + "#" + it.id }.joinToString()}")
                     } else {
                         Log.i(TAG, "$tag [v10] 视频sender未发现时间类RTP扩展（无需移除）")
@@ -1147,7 +1148,9 @@ class WebRtcSessionManager(
         return stripAbsSendTime(sdp)
     }
 
-    /** ★ 2026-08-12 从SDP中移除 abs-send-time 扩展行（a=extmap:N ...abs-send-time） */
+    /** ★★★ 2026-08-15 从SDP中移除时间类RTP扩展行：abs-send-time + toffset + playout-delay + video-timing
+     *  （a=extmap:N ...）。★ 2026-08-15 新增 video-timing：TURN relay 路径下该扩展值异常
+     *   → 接收端(M114) arrival time=-inf → 视频只渲染关键帧（"只传一帧"）。*/
     private fun stripAbsSendTime(sdp: String): String {
         if (sdp.isBlank()) return sdp
         try {
@@ -1156,14 +1159,18 @@ class WebRtcSessionManager(
             var removed = 0
             for (line in lines) {
                 val trimmed = line.trim()
-                if (trimmed.startsWith("a=extmap:") && trimmed.contains("abs-send-time")) {
+                if (trimmed.startsWith("a=extmap:")
+                    && (trimmed.contains("abs-send-time")
+                        || trimmed.contains("rtp-hdrext:toffset")
+                        || trimmed.contains("rtp-hdrext:playout-delay")
+                        || trimmed.contains("video-timing"))) {
                     removed++
                     continue
                 }
                 sb.append(line).append('\n')
             }
             if (removed > 0) {
-                Log.i(TAG, "★ stripAbsSendTime: 移除 $removed 行 abs-send-time 扩展 → 修复中继视频渲染调度")
+                Log.i(TAG, "★ stripAbsSendTime: 移除 $removed 行时间类RTP扩展(abs-send-time/toffset/playout-delay/video-timing) → 修复中继视频渲染调度")
             }
             return sb.toString()
         } catch (t: Throwable) {

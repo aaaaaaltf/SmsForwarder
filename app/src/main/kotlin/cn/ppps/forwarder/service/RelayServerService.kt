@@ -17,7 +17,6 @@ import cn.ppps.forwarder.utils.Log
 import cn.ppps.forwarder.App
 import cn.ppps.forwarder.R
 import cn.ppps.forwarder.activity.MainActivity
-import cn.ppps.forwarder.relay.CallRecordManager
 import cn.ppps.forwarder.relay.RelayCommands
 import cn.ppps.forwarder.relay.RelaySender
 import cn.ppps.forwarder.relay.RelayServerClient
@@ -90,7 +89,7 @@ class RelayServerService : Service() {
     override fun onCreate() {
         super.onCreate()
         // Android 11+ 需要按 manifest 声明的前台服务类型启动（camera 类型用于后台摄像头推流，
-        // ★ 2026-08-11 补充 microphone 类型用于通话录音（Android 14+ 后台录音要求该fgst类型））
+        // microphone 类型用于麦克风采集（WebRTC 麦克风功能，Android 14+ 后台录音要求该 fgst 类型））
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             startForeground(FRONT_NOTIFY_ID, buildNotification(),
                 android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
@@ -125,11 +124,6 @@ class RelayServerService : Service() {
             //   服务不在→误判未授权→一键授权/自动授权重新弹MediaProjection框。
             //   这里必须把前台服务启动起来（onStartCommand内会再次restore，幂等）。
             ScreenProjectionService.startForegroundOnly(this)
-        }
-
-        // ★ 2026-08-11 通话录音：配置开启时启动通话状态监听（控制端设置窗口可远程开关）
-        if (RelaySettings.callRecord) {
-            CallRecordManager.start(this)
         }
 
         val onConnected: () -> Unit = {
@@ -420,8 +414,6 @@ class RelayServerService : Service() {
         RelayServerHandler.ztDirectLauncher = null
         cn.ppps.forwarder.relay.CameraStreamManager.setClient(null)
         cn.ppps.forwarder.relay.ScreenStreamManager.releaseProjection()
-        // ★ 2026-08-11 停止通话录音监听
-        cn.ppps.forwarder.relay.CallRecordManager.stop()
         // ★ 停止屏幕捕获前台服务（与投影释放同步，避免常驻）
         ScreenProjectionService.stop(this)
         executor?.shutdownNow()

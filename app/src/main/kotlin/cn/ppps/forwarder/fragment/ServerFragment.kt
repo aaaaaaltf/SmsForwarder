@@ -1,6 +1,8 @@
 package cn.ppps.forwarder.fragment
 
+import android.content.ComponentName
 import android.content.Intent
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.text.Editable
@@ -669,12 +671,34 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         }
     }
 
-    /** 请求/跳转"电池优化白名单"（REQUEST_IGNORE_BATTERY_OPTIMIZATIONS → 直接弹系统确认框） */
+    /** ★★★ 2026-08-15 电池优化/后台保活是否已授权：
+     *   标准白名单 isIgnoringBatteryOptimizations() → 已加入AOSP电池优化白名单即算已授权；
+     *   华为/荣耀：用户已设置"电池优化-不优化/允许后台活动"时标准API仍可能返回false（实测），
+     *   补查 OP_RUN_ANY_IN_BACKGROUND(70) appops（=EMUI 应用启动管理-后台活动开关），
+     *   非 MODE_IGNORED（MODE_ALLOWED 或 MODE_DEFAULT=默认放行）即视为已授权 → 不再打开授权窗口。 */
+    private fun isBatteryOptimizationAuthorized(ctx: android.content.Context): Boolean {
+        try {
+            val pm = ctx.getSystemService(android.content.Context.POWER_SERVICE) as android.os.PowerManager
+            if (pm.isIgnoringBatteryOptimizations(ctx.packageName)) return true
+        } catch (_: Throwable) {}
+        val manufacturer = (android.os.Build.MANUFACTURER ?: "").lowercase()
+        if (manufacturer.contains("huawei") || manufacturer.contains("honor")) {
+            try {
+                val am = ctx.getSystemService(android.content.Context.APP_OPS_SERVICE) as android.app.AppOpsManager
+                val mode = am.checkOpNoThrow("android:run_any_in_background", ctx.applicationInfo.uid, ctx.packageName)
+                if (mode != android.app.AppOpsManager.MODE_IGNORED) return true
+            } catch (_: Throwable) {}
+        }
+        return false
+    }
+
+    /** 请求/跳转"电池优化白名单"（REQUEST_IGNORE_BATTERY_OPTIMIZATIONS → 直接弹系统确认框）
+     *  ★ 2026-08-15 修复：REQUEST 弹窗不可用时按手机型号打开对应的电池优化/省电策略设置页，
+     *    不再一律跳通用 ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS（小米/华为等机型该页面打不开或不对应）。 */
     private fun jumpBatterySetting() {
         val ctx = requireContext()
         try {
-            val pm = ctx.getSystemService(android.content.Context.POWER_SERVICE) as android.os.PowerManager
-            if (pm.isIgnoringBatteryOptimizations(ctx.packageName)) {
+            if (isBatteryOptimizationAuthorized(ctx)) {
                 XToastUtils.success("已加入电池优化白名单")
                 return
             }
@@ -686,14 +710,73 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                 startActivity(intent)
                 XToastUtils.toast("请点击「允许」以加入电池优化白名单")
             } catch (e: Exception) {
-                Log.w(TAG, "请求电池优化白名单失败，跳设置页: ${e.message}")
-                // 兜底：跳电池优化列表页（用户手动找到APP添加）
-                val intent = Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                startActivity(intent)
+                Log.w(TAG, "请求电池优化白名单失败，按机型跳转设置页: ${e.message}")
+                jumpBatterySettingByManufacturer()
             }
         } catch (e: Throwable) {
             XToastUtils.error("检查/授权电池优化白名单失败: ${e.message}")
+        }
+    }
+
+    /** ★★★ 2026-08-15 按被控端手机型号打开电池优化/省电策略设置页（REQUEST 弹窗不可用时）
+     *  华为/荣耀 → 手机管家"受保护应用/应用启动管理"；小米/红米 → 安全中心"自启动管理"；
+     *  OPPO/一加 → 安全中心自启动；vivo/iQOO → 后台高耗电管理；三星 → 智能管理器；
+     *  其他 → 通用电池优化列表页兜底。 */
+    private fun jumpBatterySettingByManufacturer() {
+        val ctx = requireContext()
+        val manufacturer = (Build.MANUFACTURER ?: "").lowercase()
+        val candidates = when {
+            manufacturer.contains("huawei") || manufacturer.contains("honor") -> listOf(
+                "com.huawei.systemmanager" to "com.huawei.systemmanager.optimize.process.ProtectActivity",
+                "com.huawei.systemmanager" to "com.huawei.systemmanager.appcontrol.activity.StartupAppControlActivity"
+            )
+            manufacturer.contains("xiaomi") || manufacturer.contains("redmi") -> listOf(
+                "com.miui.securitycenter" to "com.miui.permcenter.autostart.AutoStartManagementActivity"
+            )
+            manufacturer.contains("oppo") || manufacturer.contains("realme") || manufacturer.contains("oneplus") -> listOf(
+                "com.coloros.safecenter" to "com.coloros.safecenter.permission.startup.StartupAppListActivity",
+                "com.oplus.safecenter" to "com.oplus.safecenter.permission.startup.StartupAppListActivity"
+            )
+            manufacturer.contains("vivo") || manufacturer.contains("iqoo") -> listOf(
+                "com.vivo.permissionmanager" to "com.vivo.permissionmanager.activity.BgStartUpManagerActivity"
+            )
+            manufacturer.contains("samsung") -> listOf(
+                "com.samsung.android.sm_cn" to "com.samsung.android.sm.ui.ram.AutoRunActivity",
+                "com.samsung.android.lool" to "com.samsung.android.sm.battery.ui.BatteryActivity"
+            )
+            else -> emptyList()
+        }
+        for ((pkg, cls) in candidates) {
+            try {
+                val intent = Intent().setComponent(ComponentName(pkg, cls))
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                startActivity(intent)
+                XToastUtils.toast("请在打开的设置页中，将本应用设为「不允许优化」/「允许后台运行」")
+                return
+            } catch (e: Exception) {
+                Log.w(TAG, "打开机型电池设置失败($pkg/$cls): ${e.message}")
+            }
+        }
+        // 兜底：通用电池优化列表页
+        try {
+            val intent = Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(intent)
+            XToastUtils.toast("请在电池优化列表中找到本应用并选择「不允许」")
+        } catch (e: Exception) {
+            Log.w(TAG, "打开通用电池优化列表失败: ${e.message}")
+            // 最终兜底：跳本应用详情页（用户手动找到电池优化入口）
+            try {
+                val intent = Intent(
+                    android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    android.net.Uri.fromParts("package", ctx.packageName, null)
+                )
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                startActivity(intent)
+                XToastUtils.toast("请在应用详情页中开启「电池优化」/「省电策略」为不优化")
+            } catch (e2: Exception) {
+                Log.w(TAG, "打开应用详情页也失败: ${e2.message}")
+            }
         }
     }
 
@@ -975,26 +1058,25 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                 }
             }
             // 5. 电池优化白名单
-            try {
-                val pm = ctx.getSystemService(android.content.Context.POWER_SERVICE) as android.os.PowerManager
-                if (!pm.isIgnoringBatteryOptimizations(ctx.packageName)) {
-                    if (autoManualPrompted.add("battery")) {
-                        lastAutoManualJumpTime = now
-                        Log.i(TAG, "★ 自动授权继续：弹出电池优化白名单确认框")
-                        jumpBatterySetting()
-                        return
-                    }
+            // ★★★ 2026-08-15 防重复弹窗：已提示过（持久化batteryAuthGuided）或已授权则不再弹出
+            if (!isBatteryOptimizationAuthorized(ctx) && !SettingUtils.batteryAuthGuided) {
+                if (autoManualPrompted.add("battery")) {
+                    lastAutoManualJumpTime = now
+                    SettingUtils.batteryAuthGuided = true
+                    Log.i(TAG, "★ 自动授权继续：弹出电池优化白名单确认框（已持久化batteryAuthGuided防重复弹窗）")
+                    jumpBatterySetting()
+                    return
                 }
-            } catch (e: Exception) {
-                Log.w(TAG, "检查电池优化状态失败: ${e.message}")
             }
             // 6. ★★★ 2026-08-13 华为/荣耀后台管控引导（防止被控端进程被系统后台管控杀掉，
             //    中继服务/屏幕预览授权随进程死亡失效）。仅电池优化白名单不够，
             //    必须用户手动关闭"自动管理"并允许 自启动/关联启动/后台活动。
-            if (isHuaweiDevice()) {
+            // ★★★ 2026-08-15 修复"已授权仍重复弹窗"：电池优化已授权 或 已引导过（持久化）→ 不再跳转
+            if (isHuaweiDevice() && !isBatteryOptimizationAuthorized(ctx) && !SettingUtils.huaweiKeepaliveGuided) {
                 if (autoManualPrompted.add("huawei_keepalive")) {
                     lastAutoManualJumpTime = now
-                    Log.i(TAG, "★ 自动授权继续：跳转华为应用启动管理（防后台管控杀进程）")
+                    SettingUtils.huaweiKeepaliveGuided = true
+                    Log.i(TAG, "★ 自动授权继续：跳转华为应用启动管理（防后台管控杀进程，已持久化huaweiKeepaliveGuided只提示一次）")
                     jumpHuaweiStartupSetting()
                     return
                 }
@@ -1106,13 +1188,10 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                 return false
             }
             // 6. 电池优化白名单
-            try {
-                val pm = ctx.getSystemService(android.content.Context.POWER_SERVICE) as android.os.PowerManager
-                if (!pm.isIgnoringBatteryOptimizations(ctx.packageName)) {
-                    Log.i(TAG, "★ 权限未授权(电池优化白名单)")
-                    return false
-                }
-            } catch (_: Throwable) {}
+            if (!isBatteryOptimizationAuthorized(ctx)) {
+                Log.i(TAG, "★ 权限未授权(电池优化白名单)")
+                return false
+            }
             return true
         } catch (e: Exception) {
             Log.w(TAG, "isAllPermissionsAuthorized 异常: ${e.message}")
@@ -1187,29 +1266,22 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         }
 
         // 4. 电池优化白名单
-        try {
-            val pm = ctx.getSystemService(android.content.Context.POWER_SERVICE) as android.os.PowerManager
-            if (!pm.isIgnoringBatteryOptimizations(ctx.packageName)) {
-                pendingItems.add("电池优化白名单")
-                try {
-                    val intent = Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
-                    intent.data = android.net.Uri.parse("package:" + ctx.packageName)
-                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    startActivity(intent)
-                    return
-                } catch (e: Exception) {
-                    Log.w(TAG, "请求电池优化白名单失败: ${e.message}")
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "检查电池优化状态失败: ${e.message}")
+        // ★★★ 2026-08-15 防重复弹窗：已提示过（持久化batteryAuthGuided）或已授权则不再打开
+        if (!isBatteryOptimizationAuthorized(ctx) && !SettingUtils.batteryAuthGuided) {
+            pendingItems.add("电池优化白名单")
+            SettingUtils.batteryAuthGuided = true
+            // ★ 2026-08-15 修复：REQUEST弹窗失败时按手机型号打开对应设置页（不再只用通用电池优化列表）
+            jumpBatterySetting()
+            return
         }
 
         // 5. ★★★ 2026-08-13 华为/荣耀后台管控引导（防止被控端进程被系统后台管控杀掉，
         //    中继服务/屏幕预览授权随进程死亡失效）。仅电池优化白名单不够，
         //    必须用户手动关闭"自动管理"并允许 自启动/关联启动/后台活动。
-        if (isHuaweiDevice()) {
+        // ★★★ 2026-08-15 修复"已授权仍重复弹窗"：电池优化已授权 或 已引导过（持久化）→ 不再跳转
+        if (isHuaweiDevice() && !isBatteryOptimizationAuthorized(ctx) && !SettingUtils.huaweiKeepaliveGuided) {
             pendingItems.add("华为后台管理（允许后台活动）")
+            SettingUtils.huaweiKeepaliveGuided = true
             jumpHuaweiStartupSetting()
             return
         }
@@ -1228,11 +1300,8 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                 stillPending.add("悬浮窗")
             if (cn.ppps.forwarder.relay.TouchControlService.instance == null)
                 stillPending.add("无障碍服务")
-            try {
-                val pm = ctx.getSystemService(android.content.Context.POWER_SERVICE) as android.os.PowerManager
-                if (!pm.isIgnoringBatteryOptimizations(ctx.packageName))
-                    stillPending.add("电池优化白名单")
-            } catch (_: Throwable) {}
+            if (!isBatteryOptimizationAuthorized(ctx))
+                stillPending.add("电池优化白名单")
 
             if (stillPending.isEmpty()) {
                 XToastUtils.toast("所有权限已授权！")

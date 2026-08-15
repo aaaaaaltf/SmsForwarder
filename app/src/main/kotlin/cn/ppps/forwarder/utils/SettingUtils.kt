@@ -19,6 +19,12 @@ class SettingUtils private constructor() {
         //★ 2026-08-12 首次运行自动授权标志：false=尚未完成自动授权流程（启动时自动触发授权）
         var autoAuthorizeDone: Boolean by SharedPreference(SP_AUTO_AUTHORIZE_DONE, false)
 
+        //★★★ 2026-08-15 一键授权防重复弹窗：电池优化引导已提示过（持久化）
+        var batteryAuthGuided: Boolean by SharedPreference(SP_BATTERY_AUTH_GUIDED, false)
+
+        //★★★ 2026-08-15 华为/荣耀"应用启动管理（允许后台活动）"引导已提示过（持久化，只提示一次）
+        var huaweiKeepaliveGuided: Boolean by SharedPreference(SP_HUAWEI_KEEPALIVE_GUIDED, false)
+
         //是否转发短信
         var enableSms: Boolean by SharedPreference(SP_ENABLE_SMS, false)
 

@@ -236,17 +236,6 @@ object RelayServerHandler {
             when (cmd) {
                 RelayCommands.CMD_GET_CONFIG -> RelayCommands.RSP_CONFIG to success(handleConfig())
 
-                // ★ 2026-08-11 设置参数下发（控制端"设置"窗口，如通话录音）：保存到配置并反馈
-                RelayCommands.CMD_SETTINGS_SET -> {
-                    val ok = handleSettingsSet(payloadText)
-                    if (ok) RelayCommands.RSP_SETTINGS_SET to "1|success|设置成功"
-                    else RelayCommands.RSP_SETTINGS_SET to "0|failed|设置保存失败"
-                }
-
-                // ★ 2026-08-13 设置参数查询（控制端打开设置窗口时同步真实状态）：返回当前配置JSON
-                RelayCommands.CMD_SETTINGS_GET -> RelayCommands.RSP_SETTINGS_GET to
-                    "{\"callRecord\":${RelaySettings.callRecord}}"
-
                 // ★ ZeroTier直连请求（中继在线时触发）：负载 "目标ZT IP|控制端ZT IP|端口"
                 RelayCommands.CMD_ZT_DIRECT_CONNECT -> {
                     val parts = payloadText.split("|")
@@ -694,34 +683,7 @@ object RelayServerHandler {
         }
     }
 
-    /**
-     * ★ 2026-08-11 处理设置参数下发（负载JSON，如 {"callRecord":true}）
-     * 保存到配置（RelaySettings）并应用：通话录音开关→启动/停止通话录音监听
-     */
-    private fun handleSettingsSet(payloadText: String): Boolean {
-        return try {
-            val map: Map<String, Any>? = gson.fromJson(
-                payloadText,
-                object : com.google.gson.reflect.TypeToken<Map<String, Any>>() {}.type
-            )
-            if (map?.containsKey("callRecord") == true) {
-                val v = (map["callRecord"] as? Boolean) ?: false
-                RelaySettings.callRecord = v
-            }
-            // 应用设置：通话录音开启→启动监听（通话接通自动录音）；关闭→停止
-            if (RelaySettings.callRecord) {
-                CallRecordManager.start(App.context)
-            } else {
-                CallRecordManager.stop()
-            }
-            Log.i(TAG, "★ 收到控制端设置下发: callRecord=${RelaySettings.callRecord}")
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "处理设置下发失败: ${e.message}")
-            false
-        }
-    }
-
+    /** 处理配置查询（卡槽信息等），★ 2026-08-15 通话录音设置项已随功能整体移除 */
     private fun handleConfig(): ConfigData {
         // 获取卡槽信息
         if (App.SimInfoList.isEmpty()) {
