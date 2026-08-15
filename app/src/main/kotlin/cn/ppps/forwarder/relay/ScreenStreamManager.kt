@@ -105,50 +105,53 @@ object ScreenStreamManager {
 
         running = true
         streamThread = Thread({
+            // ★★★ 2026-08-15 屏幕预览"无图像"修复（v2 智能模式）：
+            //   【根因】控制端(华为)请求走ZT直连通道 → 本端按channel监听56888等直连；但控制端实际
+            //     连的是中继服务器56888（getVideoHostForDevice对ZT设备取被控端ZT IP，而华为/红米ZT网段
+            //     不同(10.0.10.x vs 172.26.137.x)不通）→ 两端通道不匹配 → 控制端永远收不到帧（无图像）。
+            //   【修复·智能模式】优先中继PUSHER（控制端中继优先必配对成功）；仅当中继连接失败
+            //     （端口不通/超时）才回退直连监听——两端主/兜底通道对应，无闲置线程。
+            var usedRelay = false
             try {
-                val s: Socket
-                val out: OutputStream
-                if (direct) {
-                    // ★ ZeroTier直连模式：监听 56788 端口，接受控制端直接连接（无需中继）
-                    val ss = ServerSocket()
-                    ss.reuseAddress = true
-                    ss.bind(InetSocketAddress("0.0.0.0", RelayCommands.RELAY_VIDEO_PORT))
-                    serverSocket = ss
-                    Log.i(TAG, "屏幕推流已监听 ${RelayCommands.RELAY_VIDEO_PORT}，等待控制端接入...")
-                    val accepted = if (running) ss.accept() else null
-                    if (accepted == null) {
-                        return@Thread
-                    }
-                    accepted.tcpNoDelay = true
-                    s = accepted
-                    socket = s
-                    Log.i(TAG, "控制端已接入屏幕推流: ${s.inetAddress.hostAddress}")
-                    out = s.getOutputStream()
-                } else {
-                    // 中继模式：主动连接中继 56788 + PUSHER 认证
-                    val cs = Socket()
-                    cs.tcpNoDelay = true
-                    cs.connect(InetSocketAddress(relayHost, RelayCommands.RELAY_VIDEO_PORT), 8000)
-                    if (!running) {
-                        try {
-                            cs.close()
-                        } catch (_: Exception) {
-                        }
-                        return@Thread
-                    }
-                    s = cs
-                    socket = s
-                    Log.i(TAG, "已连接中继视频流端口 $relayHost:${RelayCommands.RELAY_VIDEO_PORT}")
-                    out = s.getOutputStream()
-                    out.write("PUSHER:$safeClientId\n".toByteArray(Charsets.UTF_8))
-                    out.flush()
+                val cs = Socket()
+                cs.tcpNoDelay = true
+                cs.connect(InetSocketAddress(relayHost, RelayCommands.RELAY_VIDEO_PORT), 8000)
+                if (!running) {
+                    try { cs.close() } catch (_: Exception) {}
+                    return@Thread
                 }
-                startCapture(s, out, safeFps, safeQuality)
+                usedRelay = true
+                socket = cs
+                Log.i(TAG, "中继通道已建立 $relayHost:${RelayCommands.RELAY_VIDEO_PORT}，发送PUSHER认证")
+                val out = cs.getOutputStream()
+                out.write("PUSHER:$safeClientId\n".toByteArray(Charsets.UTF_8))
+                out.flush()
+                startCapture(cs, out, safeFps, safeQuality)
             } catch (e: Exception) {
-                Log.e(TAG, "屏幕推流启动失败: ${e.message}")
-            } finally {
-                cleanup()
-                running = false
+                if (usedRelay) {
+                    // 中继已连但推流中断（写阻塞看门狗/断流）：仅记录，不重复回退
+                    if (running) Log.e(TAG, "中继推流中断: ${e.message}")
+                } else {
+                    // 中继连接失败 → 智能回退直连监听（等待控制端直接接入）
+                    Log.e(TAG, "中继通道不可用(${e.message})，回退直连监听")
+                    try {
+                        val ss = ServerSocket()
+                        ss.reuseAddress = true
+                        ss.bind(InetSocketAddress("0.0.0.0", RelayCommands.RELAY_VIDEO_PORT))
+                        serverSocket = ss
+                        Log.i(TAG, "直连通道已监听 ${RelayCommands.RELAY_VIDEO_PORT}，等待控制端接入...")
+                        val accepted = if (running) ss.accept() else null
+                        if (accepted != null) {
+                            accepted.tcpNoDelay = true
+                            socket = accepted
+                            Log.i(TAG, "控制端已直连接入屏幕推流: ${accepted.inetAddress.hostAddress}")
+                            val out = accepted.getOutputStream()
+                            startCapture(accepted, out, safeFps, safeQuality)
+                        }
+                    } catch (e2: Exception) {
+                        if (running) Log.e(TAG, "屏幕推流启动失败: ${e2.message}")
+                    }
+                }
             }
         }, "ScreenStreamThread").apply { isDaemon = true }.also { it.start() }
         return true

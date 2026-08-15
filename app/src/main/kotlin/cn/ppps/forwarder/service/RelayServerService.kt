@@ -119,6 +119,12 @@ class RelayServerService : Service() {
         // ★ 恢复已保存的屏幕捕获授权（复用上次授权的Intent，App重启后无需重新授权）
         if (ScreenProjectionService.restore(this)) {
             Log.i(TAG, "已恢复屏幕捕获授权，远程屏幕控制可用")
+            // ★★★ 2026-08-14 修复"重启应用后授权失效"：
+            //   restore只设置了ScreenStreamManager，未拉起前台服务；
+            //   ServerFragment.isScreenProjectionAuthorized要求"ScreenProjectionService服务运行中"，
+            //   服务不在→误判未授权→一键授权/自动授权重新弹MediaProjection框。
+            //   这里必须把前台服务启动起来（onStartCommand内会再次restore，幂等）。
+            ScreenProjectionService.startForegroundOnly(this)
         }
 
         // ★ 2026-08-11 通话录音：配置开启时启动通话状态监听（控制端设置窗口可远程开关）

@@ -1016,24 +1016,33 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
 
     /** ★★★ 2026-08-13 华为/荣耀后台管控：跳转"应用启动管理"页面，引导用户改为手动管理并允许后台活动。
      *  华为后台管控会在后台杀掉被控端进程，仅电池优化白名单不够，
-     *  必须用户手动关闭"自动管理"并允许 自启动/关联启动/后台活动。 */
+     *  必须用户手动关闭"自动管理"并允许 自启动/关联启动/后台活动。
+     *
+     *  ★★★ 2026-08-14 修复"没有打开设置中的相应界面"：
+     *    华为 Android 12 上启动管理Activity(StartupNormalAppListActivity / StartupAppControlActivity)
+     *    均要求系统权限 com.huawei.permission.external_app_settings.USE_COMPONENT，
+     *    第三方应用直接 startActivity 会抛 SecurityException（adb 实测确认），
+     *    因此无法 Intent 直达启动管理页。改为跳转【本应用详情页】(com.android.settings 可导出、
+     *    实测可用)，华为详情页内有"启动管理"入口，用户点击后进入启动控制页设置
+     *    自启动/关联启动/后台活动。 */
     private fun jumpHuaweiStartupSetting() {
         try {
-            // 优先：华为应用启动管理页（EMUI / HarmonyOS）
-            val intent = Intent().setClassName("com.huawei.systemmanager", "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity")
+            val intent = Intent(
+                android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                android.net.Uri.fromParts("package", requireContext().packageName, null)
+            )
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             startActivity(intent)
-            XToastUtils.toast("请将本应用设为「手动管理」，并允许自启动/关联启动/后台活动")
+            XToastUtils.toast("请在应用详情页点击「启动管理」，关闭自动管理，并允许自启动/关联启动/后台活动")
         } catch (e: Exception) {
-            Log.w(TAG, "打开华为应用启动管理失败: ${e.message}")
+            Log.w(TAG, "打开应用详情页失败: ${e.message}")
+            // 兜底：老版本EMUI尝试直达启动管理页（部分版本可能仍可打开）
             try {
-                // 备用：华为电池-后台应用列表页
-                val intent2 = Intent().setClassName("com.huawei.systemmanager", "com.huawei.systemmanager.power.ui.HwStartupAppListActivity")
+                val intent2 = Intent().setClassName("com.huawei.systemmanager", "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity")
                 intent2.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 startActivity(intent2)
-                XToastUtils.toast("请将本应用设为「手动管理」，并允许后台活动")
             } catch (e2: Exception) {
-                Log.w(TAG, "打开华为后台管理页也失败: ${e2.message}")
+                Log.w(TAG, "打开华为启动管理页也失败: ${e2.message}")
             }
         }
     }

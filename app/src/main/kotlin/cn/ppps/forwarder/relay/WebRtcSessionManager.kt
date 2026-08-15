@@ -113,6 +113,18 @@ class WebRtcSessionManager(
     /** ★★★ 2026-08-12 中继优先模式：true=中继服务在线，媒体走TURN relay（中继转发）；false=ZT/WiFi直连兜底 */
     @Volatile private var relayPreferred: Boolean = true
 
+    // ★★★ 2026-08-14 周期关键帧机制（修复"只传一帧"）：
+    //   华为EMUI等ROM的Camera2传感器时间戳异常 → P帧RTP时间戳乱序 → 控制端MediaCodec
+    //   只解出首帧关键帧、后续P帧全部解码失败(decode_fps=0)且无PLI恢复 → 画面永远卡在首帧。
+    //   被控端每2秒对videoTrack做一次setEnabled(false→true)抖动，强制VideoStreamEncoder
+    //   重新输出关键帧，即使P帧解码失败也能在2秒内恢复画面。
+    @Volatile private var keyFrameTimer: Thread? = null
+    @Volatile private var videoTrackRef: org.webrtc.VideoTrack? = null
+    private val KEY_FRAME_INTERVAL_MS = 2000L
+    /** ★★★ 2026-08-14 修复"只传一帧"：enable抖动必须保持disabled足够久（编码器感知帧中断才出关键帧）。
+     *  立即 setEnabled(false→true) 两事件在同一次native消息队列合并 → VideoStreamEncoder感知不到中断 → 不出关键帧。 */
+    private val KEY_FRAME_HOLD_MS = 200L
+
     // ★ 2026-08-11 ICE连接宽容策略v2：
     //   - 之前：everConnected + 15秒 → 失败案例：ICE瞬时CONNECTED(选到了一个假候选对)后立即FAILED，
     //     15秒内 WebRTC 还没来得及用其他候选对（如ZT host↔host）重试就被判定为失败。
@@ -493,24 +505,19 @@ class WebRtcSessionManager(
         }
 
         // —— ★ [6/8] 创建 PeerConnection
-        // ★★★ 2026-08-12 同设备loopback"只传1帧"根因修复（v6）：
-        //   【根因】红米双端（控制端+被控端同机）时，ICE 总是优先选中 host 候选(192.168.31.177 本机IP)，
-        //     RTP/UDP 走 loopback 路径 → 控制端 rtp_video_stream_receiver2 的包 arrival time 未设置
-        //     (= -inf ms) → FrameBuffer/Timing 帧播放调度失败 → MediaCodec 解码输出全 Drop(Render 0/Drop 100)
-        //     → 视频只传1帧后停止。跨设备(华为+红米)走真实网络路径正常(15fps)。
-        //   【修复】中继优先模式(relayPreferred=true)下 iceTransportsType=RELAY：只允许 TURN relay 候选，
-        //     强制媒体走云服务器TURN转发(真实网络路径，非loopback) → arrival time 正常 → 视频持续渲染。
-        //     直连兜底模式(relayPreferred=false)保持 ALL（host/srflx/relay 全参与，ZT/局域网直连）。
+        // ★★★ 2026-08-14 中继"只传2帧"根因修复（v7）：
+        //   【新证据】跨设备(红米控制+华为被控)中继优先模式下，两端协商交集强制走 TURN relay，
+        //     M114 的 rtp_video_stream_receiver2 日志 "arrival time: -inf ms"（relay 路径收包无到达时间）
+        //     → FrameBuffer 帧播放调度失败 → 控制端只渲染2帧（decode_fps=0, frames_dropped=16）。
+        //   【修复】被控端不再强制 iceTransportsType=RELAY，统一 ALL：
+        //     host/srflx 直连候选全参与（真实网络路径 arrival time 正常→15fps），relay 仍作为兜底候选。
         val rtcConfig = PeerConnection.RTCConfiguration(buildIceServers(relayPreferred)).apply {
             bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE
             rtcpMuxPolicy = PeerConnection.RtcpMuxPolicy.REQUIRE
             continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
-            iceTransportsType = if (relayPreferred) {
-                Log.i(TAG, "$stepTag ★★★ [6/8] 中继优先模式：iceTransportsType=RELAY（强制TURN relay转发，避免同设备loopback导致arrival time=-inf）")
-                PeerConnection.IceTransportsType.RELAY
-            } else {
-                PeerConnection.IceTransportsType.ALL
-            }
+            // ★★★ 2026-08-14 修复中继-2帧：不再 RELAY-only（relay路径arrival time=-inf → 视频只解2帧）
+            iceTransportsType = PeerConnection.IceTransportsType.ALL
+            Log.i(TAG, "$stepTag ★★★ [6/8] 2026-08-14 修复中继-2帧：iceTransportsType=ALL（直连优先，relay兜底；规避TURN relay路径arrival time=-inf）")
         }
         val pc = try {
             Log.i(TAG, "$stepTag [6/8] createPeerConnection 开始...")
@@ -659,6 +666,13 @@ class WebRtcSessionManager(
                                 for (sender in senders) {
                                     val track = sender.track()
                                     if (track is VideoTrack) {
+                                        // ★★★ 2026-08-14 保存视频轨引用
+                                        // ★★★ 2026-08-14 晚修复"摄像头预览每隔1-2秒闪屏"：不再启动周期关键帧enable抖动！
+                                        //   enable(false→true)每2秒中断视频轨200ms → 控制端画面冻结闪动。
+                                        //   "只传一帧"根本问题改由【时间戳矫正改用本机单调时钟】(tsFixObserver)彻底解决：
+                                        //   传感器时间戳异常→RTP时间戳乱序→P帧解码失败的本质已消除，无需周期性中断画面。
+                                        videoTrackRef = track
+                                        // startKeyFrameTimer()  // ← 已禁用（闪屏根源）
                                         val p = sender.parameters
                                         try {
                                             p.degradationPreference =
@@ -765,6 +779,37 @@ class WebRtcSessionManager(
         }
     }
 
+    /** ★★★ 2026-08-14 启动周期关键帧线程：每2秒对videoTrack做setEnabled(false→true)抖动，
+     *  强制VideoStreamEncoder重新输出关键帧。解决"只传一帧"——华为EMUI传感器时间戳异常导致
+     *  控制端P帧解码全部失败且无PLI恢复时，周期性关键帧保证画面2秒内恢复。 */
+    private fun startKeyFrameTimer() {
+        if (keyFrameTimer != null) return
+        keyFrameTimer = Thread({
+            Log.i(TAG, "$TAG ★★★ [周期关键帧] 已启动：每${KEY_FRAME_INTERVAL_MS / 1000}秒强制一次关键帧（P帧解码失败后快速恢复画面）")
+            while (running && !Thread.currentThread().isInterrupted) {
+                try {
+                    Thread.sleep(KEY_FRAME_INTERVAL_MS)
+                } catch (_: InterruptedException) {
+                    break
+                }
+                if (!running) break
+                val vt = videoTrackRef ?: continue
+                if (!running) break
+                try {
+                    // ★★★ 2026-08-14 修复：enable抖动必须等待帧中断。立即false→true编码器感知不到。
+                    vt.setEnabled(false)
+                    try { Thread.sleep(KEY_FRAME_HOLD_MS) } catch (_: InterruptedException) { break }
+                    vt.setEnabled(true)
+                    Log.i(TAG, "$TAG ★★★ [周期关键帧] 已强制输出关键帧（enable抖动+hold ${KEY_FRAME_HOLD_MS}ms）")
+                } catch (t: Throwable) {
+                    Log.w(TAG, "$TAG [周期关键帧] 抖动失败: ${t.message}")
+                }
+            }
+            keyFrameTimer = null
+            Log.i(TAG, "$TAG [周期关键帧] 线程结束")
+        }, "WebRtcKeyFrameTimer").apply { isDaemon = true }.also { it.start() }
+    }
+
     @Synchronized
     fun close() {
         closeInternal(true)
@@ -773,6 +818,10 @@ class WebRtcSessionManager(
     @Synchronized
     private fun closeInternal(notifyCb: Boolean) {
         running = false
+        // ★★★ 2026-08-14 停止周期关键帧线程
+        try { keyFrameTimer?.interrupt() } catch (_: Throwable) {}
+        keyFrameTimer = null
+        videoTrackRef = null
         try { videoCapturer?.stopCapture() } catch (_: Throwable) {}
         try { videoCapturer?.dispose() } catch (_: Throwable) {}
         videoCapturer = null
@@ -968,12 +1017,17 @@ class WebRtcSessionManager(
             //   用代理 CapturerObserver 矫正时间戳为单调递增(回退时自动累加偏移)，
             //   同时保持帧 buffer 引用计数正确(retain→构造新帧→release原帧)。
             val realObserver = videoSource!!.capturerObserver
+            // ★★★ 2026-08-14 晚修复"只传一帧/摄像头闪屏"：
+            //   时间戳不再依赖传感器(SENSOR_TIMESTAMP)，改用【本机单调时钟 System.nanoTime】基准。
+            //   华为EMUI等传感器时间戳回退/跳变/间隔乱序 → 直接丢弃，帧间间隔由本机时钟精确驱动 →
+            //   RTP时间戳单调且间隔真实 → 控制端P帧正常解码（不再"只传一帧"），
+            //   从而可移除周期关键帧enable抖动（不再闪屏）。
             val tsFixObserver = object : CapturerObserver {
-                private var lastMonotonicTsNs = 0L
-                private var tsOffsetNs = 0L
+                private var baseNs = 0L
+                private var lastFixedTsNs = 0L
                 override fun onCapturerStarted(success: Boolean) {
-                    lastMonotonicTsNs = 0L
-                    tsOffsetNs = 0L
+                    baseNs = 0L
+                    lastFixedTsNs = 0L
                     // ★★★ 2026-08-13 摄像头打开失败（被其他应用占用如视频通话/权限不足）→ 明确反馈控制端"为什么没有图像"
                     if (!success) {
                         val reason = "被控端摄像头无法打开（被其他应用占用如视频通话，或摄像头权限被收回）"
@@ -987,16 +1041,12 @@ class WebRtcSessionManager(
                 override fun onCapturerStopped() { realObserver.onCapturerStopped() }
                 override fun onFrameCaptured(frame: VideoFrame) {
                     try {
-                        val rawTs = frame.timestampNs
-                        if (lastMonotonicTsNs == 0L) {
-                            tsOffsetNs = 0L
-                        } else if (rawTs + tsOffsetNs <= lastMonotonicTsNs) {
-                            // 传感器时间戳回退/跳变 → 修正偏移，保证单调递增(+100ms最小步进)
-                            tsOffsetNs = lastMonotonicTsNs - rawTs + 100_000_000L
-                            Log.w(TAG, "★ [时间戳矫正] 帧时间戳回退 rawTs=$rawTs offset+=${tsOffsetNs}ns，已矫正为单调递增")
-                        }
-                        val fixedTs = rawTs + tsOffsetNs
-                        lastMonotonicTsNs = fixedTs
+                        val nowNs = System.nanoTime()
+                        if (baseNs == 0L) baseNs = nowNs
+                        var fixedTs = nowNs - baseNs
+                        // 保证严格单调递增（WebRTC要求RTP时间戳单调，防同值帧被丢弃）
+                        if (fixedTs <= lastFixedTsNs) fixedTs = lastFixedTsNs + 1_000_000L
+                        lastFixedTsNs = fixedTs
                         // 复用原buffer构造矫正帧(retain+1)，随后释放原帧引用
                         frame.buffer.retain()
                         val fixed = VideoFrame(frame.buffer, frame.rotation, fixedTs)

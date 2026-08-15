@@ -98,12 +98,15 @@ object RelayServerHandler {
                 val fallbackSender = sender
                 // ★ 2026-08-11 判断当前会话是否纯音频模式（麦克风WebRTC）：回退时只启动老麦克风，不启动摄像头
                 val webrtcIsAudioOnly = webrtcAudioOnly
-                // 先关 WebRTC
-                try { webrtc?.close() } catch (_: Throwable) {}
-                webrtc = null
-                // ★ 优雅回退：分别启动老的 CameraStreamManager + MicrophoneStreamManager，保持控制端"无感"继续工作
+                // ★★★ 2026-08-14 修复"摄像头被占用后回退失败/后续全部无图像"：
+                //   根因：onError 在 WebRTC 捕获线程被回调 → close()(@Synchronized) 内 videoCapturer.stopCapture()
+                //   会等待【捕获线程自身】退出 → 死锁 → 回退Thread永不启动 → 摄像头不推流；
+                //   且卡死的close()持有this锁 → 后续新OFFER/挂断的webrtc?.close()也等锁 → 屏幕预览/麦克风全失效。
+                //   修复：回退Thread提前启动(不依赖close完成)，close()移入回退线程异步执行(非捕获线程→不阻塞)。
                 Thread {
                     try {
+                        try { webrtc?.close() } catch (_: Throwable) {}
+                        webrtc = null
                         // —— 1) 老摄像头：JPEG推（纯音频模式跳过，不占用摄像头）
                         if (!webrtcIsAudioOnly) {
                             val okCam = CameraStreamManager.start(fallbackCamera)

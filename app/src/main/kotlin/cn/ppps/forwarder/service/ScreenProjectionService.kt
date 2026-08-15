@@ -61,13 +61,40 @@ class ScreenProjectionService : Service() {
         private fun save(context: Context, resultCode: Int, data: Intent) {
             try {
                 val prefs = context.getSharedPreferences(SP_NAME, Context.MODE_PRIVATE)
-                prefs.edit().putInt(SP_RESULT_CODE, resultCode).apply()
-                val p = Parcel.obtain()
-                p.writeValue(data)
-                val bytes = p.marshall()
-                p.recycle()
-                prefs.edit().putString(SP_RESULT_DATA, Base64.encodeToString(bytes, Base64.NO_WRAP)).apply()
-                Log.i(TAG, "屏幕捕获授权已保存（可复用）")
+                val editor = prefs.edit()
+                editor.putInt(SP_RESULT_CODE, resultCode)
+                // ★★★ 2026-08-14 修复"重启后授权失效"：
+                //   旧代码 p.writeValue(data) 序列化MediaProjection授权Intent可能抛异常，
+                //   异常被外层catch吞掉 → result_code已写但result_data未写 → 重启后restore读不到token
+                //   → 无法恢复授权 → 一键授权误判未授权 → 重新弹窗。
+                //   改为 writeParcelable + 独立try/降级writeValue + 详细错误日志。
+                var saved = false
+                try {
+                    val p = Parcel.obtain()
+                    p.writeParcelable(data, 0)
+                    val bytes = p.marshall()
+                    p.recycle()
+                    editor.putString(SP_RESULT_DATA, Base64.encodeToString(bytes, Base64.NO_WRAP))
+                    editor.apply()
+                    saved = true
+                } catch (se: Throwable) {
+                    Log.e(TAG, "writeParcelable序列化授权Intent失败: ${se.message}")
+                    // 降级：writeValue 方式
+                    try {
+                        val p2 = Parcel.obtain()
+                        p2.writeValue(data)
+                        val bytes2 = p2.marshall()
+                        p2.recycle()
+                        editor.putString(SP_RESULT_DATA, Base64.encodeToString(bytes2, Base64.NO_WRAP))
+                        editor.apply()
+                        saved = true
+                        Log.i(TAG, "屏幕捕获授权已保存（writeValue降级成功）")
+                    } catch (e2: Throwable) {
+                        Log.e(TAG, "writeValue序列化也失败: ${e2.message}，授权将无法跨重启恢复（需每次重新授权）")
+                        editor.apply() // 至少保存result_code
+                    }
+                }
+                if (saved) Log.i(TAG, "屏幕捕获授权已保存（可复用）")
             } catch (e: Exception) {
                 Log.w(TAG, "保存授权失败: ${e.message}")
             }
@@ -96,6 +123,23 @@ class ScreenProjectionService : Service() {
             } catch (e: Exception) {
                 Log.w(TAG, "恢复授权失败: ${e.message}")
                 return false
+            }
+        }
+
+        /** ★★★ 2026-08-14 修复"重启应用后授权失效"：仅启动前台服务（不传授权结果），
+         *  onStartCommand 会自动走 [restore] 恢复已保存的 MediaProjection。
+         *  RelayServerService.startRelay 中 restore 成功时必须调用本方法把前台服务拉起来，
+         *  否则 isScreenProjectionAuthorized 判定"服务运行中"为 false → 一键授权误判未授权 → 重新弹窗。 */
+        fun startForegroundOnly(context: Context) {
+            try {
+                val intent = Intent(context, ScreenProjectionService::class.java)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "启动屏幕捕获前台服务失败: ${e.message}")
             }
         }
 
