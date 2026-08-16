@@ -91,6 +91,9 @@ class App : Application(), Configuration.Provider by Core {
             context = applicationContext
             initLibs()
 
+            // ★ 2026-08-16 Tailscale 集成：启动 VPN 后端 + authkey 无 UI 登录
+            cn.ppps.forwarder.tailscale.TailscaleManager.ensureStarted(this)
+
             //启动被控端中继服务（开机自启）
             if (RelaySettings.enableServerAutorun) {
                 RelayServerService.start(this)

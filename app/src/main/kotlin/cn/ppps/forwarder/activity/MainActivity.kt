@@ -29,6 +29,23 @@ class MainActivity : BaseActivity<ActivityMainBinding?>() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         initViews()
+        // ★ 2026-08-16 Tailscale 集成：首次运行请求 VPN 授权（一次性系统弹窗，授权后自动建立 tun）
+        binding?.root?.post {
+            try {
+                if (cn.ppps.forwarder.tailscale.TailscaleManager.isInitialized()) {
+                    cn.ppps.forwarder.tailscale.TailscaleManager.requestVpnConsent(this)
+                }
+            } catch (t: Throwable) {
+                android.util.Log.w(TAG, "请求 VPN 授权异常: ${t.message}")
+            }
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == cn.ppps.forwarder.tailscale.TailscaleManager.REQUEST_VPN_PREPARE) {
+            cn.ppps.forwarder.tailscale.TailscaleManager.handleVpnConsentResult(this, resultCode)
+        }
     }
 
     override val isSupportSlideBack: Boolean

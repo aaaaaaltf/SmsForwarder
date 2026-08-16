@@ -35,7 +35,7 @@ object CameraStreamManager {
     @Volatile
     private var client: RelaySender? = null
 
-    /** ★ 所有可用的帧发送通道（中继client / 直连监听listener / ZT直连client），发送时按连接状态择可用通道 */
+    /** ★ 所有可用的帧发送通道（中继client / 直连监听listener / TS直连client），发送时按连接状态择可用通道 */
     private val senders: MutableList<RelaySender> = java.util.Collections.synchronizedList(mutableListOf())
 
     @Volatile
@@ -114,7 +114,7 @@ object CameraStreamManager {
         if (c == null) stop()
     }
 
-    /** ★ 注册帧发送通道（中继/直连监听/ZT直连），同一连接重复注册自动忽略 */
+    /** ★ 注册帧发送通道（中继/直连监听/TS直连），同一连接重复注册自动忽略 */
     fun addSender(c: RelaySender) {
         synchronized(senders) {
             if (!senders.contains(c)) senders.add(c)
@@ -138,7 +138,7 @@ object CameraStreamManager {
     @Synchronized
     fun start(index: Int): Boolean {
         // ★ 2026-08-05修复：直连模式下中继client未连接（云服务关闭/中继不可达）时，
-        //   只要存在任一已连接的发送通道（直连监听56786 / ZT直连56789），摄像头仍可推流。
+        //   只要存在任一已连接的发送通道（直连监听56786 / TS直连56789），摄像头仍可推流。
         //   原逻辑只检查中继client，导致直连模式摄像头永远启动失败。
         val hasSender = synchronized(senders) { senders.any { it.isConnected() } }
         if (!hasSender) {
@@ -242,7 +242,7 @@ object CameraStreamManager {
                         val header = "$cameraIndex|$streamId|".toByteArray(Charsets.UTF_8)
                         val data = header + jpeg
                         try {
-                            // ★ 2026-08-05：逐通道发送——中继/直连监听/ZT直连，只要有连接就推（直连模式下摄像头仍可用）
+                            // ★ 2026-08-05：逐通道发送——中继/直连监听/TS直连，只要有连接就推（直连模式下摄像头仍可用）
                             var sent = false
                             synchronized(senders) {
                                 for (s in senders) {

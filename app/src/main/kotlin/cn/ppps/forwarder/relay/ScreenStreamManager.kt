@@ -23,7 +23,7 @@ import java.nio.ByteBuffer
  * 1. ServerFragment 通过 MediaProjection 授权后，把授权结果交给 ScreenProjectionService，
  *    ScreenProjectionService 调用 [setProjection] 保存 MediaProjection。
  * 2. 收到控制端 rdstrt000000 命令后调用 [startStream]：
- *    - ★ ZeroTier直连模式（RelaySettings.directMode=true）：监听 56788 端口，接受控制端直接连接（无需中继）
+ *    - ★ Tailscale直连模式（RelaySettings.directMode=true）：监听 56788 端口，接受控制端直接连接（无需中继）
  *    - 中继模式：主动连接中继 56788，发送 PUSHER:clientId\n 认证标签
  *    - 通过 VirtualDisplay + ImageReader 采集屏幕帧
  *    - 每帧发送 [4字节大端JPEG长度][JPEG二进制]
@@ -78,7 +78,7 @@ object ScreenStreamManager {
      * @param clientId 被控端pc_id（用于中继56788 PUSHER/LISTENER 配对）
      * @param fps 帧率
      * @param quality JPEG质量(10~90)
-     * @param channel 命令来源通道：RelayServerHandler.CHANNEL_RELAY=中继 / CHANNEL_DIRECT=直连监听(56786) / CHANNEL_ZT=ZT直连(56789)
+     * @param channel 命令来源通道：RelayServerHandler.CHANNEL_RELAY=中继 / CHANNEL_DIRECT=直连监听(56786) / CHANNEL_ZT=TS直连(56789)
      * @return 是否成功启动
      */
     @Synchronized
@@ -98,7 +98,7 @@ object ScreenStreamManager {
         val safeClientId = if (clientId >= 0) clientId else 0
         // ★ 2026-08-05修复：推流模式由命令来源通道决定（而非本机中继连接状态）——
         //   命令经中继到达 → 主动连中继56788(PUSHER认证)；
-        //   命令经直连监听(56786)/ZT直连(56789)到达 → 监听56788等待控制端直连收流。
+        //   命令经直连监听(56786)/TS直连(56789)到达 → 监听56788等待控制端直连收流。
         //   原逻辑用 RelayServerService.isConnected 判断，被控端"始终连接中继"后恒为中继推流，
         //   控制端直连模式（云服务不可达）下连被控端56788无人监听 → 预览失败。
         val direct = channel != cn.ppps.forwarder.relay.RelayServerHandler.CHANNEL_RELAY
@@ -106,9 +106,8 @@ object ScreenStreamManager {
         running = true
         streamThread = Thread({
             // ★★★ 2026-08-15 屏幕预览"无图像"修复（v2 智能模式）：
-            //   【根因】控制端(华为)请求走ZT直连通道 → 本端按channel监听56888等直连；但控制端实际
-            //     连的是中继服务器56888（getVideoHostForDevice对ZT设备取被控端ZT IP，而华为/红米ZT网段
-            //     不同(10.0.10.x vs 172.26.137.x)不通）→ 两端通道不匹配 → 控制端永远收不到帧（无图像）。
+            //   【根因】控制端(华为)请求走TS直连通道 → 本端按channel监听56888等直连；但控制端实际
+            //     连的是中继服务器56888（getVideoHostForDevice对TS设备取被控端Tailscale IP）→ 两端通道不匹配 → 控制端永远收不到帧（无图像）。
             //   【修复·智能模式】优先中继PUSHER（控制端中继优先必配对成功）；仅当中继连接失败
             //     （端口不通/超时）才回退直连监听——两端主/兜底通道对应，无闲置线程。
             var usedRelay = false

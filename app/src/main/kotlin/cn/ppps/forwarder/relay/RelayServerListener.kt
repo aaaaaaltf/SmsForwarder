@@ -11,7 +11,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * 被控端直连监听器（ZeroTier 直连模式，无需中继云服务，2026-08-04 移植自 python_version_zerotier）
+ * 被控端直连监听器（Tailscale 直连模式，无需中继云服务，2026-08-04 移植自PC被控端直连逻辑）
  *
  * 监听 0.0.0.0:56786，接受手机控制端直接 TCP 连接。
  * ★ 2026-08-05 多连接改造：acceptLoop 不再阻塞（原实现 receiveLoop 阻塞在 accept 循环内，
@@ -96,7 +96,7 @@ class RelayServerListener(
             ss.reuseAddress = true
             ss.bind(InetSocketAddress("0.0.0.0", port))
             serverSocket = ss
-            Log.i(TAG, "被控端已监听端口 $port（ZeroTier直连模式），等待控制端接入...")
+            Log.i(TAG, "被控端已监听端口 $port（Tailscale直连模式），等待控制端接入...")
             while (running && !ss.isClosed) {
                 val s = try {
                     ss.accept()

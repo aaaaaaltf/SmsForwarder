@@ -9,7 +9,7 @@ import java.util.concurrent.Executors
 
 /**
  * 被控端命令发送器统一接口
- * RelayServerClient（中继模式）与 RelayServerListener（ZeroTier直连模式）均实现，
+ * RelayServerClient（中继模式）与 RelayServerListener（Tailscale直连模式）均实现，
  * 供 CameraStreamManager 等模块透明使用。
  *
  * ★ 2026-08-06 下载稳定性修复：

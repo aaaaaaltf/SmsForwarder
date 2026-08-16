@@ -70,11 +70,11 @@ object RelayCommands {
     /** 熄屏/点亮屏幕执行结果响应（负载: 1|success|成功信息 或 0|failed|失败原因） */
     const val RSP_SCREEN_CTRL = "sfscreen0000"
 
-    // ==================== ZeroTier直连（中继关闭时被控端主动连接控制端56789） ====================
-    /** ZeroTier直连请求（控制端→被控端，负载: 目标ZT IP|控制端ZT IP|端口） */
+    // ==================== Tailscale直连（中继关闭时被控端主动连接控制端56789） ====================
+    /** Tailscale直连请求（控制端→被控端，负载: 目标Tailscale IP|控制端Tailscale IP|端口） */
     const val CMD_ZT_DIRECT_CONNECT = "ztdirect0000"
 
-    /** 手机控制端ZT直连监听端口（DirectHostServer） */
+    /** 手机控制端TS直连监听端口（DirectHostServer） */
     const val ZT_DIRECT_PORT = 56789
 
     /** PC协议版本查询（控制端用于确认被控端在线，兼容PC被控端协议） */

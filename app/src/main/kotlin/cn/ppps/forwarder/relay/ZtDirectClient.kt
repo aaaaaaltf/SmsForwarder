@@ -8,10 +8,10 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 /**
- * ★ ZeroTier直连客户端（被控端侧，2026-08-04新增）
+ * ★ Tailscale直连客户端（被控端侧，2026-08-04新增）
  *
- * 主动连接手机控制端的 ZT IP:56789（DirectHostServer，参照PC被控端↔PC控制端逻辑）。
- * 用于中继服务关闭时，被控端仍可通过 ZeroTier 直连接收控制端命令。
+ * 主动连接手机控制端的 Tailscale IP:56789（DirectHostServer，参照PC被控端↔PC控制端逻辑）。
+ * 用于中继服务关闭时，被控端仍可通过 Tailscale 直连接收控制端命令。
  *
  * 帧格式与中继一致: [4字节大端长度][12字节命令][负载]
  * 命令处理复用 RelayServerHandler，响应通过本直连通道回传。
@@ -88,11 +88,11 @@ class ZtDirectClient(
                 }
                 socket = s
                 retries = 0
-                Log.i(TAG, "★ ZT直连成功: $host:$port")
+                Log.i(TAG, "★ TS直连成功: $host:$port")
                 onConnected()
                 receiveLoop(s)
             } catch (e: Exception) {
-                if (running) Log.w(TAG, "ZT直连失败(${e.message})，剩余重试=${maxReconnect - retries - 1}")
+                if (running) Log.w(TAG, "TS直连失败(${e.message})，剩余重试=${maxReconnect - retries - 1}")
             }
             socket = null
             if (running) onDisconnected()
@@ -104,7 +104,7 @@ class ZtDirectClient(
                 }
             }
         }
-        if (running) Log.w(TAG, "ZT直连停止重试（已达最大次数）")
+        if (running) Log.w(TAG, "TS直连停止重试（已达最大次数）")
     }
 
     private fun receiveLoop(s: Socket) {
@@ -134,7 +134,7 @@ class ZtDirectClient(
                 }
             }
         } catch (e: IOException) {
-            if (running) Log.w(TAG, "ZT直连接收中断: ${e.message}")
+            if (running) Log.w(TAG, "TS直连接收中断: ${e.message}")
         }
     }
 
@@ -157,7 +157,7 @@ class ZtDirectClient(
                         out.flush()
                     }
                 } catch (e: Exception) {
-                    Log.w(TAG, "ZT直连发送失败: ${e.javaClass.simpleName}: ${e.message}，关闭socket触发重连")
+                    Log.w(TAG, "TS直连发送失败: ${e.javaClass.simpleName}: ${e.message}，关闭socket触发重连")
                     try {
                         s.close()
                     } catch (_: Exception) {
@@ -165,7 +165,7 @@ class ZtDirectClient(
                 }
             }
         } catch (e: Exception) {
-            Log.w(TAG, "提交ZT直连发送任务失败: ${e.message}")
+            Log.w(TAG, "提交TS直连发送任务失败: ${e.message}")
         }
     }
 
@@ -185,19 +185,19 @@ class ZtDirectClient(
                     }
                     true
                 } catch (e: Exception) {
-                    Log.w(TAG, "ZT直连同步发送失败: ${e.javaClass.simpleName}: ${e.message}")
+                    Log.w(TAG, "TS直连同步发送失败: ${e.javaClass.simpleName}: ${e.message}")
                     try { s.close() } catch (_: Exception) {}
                     false
                 }
             }
         } catch (e: Exception) {
-            Log.w(TAG, "提交ZT直连同步发送任务失败: ${e.message}")
+            Log.w(TAG, "提交TS直连同步发送任务失败: ${e.message}")
             return false
         }
         return try {
             future.get(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
         } catch (e: Exception) {
-            Log.w(TAG, "ZT直连同步发送超时/中断: ${e.javaClass.simpleName}: ${e.message}")
+            Log.w(TAG, "TS直连同步发送超时/中断: ${e.javaClass.simpleName}: ${e.message}")
             try { future.cancel(true) } catch (_: Exception) {}
             false
         }

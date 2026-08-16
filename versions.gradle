@@ -4,7 +4,7 @@ import java.util.regex.Pattern
 def build_versions = [:]
 build_versions.version_code = 55
 build_versions.version_name = "3.5.0"
-build_versions.min_sdk = 21  // ★ 2026-08-10 WebRTC 114.x 要求 minSdk>=21；红米/华为均满足（Android 11/12+）
+build_versions.min_sdk = 26  // ★ 2026-08-16 Tailscale 集成：libtailscale.aar(Go 内核)要求 minSdk>=26（Android 8.0）；红米/华为均满足（Android 11/12+）
 build_versions.target_sdk = 33
 build_versions.build_tools = "33.0.1"
 ext.build_versions = build_versions

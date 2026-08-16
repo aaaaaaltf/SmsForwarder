@@ -179,13 +179,8 @@ android {
     }
     def abiCodes = ['universal': 1, 'armeabi-v7a': 2, 'arm64-v8a': 3, 'x86': 4, 'x86_64': 5]
     packagingOptions {
-        //去除FrpcLib的so，用时下载并动态加载
-        if (excludeFrpclib.toBoolean()) {
-            exclude 'lib/armeabi-v7a/libgojni.so'
-            exclude 'lib/arm64-v8a/libgojni.so'
-            exclude 'lib/x86/libgojni.so'
-            exclude 'lib/x86_64/libgojni.so'
-        }
+        // ★ 2026-08-16 Tailscale 集成：libtailscale.aar 内置 libgojni.so（Go 后端），必须打包，
+        //   不再排除（原 excludeFrpclib 排除逻辑移除；FrpcLib 的 so 本就运行时下载不参与打包）
         jniLibs {
             excludes += ["kotlin/**"]
         }
@@ -280,6 +275,8 @@ tasks.withType(Test).configureEach {
 
 dependencies {
     implementation fileTree(dir: 'libs', include: ['*.jar'])
+    // ★ 2026-08-16 Tailscale 集成：libtailscale.aar（golang 编译的被控端 VPN 内核）
+    implementation files('libs/libtailscale.aar')
 
     testImplementation deps.junit
     androidTestImplementation 'androidx.test.ext:junit:1.3.0'
@@ -414,7 +411,7 @@ dependencies {
     //   - Jitter Buffer 抗网络抖动 + NetEQ 音频PLC丢包补偿
     //   - 视频 VP8/H264 编码压缩（替换原来JPEG单帧传输，带宽占用减少70%+）
     //   - PLI/FIR/NACK/RTX/RED/FEC 视频丢包恢复与冗余
-    //   - ICE/STUN/TURN NAT穿透（兼容ZT直连/中继公网/局域网三种链路）
+    //   - ICE/STUN/TURN NAT穿透（兼容TS直连/中继公网/局域网三种链路）
     //   artifact: io.github.webrtc-sdk:android（Maven Central 维护的 Chromium 稳定分支 114.x，package org.webrtc.* 与老版API完全兼容）
     //   兼容 minSdk 21+。
     implementation 'io.github.webrtc-sdk:android:114.5735.08.1'

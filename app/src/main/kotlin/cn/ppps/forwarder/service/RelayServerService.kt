@@ -50,10 +50,10 @@ class RelayServerService : Service() {
     private var executor: ExecutorService? = null
     private var stateTimer: Timer? = null
 
-    // ★ ZeroTier直连客户端（多控制端：phoneIp → client，中继关闭时被控端主动连接控制端56789）
+    // ★ Tailscale直连客户端（多控制端：phoneIp → client，中继关闭时被控端主动连接控制端56789）
     private val ztDirectClients = ConcurrentHashMap<String, ZtDirectClient>()
 
-    // ★ ZeroTier直连扫描器（中继关闭时自动发现控制端，与PC被控端扫描兜底一致）
+    // ★ Tailscale直连扫描器（中继关闭时自动发现控制端，与PC被控端扫描兜底一致）
     private var ztScanner: ZtDirectScanner? = null
 
     companion object {
@@ -129,12 +129,16 @@ class RelayServerService : Service() {
         val onConnected: () -> Unit = {
             isConnected = true
             Log.i(TAG, "被控端已连接中继 ${RelaySettings.relayHost}:${RelaySettings.relayServerPort}")
+            // ★ 2026-08-16 中继联动：中继正常 → 关闭 Tailscale VPN（节省资源，Go 后端保留）
+            cn.ppps.forwarder.tailscale.TailscaleManager.setRelayConnected(this, true)
         }
         val onDisconnected: () -> Unit = {
             isConnected = false
             Log.i(TAG, "被控端连接已断开")
-            // ★ 中继断开后由 ZtDirectScanner 自动探测并建立 ZT 直连（扫描器每15秒探测56789），
-            //   不再自动操作 ZeroTier 开关（2026-08-13 取消：避免无障碍窗口出现在被控端；ZT无公开API可编程开关）
+            // ★ 2026-08-16 中继联动：中继不可用 → 自动开启 Tailscale 直连
+            cn.ppps.forwarder.tailscale.TailscaleManager.setRelayConnected(this, false)
+            // ★ 中继断开后由 ZtDirectScanner 自动探测并建立 TS 直连（扫描器每15秒探测56789），
+            //   不再自动操作 Tailscale 开关（2026-08-13 取消：避免无障碍窗口出现在被控端；Tailscale 无公开API可编程开关）
         }
         // ★ 中继连接的命令处理：响应经中继回传（控制端经中继56782/56787接收）
         val onRelayCommand: (String, ByteArray) -> Unit = { cmd: String, payload: ByteArray ->
@@ -219,7 +223,7 @@ class RelayServerService : Service() {
         }
 
         // ★ 中继云优先（2026-08-05）：被控端始终主动连接中继（更稳定，控制端优先显示云服务），
-        //   中继不可达时由直连监听(56786) + ZT直连扫描器(56789)兜底
+        //   中继不可达时由直连监听(56786) + TS直连扫描器(56789)兜底
         val c = RelayServerClient(
             host = RelaySettings.relayHost,
             port = RelaySettings.relayServerPort,
@@ -245,20 +249,23 @@ class RelayServerService : Service() {
             // ★ 注册直连监听为摄像头帧发送通道（直连模式下摄像头仍可用）
             cn.ppps.forwarder.relay.CameraStreamManager.addSender(l)
         }
-        // ★ ZeroTier直连：设置启动器（收到ztdirect0000时触发主动连接控制端56789，兜底通道）
+        // ★ Tailscale直连：设置启动器（收到ztdirect0000时触发主动连接控制端56789，兜底通道）
         RelayServerHandler.ztDirectLauncher = { phoneIp, port ->
             startZtDirect(phoneIp, port)
         }
-        // ★ ZeroTier直连扫描兜底：中继关闭时自动发现手机控制端并主动连接（与PC被控端一致）
+        // ★ Tailscale直连扫描兜底：中继关闭时自动发现手机控制端并主动连接（与PC被控端一致）
+        // ★ 2026-08-16 修复：多控制端场景下持续扫描所有未连接的控制端（华为+红米控制端并存），
+        //   每台控制端各自建立独立直连。已连接的控制端IP由 connectedIps 提供，扫描时跳过。
         ztScanner = ZtDirectScanner(
             isDirectActive = { ztDirectClients.values.any { it.isConnected() } },
             onDirectFound = { phoneIp, port -> startZtDirect(phoneIp, port) },
+            connectedIps = { ztDirectClients.keys.toSet() },
         ).also { it.start() }
         // ★ 启动设备状态周期上报（每5秒）
         startStateReport()
     }
 
-    /** ★ 启动ZeroTier直连客户端（主动连接手机控制端56789，中继关闭时仍可控制，多控制端各自独立连接） */
+    /** ★ 启动Tailscale直连客户端（主动连接手机控制端56789，中继关闭时仍可控制，多控制端各自独立连接） */
     private fun startZtDirect(phoneIp: String, port: Int) {
         Log.i(TAG, "★ startZtDirect: 连接手机控制端 $phoneIp:$port")
         // ★ 防止自连：本机IP（局域网/ZT）直接忽略——扫描器可能把本机56789(控制端App同机运行)当成控制端，
@@ -270,7 +277,7 @@ class RelayServerService : Service() {
         // ★ 多控制端：每台控制端独立连接（与PC被控端_zt_direct_clients一致），已连接的直接复用
         val existing = ztDirectClients[phoneIp]
         if (existing != null && existing.isConnected()) {
-            Log.i(TAG, "★ 已有到 $phoneIp 的ZT直连，复用")
+            Log.i(TAG, "★ 已有到 $phoneIp 的TS直连，复用")
             return
         }
         existing?.let {
@@ -283,46 +290,65 @@ class RelayServerService : Service() {
             host = phoneIp,
             port = port,
             onConnected = {
-                Log.i(TAG, "★ ZT直连已连接控制端 $phoneIp:$port")
+                Log.i(TAG, "★ TS直连已连接控制端 $phoneIp:$port")
             },
             onDisconnected = {
-                Log.i(TAG, "ZT直连已断开 $phoneIp:$port")
+                Log.i(TAG, "TS直连已断开 $phoneIp:$port")
             },
             onCommand = { cmd, payload ->
                 // 命令处理放到线程池，避免阻塞接收循环（与中继一致）
                 executor?.execute {
                     try {
-                        // ★ 2026-08-06：传入该控制端ZT直连client作为sender（文件下载二进制推送回发该控制端）
+                        // ★ 2026-08-06：传入该控制端TS直连client作为sender（文件下载二进制推送回发该控制端）
+                        Log.i(TAG, "★ TS直连 handle命令: cmd=$cmd payloadLen=${payload.size} phoneIp=$phoneIp")
                         val result = RelayServerHandler.handle(cmd, payload, RelayServerHandler.CHANNEL_ZT, ztDirectClients[phoneIp])
                         if (result != null) {
                             // ★ 响应经来源通道回传（查map取该控制端最新连接）
+                            Log.i(TAG, "★ TS直连 响应发送: respCmd=${result.first} respLen=${result.second.length} phoneIp=$phoneIp")
                             ztDirectClients[phoneIp]?.send(result.first, result.second)
+                        } else {
+                            Log.w(TAG, "TS直连 handle 无响应: cmd=$cmd phoneIp=$phoneIp")
                         }
                     } catch (e: Exception) {
-                        Log.e(TAG, "ZT直连命令处理异常: ${e.message}")
+                        Log.e(TAG, "TS直连命令处理异常: ${e.message}")
                     }
                 }
             },
         )
         c.start()
         ztDirectClients[phoneIp] = c
-        // ★ 注册ZT直连为摄像头帧发送通道（中继关闭直连控制时摄像头仍可用）
+        // ★ 注册TS直连为摄像头帧发送通道（中继关闭直连控制时摄像头仍可用）
         cn.ppps.forwarder.relay.CameraStreamManager.addSender(c)
     }
 
-    /** ★ 判断目标IP是否本机（局域网+ZeroTier），防止被控端自连自己的控制端App */
+    /** ★ 判断目标IP是否本机（仅自己App的Tailscale IP + 局域网IP），防止被控端自连自己的控制端App */
     private fun isOwnIp(target: String): Boolean {
+        // ★ 2026-08-16 修复：Tailscale 本机IP用 getOwnZtIps()（只含自己App节点IP）。
+        //   原实现遍历 NetworkInterface，会把同一手机上"控制端App的VPN接口IP"误判为本机，
+        //   导致 startZtDirect 忽略对控制端的直连。
+        if (target in RelayServerHandler.getOwnZtIps()) return true
         return try {
             java.util.Collections.list(java.net.NetworkInterface.getNetworkInterfaces()).any { ni ->
                 if (!ni.isUp || ni.isLoopback) return@any false
                 java.util.Collections.list(ni.inetAddresses).any { addr ->
-                    addr.hostAddress == target
+                    val ip = addr.hostAddress ?: return@any false
+                    // ★ 排除 Tailscale CGNAT 段（100.64-100.127.x）：该段可能是其他App(控制端)的VPN接口，
+                    //   不属于"本机局域网IP"，不能用于自连判断
+                    if (isTailscaleCgnat(ip)) return@any false
+                    ip == target
                 }
             }
         } catch (e: Exception) {
             Log.w(TAG, "本机IP判断异常: ${e.message}")
             false
         }
+    }
+
+    /** Tailscale CGNAT 段判断（100.64.0.0/10） */
+    private fun isTailscaleCgnat(ip: String): Boolean {
+        val p = ip.split(".")
+        if (p.size != 4 || p[0] != "100") return false
+        return p[1].toIntOrNull()?.let { it in 64..127 } ?: false
     }
 
     /** 启动设备状态上报定时器：每5秒发送 devstate0000（名称|锁屏|屏幕|电量|充电） */
@@ -333,7 +359,7 @@ class RelayServerService : Service() {
             override fun run() {
                 try {
                     val state = buildDeviceState()
-                    // ★ 设备状态上报：中继连接 + 直连监听（广播所有已接入控制端）+ ZT直连（广播所有控制端）
+                    // ★ 设备状态上报：中继连接 + 直连监听（广播所有已接入控制端）+ TS直连（广播所有控制端）
                     client?.send(RelayCommands.CMD_DEV_STATE, state)
                     listener?.broadcast(RelayCommands.CMD_DEV_STATE, state)
                     for (c in ztDirectClients.values) {
@@ -405,10 +431,10 @@ class RelayServerService : Service() {
         client = null
         listener?.stop()
         listener = null
-        // ★ 停止全部ZT直连（多控制端）
+        // ★ 停止全部TS直连（多控制端）
         ztDirectClients.values.forEach { it.stop() }
         ztDirectClients.clear()
-        // ★ 停止ZT直连扫描器
+        // ★ 停止TS直连扫描器
         ztScanner?.stop()
         ztScanner = null
         RelayServerHandler.ztDirectLauncher = null

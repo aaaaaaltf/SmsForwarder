@@ -92,7 +92,8 @@ object MicrophoneStreamManager {
     }
 
     /** 获取本机IPv4地址（用于直连模式通知控制端）
-     *  ★ 2026-08-10 修复：ZT直连模式优先返回 172.26.x.x 的ZeroTier IP，
+     *  ★ 2026-08-10 修复：直连模式优先返回虚拟网 Tailscale IP（100.64.x.x），
+     *  ★ 2026-08-16 增加：Tailscale 直连优先返回 100.64.x.x 的 Tailscale IP，
      *  其次返回 192.168.x.x / 10.x.x.x 的局域网IP，最后回退到第一个非回环IP。
      *  避免返回WiFi热点IP导致控制端无法连接。
      */
@@ -107,8 +108,8 @@ object MicrophoneStreamManager {
                     if (!addr.isLoopbackAddress && addr is Inet4Address) {
                         val ip = addr.hostAddress ?: continue
                         when {
-                            ip.startsWith("172.26.") -> {
-                                Log.i(TAG, "getLocalIpAddress 选择ZT IP: $ip")
+                            ip.startsWith("100.") && isTailscaleCgnat(ip) -> {
+                                Log.i(TAG, "getLocalIpAddress 选择Tailscale IP: $ip")
                                 return ip
                             }
                             ip.startsWith("192.168.") || ip.startsWith("10.") -> {
@@ -127,6 +128,13 @@ object MicrophoneStreamManager {
             Log.w(TAG, "getLocalIpAddress异常: ${e.message}")
         }
         return "127.0.0.1"
+    }
+
+    /** 判断是否为 Tailscale CGNAT 段（100.64.0.0/10） */
+    private fun isTailscaleCgnat(ip: String): Boolean {
+        val p = ip.split(".")
+        if (p.size != 4 || p[0] != "100") return false
+        return p[1].toIntOrNull()?.let { it in 64..127 } ?: false
     }
 
     private fun acquireWakeLock() {

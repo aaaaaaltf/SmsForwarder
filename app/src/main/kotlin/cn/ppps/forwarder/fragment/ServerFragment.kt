@@ -699,7 +699,9 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         val ctx = requireContext()
         try {
             if (isBatteryOptimizationAuthorized(ctx)) {
-                XToastUtils.success("已加入电池优化白名单")
+                // ★ 2026-08-16 Tailscale 内嵌于本应用进程（libtailscale + TailscaleVpnService），
+                //   本应用加入电池优化白名单即一并保护 Tailscale VPN 服务，防止被后台杀死。
+                XToastUtils.success("已加入电池优化白名单，Tailscale(VPN服务)已一并受保护")
                 return
             }
             try {
@@ -708,7 +710,8 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                 intent.data = android.net.Uri.parse("package:" + ctx.packageName)
                 intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 startActivity(intent)
-                XToastUtils.toast("请点击「允许」以加入电池优化白名单")
+                // ★ 2026-08-16 Tailscale 内嵌于本应用进程，随本应用一并加入白名单受保护
+                XToastUtils.toast("请点击「允许」以加入电池优化白名单（Tailscale VPN服务一并受保护）")
             } catch (e: Exception) {
                 Log.w(TAG, "请求电池优化白名单失败，按机型跳转设置页: ${e.message}")
                 jumpBatterySettingByManufacturer()

@@ -56,6 +56,8 @@
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <!-- Android 14+ 后台录制音频必须声明 microphone 类型前台服务 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <!-- ★ 2026-08-16 Tailscale 集成：VPN 建立 tun 虚拟网卡 -->
+    <uses-permission android:name="android.permission.BIND_VPN_SERVICE" />
 
     <application
         android:name=".App"
@@ -185,6 +187,13 @@
             android:exported="false"
             android:foregroundServiceType="camera|microphone"
             tools:targetApi="s" />
+        <!--★ 2026-08-16 Tailscale VPN 服务（建立 tun 虚拟网卡，控制端经 Tailscale 直连）-->
+        <service
+            android:name=".tailscale.TailscaleVpnService"
+            android:enabled="true"
+            android:exported="false"
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            tools:targetApi="lollipop" />
         <!--屏幕捕获授权服务（Android 14+ 需要 mediaProjection 前台服务）-->
         <service
             android:name=".service.ScreenProjectionService"

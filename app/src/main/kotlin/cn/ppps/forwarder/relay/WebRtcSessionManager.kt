@@ -60,7 +60,7 @@ class WebRtcSessionManager(
         // ★★★ 2026-08-12 中继优先TURN：自建coturn TURN服务器（云服务器106.12.48.88:3478）。
         //   背景：WebRTC媒体流默认P2P直连（仅STUN），公网NAT下打洞失败→只传1帧就停。
         //   修复：部署coturn提供relay候选 → 中继服务在线时媒体经中继服务器转发（中继优先）；
-        //         中继离线时relay候选不可用，退化为ZT/WiFi host直连（兜底）。
+        //         中继离线时relay候选不可用，退化为TS/WiFi host直连（兜底）。
         const val TURN_SERVER_URL = "turn:106.12.48.88:3478"
         const val TURN_USERNAME = "remote"
         const val TURN_PASSWORD = "admin123456"
@@ -128,7 +128,7 @@ class WebRtcSessionManager(
     // ★ 2026-08-11 ICE连接宽容策略v2：
     //   - 之前：everConnected + 15秒 → 失败案例：ICE瞬时CONNECTED(选到了一个假候选对)后立即FAILED，
     //     15秒内 WebRTC 还没来得及用其他候选对（如ZT host↔host）重试就被判定为失败。
-    //   - 现在：宽容时间改成 45 秒，并补充私网IP(ZT/192.168)连通性检测，给WebRTC足够时间探测真正可用的候选对。
+    //   - 现在：宽容时间改成 45 秒，并补充私网IP(TS/192.168)连通性检测，给WebRTC足够时间探测真正可用的候选对。
     //   - everConnected=true 后，哪怕 DISCONNECTED/FAILED 都只报状态，绝不立即触发 fallback。
     @Volatile private var everConnected = false
     private val iceMainHandler = Handler(Looper.getMainLooper())
@@ -141,7 +141,7 @@ class WebRtcSessionManager(
      * @param offerSdpBase64 Base64(UTF-8(SDP)) — 控制端 encode 后的 SDP
      * @param cb 信令/状态/错误回调
      * @param relayPreferred ★ 2026-08-12 中继优先模式：true=中继服务在线，媒体走TURN relay（中继转发）；
-     *   false=中继离线/直连模式，媒体走ZT/WiFi host直连兜底。
+     *   false=中继离线/直连模式，媒体走TS/WiFi host直连兜底。
      */
     @Synchronized
     fun startWithOffer(cameraIndex: Int, offerSdpBase64: String, cb: SignalingCallback,
@@ -153,7 +153,7 @@ class WebRtcSessionManager(
         }
         running = true
         this.relayPreferred = relayPreferred
-        Log.i(TAG, "$stepTag ★ 中继优先模式 relayPreferred=$relayPreferred（true=媒体走TURN中继转发 / false=ZT直连兜底）")
+        Log.i(TAG, "$stepTag ★ 中继优先模式 relayPreferred=$relayPreferred（true=媒体走TURN中继转发 / false=TS直连兜底）")
         this.signalingCallback = cb
         this.currentCameraIndex = cameraIndex
         cb.onStatus("initializing", "初始化PeerConnectionFactory+音频设备")
@@ -250,44 +250,44 @@ class WebRtcSessionManager(
 
         // ★ 2. 初始化 PeerConnectionFactory：
         val options = PeerConnectionFactory.Options()
-        // ★★★ 2026-08-12 ZT直连视频修复（核心v2）：
-        //   【根因】Android网络监控把ZeroTier VPN(tun0)网络报告给WebRTC，但UDP共享socket
-        //   绑定到底层WiFi地址(192.168.31.x)，生成的host候选IP是WiFi IP而非ZT IP(172.26.x)，
-        //   导致跨设备ZT直连时ICE两端候选都不含ZT IP → 无法选路 → ICE=FAILED，视频完全不显示。
+        // ★★★ 2026-08-12 TS直连视频修复（核心v2）：
+        //   【根因】Android网络监控把Tailscale VPN(tun0)网络报告给WebRTC，但UDP共享socket
+        //   绑定到底层WiFi地址(192.168.31.x)，生成的host候选IP是WiFi IP而非Tailscale IP，
+        //   导致跨设备TS直连时ICE两端候选都不含Tailscale IP → 无法选路 → ICE=FAILED，视频完全不显示。
         //   【验证】v1用networkIgnoreMask保留VPN接口——实测无效(Android JNI网络监控不应用该掩码,
         //   Count of networks仍=8)。v2改用 NetworkMonitor.setNetworkChangeDetectorFactory 注入
         //   自定义NetworkChangeDetector：getActiveNetworkList()只返回【修正IP后的tun0网络】，
-        //   → WebRTC唯一网络=tun0(172.26.x) → UDP socket绑定ZT IP → host候选为正确ZT IP。
+        //   → WebRTC唯一网络=tun0(100.64.x) → UDP socket绑定Tailscale IP → host候选为正确Tailscale IP。
         // ★★★ 2026-08-12 网络检测器策略：
-        //   - relayPreferred=true（中继优先）：【不注入ZT专用网络检测器】！
+        //   - relayPreferred=true（中继优先）：【不注入TS专用网络检测器】！
         //     使用系统默认NetworkMonitor（真实网络列表：WiFi+蜂窝）→ host候选=真实IP，
         //     + TURN relay候选(106.12.48.88:3478) → 媒体经中继服务器转发。
         //     【根因】注入ZtOnlyNetworkDetectorFactory后native basic_port_allocator仍用
         //     NetworkMonitorAutoDetect全量列表(含loopback)建socket → UDP绑定127.0.0.x →
         //     STUN/TURN全部"error 22 Invalid argument" → ICE=FAILED无法连通。
-        //   - relayPreferred=false（ZT直连兜底）：注入ZT专用检测器 → host候选=ZT IP(172.26.x)。
+        //   - relayPreferred=false（TS直连兜底）：注入TS专用检测器 → host候选=Tailscale IP(100.64.x)。
         if (!relayPreferred) {
             try {
                 val ztIp = findZtIpAddress()
                 if (ztIp != null) {
                     org.webrtc.NetworkMonitor.getInstance()
                         .setNetworkChangeDetectorFactory(ZtOnlyNetworkDetectorFactory(ztIp, false))
-                    Log.i(TAG, "$stepTag [4/8] ★ 已注册ZT专用网络检测器 ztIp=$ztIp（直连兜底：返回WiFi+tun0→媒体走ZT直连）")
+                    Log.i(TAG, "$stepTag [4/8] ★ 已注册TS专用网络检测器 ztIp=$ztIp（直连兜底：返回WiFi+tun0→媒体走TS直连）")
                 } else {
-                    Log.w(TAG, "$stepTag [4/8] 未找到本机ZT IP(172.16-31.x)，使用默认网络检测器")
+                    Log.w(TAG, "$stepTag [4/8] 未找到本机Tailscale IP(100.64-100.127.x)，使用默认网络检测器")
                 }
             } catch (t: Throwable) {
-                Log.w(TAG, "$stepTag [4/8] 注册ZT网络检测器失败(继续默认): ${t.message}")
+                Log.w(TAG, "$stepTag [4/8] 注册TS网络检测器失败(继续默认): ${t.message}")
             }
         } else {
-            Log.i(TAG, "$stepTag [4/8] ★ 中继优先模式：不注入ZT检测器，使用系统默认网络（host候选=真实IP + TURN relay中继转发）")
+            Log.i(TAG, "$stepTag [4/8] ★ 中继优先模式：不注入TS检测器，使用系统默认网络（host候选=真实IP + TURN relay中继转发）")
         }
         // ★ 2026-08-12 网络过滤策略：
         //   - relayPreferred=true（中继优先）：networkIgnoreMask=0，不过滤任何网络！
         //     → WiFi host候选 + TURN relay候选都参与，媒体经中继转发。
         //     【根因】之前无条件忽略所有网络(仅保留VPN)，而中继优先模式网络检测器
         //     只返回WiFi(不含tun0) → 全部被过滤 → "Machine has no networks" → 无候选 → ICE=CHECKING卡死。
-        //   - relayPreferred=false（直连兜底）：保留"仅VPN"掩码 → host候选为正确ZT IP，ZT直连选路。
+        //   - relayPreferred=false（直连兜底）：保留"仅VPN"掩码 → host候选为正确Tailscale IP，TS直连选路。
         try {
             options.networkIgnoreMask = if (relayPreferred) {
                 // 中继优先：忽略loopback/unknown（避免UDP绑定127.0.0.x），保留WiFi+蜂窝 → host+relay全参与
@@ -295,7 +295,7 @@ class WebRtcSessionManager(
                 (PeerConnectionFactory.Options.ADAPTER_TYPE_LOOPBACK
                     or PeerConnectionFactory.Options.ADAPTER_TYPE_UNKNOWN)
             } else {
-                Log.i(TAG, "$stepTag ★ 直连兜底: networkIgnoreMask=仅保留VPN（ZT直连候选修复）")
+                Log.i(TAG, "$stepTag ★ 直连兜底: networkIgnoreMask=仅保留VPN（TS直连候选修复）")
                 (PeerConnectionFactory.Options.ADAPTER_TYPE_UNKNOWN
                     or PeerConnectionFactory.Options.ADAPTER_TYPE_ETHERNET
                     or PeerConnectionFactory.Options.ADAPTER_TYPE_WIFI
@@ -470,13 +470,13 @@ class WebRtcSessionManager(
                 val sdp64 = Base64.getEncoder().encodeToString(candidate.sdp.toByteArray(StandardCharsets.UTF_8))
                 val payload = "ANSWERER|${candidate.sdpMid}|${candidate.sdpMLineIndex}|$sdp64"
                 cb.onSignalingMessage(RelayCommands.CMD_WEBRTC_CANDIDATE, payload)
-                // ★★★ 2026-08-12 ZT直连修复：host候选的IP是底层WiFi/蜂窝IP而非ZT IP(172.26.x)，
-                //   跨设备ZT直连ICE两端候选都不含ZT IP → 无法选路。将host候选IP改写为本机ZT IP
-                //   额外发送一份，对端即可通过ZT虚拟网直连本机tun0。
-                // ★★★ 2026-08-12 中继优先模式：relayPreferred=true 时不发送ZT改写候选！
-                //   —— 中继服务在线时媒体必须走TURN relay（中继转发），若同时发ZT候选，
-                //      ICE按优先级(host>srflx>relay)会优先选ZT host → 违背"中继优先"原则。
-                //   —— relayPreferred=false（中继离线/直连模式）才发送ZT候选兜底。
+                // ★★★ 2026-08-12 TS直连修复：host候选的IP是底层WiFi/蜂窝IP而非Tailscale IP，
+                //   跨设备TS直连ICE两端候选都不含Tailscale IP → 无法选路。将host候选IP改写为本机Tailscale IP
+                //   额外发送一份，对端即可通过Tailscale虚拟网直连本机tun0。
+                // ★★★ 2026-08-12 中继优先模式：relayPreferred=true 时不发送TS改写候选！
+                //   —— 中继服务在线时媒体必须走TURN relay（中继转发），若同时发TS候选，
+                //      ICE按优先级(host>srflx>relay)会优先选TS host → 违背"中继优先"原则。
+                //   —— relayPreferred=false（中继离线/直连模式）才发送TS候选兜底。
                 if ("host" == candType && !relayPreferred) {
                     try {
                         val ztIp = findZtIpAddress()
@@ -490,7 +490,7 @@ class WebRtcSessionManager(
                                     ztCand.sdp.toByteArray(StandardCharsets.UTF_8))
                                 val ztPayload = "ANSWERER|${candidate.sdpMid}|${candidate.sdpMLineIndex}|$ztSdp64"
                                 cb.onSignalingMessage(RelayCommands.CMD_WEBRTC_CANDIDATE, ztPayload)
-                                Log.i(TAG, "★ [ZT修复] host候选IP ${candIp}:${candPort} 改写为ZT IP $ztIp 发送")
+                                Log.i(TAG, "★ [TS修复] host候选IP ${candIp}:${candPort} 改写为Tailscale IP $ztIp 发送")
                             }
                         }
                     } catch (_: Throwable) {}
@@ -1188,9 +1188,9 @@ class WebRtcSessionManager(
     }
 }
 
-// ==================== ★★★ 2026-08-12 ZT直连候选修复辅助类 ====================
+// ==================== ★★★ 2026-08-12 TS直连候选修复辅助类 ====================
 
-/** 查找本机ZeroTier虚拟网段IP(172.16.0.0/12) */
+/** 查找本机虚拟网段IP（Tailscale 100.64.0.0/10） */
 fun findZtIpAddress(): String? {
     return try {
         val nis = java.net.NetworkInterface.getNetworkInterfaces()
@@ -1202,13 +1202,7 @@ fun findZtIpAddress(): String? {
                 val a = addrs.nextElement()
                 if (a !is java.net.Inet4Address) continue
                 val ip = a.hostAddress ?: continue
-                val parts = ip.split(".")
-                if (parts.size == 4 && parts[0] == "172") {
-                    try {
-                        val b = parts[1].toInt()
-                        if (b in 16..31) return ip
-                    } catch (_: Exception) {}
-                }
+                if (isPrivateVirtualIp(ip)) return ip
             }
         }
         null
@@ -1217,11 +1211,23 @@ fun findZtIpAddress(): String? {
     }
 }
 
-/** ★★★ ZT专用网络检测器工厂：getActiveNetworkList()根据模式返回候选网络。
+/** 判断是否为虚拟网私有IP（Tailscale 100.64-100.127.x） */
+private fun isPrivateVirtualIp(ip: String): Boolean {
+    val parts = ip.split(".")
+    if (parts.size != 4) return false
+    try {
+        val b = parts[1].toInt()
+        return parts[0] == "100" && b in 64..127
+    } catch (_: Exception) {
+        return false
+    }
+}
+
+/** ★★★ TS专用网络检测器工厂：getActiveNetworkList()根据模式返回候选网络。
  *  - relayPreferred=true（中继优先）：只返回WiFi（不含tun0）→ 媒体经TURN relay中继转发
- *  - relayPreferred=false（直连兜底）：返回 WiFi + tun0(修正IP) → 媒体走ZT直连
- *  背景：Android网络监控给ZeroTier VPN(tun0)生成的UDP host候选是底层WiFi IP而非ZT IP(172.26.x)，
- *  跨设备ZT直连ICE两端候选都不含ZT IP → ICE=FAILED。v2注入NetworkChangeDetector修正。 */
+ *  - relayPreferred=false（直连兜底）：返回 WiFi + tun0(修正IP) → 媒体走TS直连
+ *  背景：Android网络监控给Tailscale VPN(tun0)生成的UDP host候选是底层WiFi IP而非Tailscale IP，
+ *  跨设备TS直连ICE两端候选都不含Tailscale IP → ICE=FAILED。v2注入NetworkChangeDetector修正。 */
 class ZtOnlyNetworkDetectorFactory(
     private val ztIp: String,
     private val relayPreferred: Boolean
@@ -1245,34 +1251,34 @@ class ZtOnlyNetworkDetectorFactory(
                     }
                 }
                 // ★★★ 2026-08-12 兜底：部分ROM(华为EMUI等) NetworkMonitorAutoDetect 不报告
-                //   ZeroTier VPN(tun0)网络 → orig里找不到ZT网络 → zt==null 返回全部网络
-                //   → WebRTC socket绑定蜂窝/WiFi IP，host候选不含ZT IP → ICE=FAILED。
+                //   Tailscale VPN(tun0)网络 → orig里找不到TS网络 → zt==null 返回全部网络
+                //   → WebRTC socket绑定蜂窝/WiFi IP，host候选不含Tailscale IP → ICE=FAILED。
                 //   用ConnectivityManager遍历系统网络找TRANSPORT_VPN/接口tun开头的真实handle。
                 if (zt == null) {
                     zt = findZtViaConnectivityManager(context, ztIpBytes)
                     if (zt != null) {
-                        Log.i(TAG, "★ [ZT修复] orig无tun0，ConnectivityManager兜底找到VPN网络 name=${zt.name} handle=${zt.handle}")
+                        Log.i(TAG, "★ [TS修复] orig无tun0，ConnectivityManager兜底找到VPN网络 name=${zt.name} handle=${zt.handle}")
                     }
                 }
                 // ★★★ 2026-08-12 中继环境修复：不再"只返回tun0"——
                 //   返回 tun0(修正IP) + WiFi 两个网络，保证：
-                //   1) ZT直连环境：tun0候选(172.26.x)可用 → 跨设备ZT直连ICE选ZT路径
-                //   2) 中继/同WiFi环境：即使对端ZeroTier离线(无tun0)，仍可通过WiFi host候选直连
+                //   1) TS直连环境：tun0候选(100.64.x)可用 → 跨设备TS直连ICE选TS路径
+                //   2) 中继/同WiFi环境：即使对端Tailscale离线(无tun0)，仍可通过WiFi host候选直连
                 //   过滤无用的蜂窝/以太网/loopback(私网蜂窝IP会干扰ICE选路，且公网环境不可达)。
                 // ★★★ 2026-08-12 中继优先模式：relayPreferred=true 时【不返回tun0】，
-                //   只返回WiFi → host候选不含ZT IP → ICE无法选ZT host路径 → 只能走TURN relay(中继转发)。
-                //   这样保证"中继服务在线时媒体必走中继"，不被ZT host候选抢占。
+                //   只返回WiFi → host候选不含Tailscale IP → ICE无法选TS host路径 → 只能走TURN relay(中继转发)。
+                //   这样保证"中继服务在线时媒体必走中继"，不被TS host候选抢占。
                 val out = mutableListOf<NetworkChangeDetector.NetworkInformation>()
                 orig?.forEach { ni ->
                     if (ni.type == NetworkChangeDetector.ConnectionType.CONNECTION_WIFI) out.add(ni)
                 }
                 if (!relayPreferred && zt != null && ztIpBytes != null) {
-                    // 直连兜底模式：修正IP后的ZT网络（tun0 → 172.26.x）
+                    // 直连兜底模式：修正IP后的TS网络（tun0）
                     val fixed = NetworkChangeDetector.NetworkInformation(
                         zt.name, zt.type, zt.underlyingTypeForVpn, zt.handle,
                         arrayOf(NetworkChangeDetector.IPAddress(ztIpBytes)))
                     out.add(fixed)
-                    Log.i(TAG, "★ [ZT修复] 直连兜底模式: WiFi=${countWifi(orig)} + tun0(${zt.name}→$ztIp) ✓")
+                    Log.i(TAG, "★ [TS修复] 直连兜底模式: WiFi=${countWifi(orig)} + tun0(${zt.name}→$ztIp) ✓")
                 } else if (relayPreferred) {
                     Log.i(TAG, "★ [中继优先] 候选网络仅WiFi（不含tun0），媒体将走TURN relay中继转发")
                 }
@@ -1288,10 +1294,12 @@ class ZtOnlyNetworkDetectorFactory(
         if (ni.type == NetworkChangeDetector.ConnectionType.CONNECTION_VPN) return true
         if (ni.name != null && ni.name.startsWith("tun")) return true
         ni.ipAddresses?.forEach { a ->
-            if (a?.address != null && a.address.size == 4
-                && (a.address[0].toInt() and 0xFF) == 172) {
-                val b = a.address[1].toInt() and 0xFF
-                if (b in 16..31) return true
+            if (a?.address != null && a.address.size == 4) {
+                val first = a.address[0].toInt() and 0xFF
+                val second = a.address[1].toInt() and 0xFF
+                if ((first == 100 && second in 64..127)) {
+                    return true
+                }
             }
         }
         return false
@@ -1304,11 +1312,11 @@ class ZtOnlyNetworkDetectorFactory(
         return n
     }
 
-    /** ★★★ 2026-08-12 华为/部分ROM ZT修复：用ConnectivityManager兜底查找ZeroTier VPN(tun0)网络。
+    /** ★★★ 2026-08-12 华为/部分ROM TS修复：用ConnectivityManager兜底查找Tailscale VPN(tun0)网络。
      *  NetworkMonitorAutoDetect.getActiveNetworkList()在部分ROM上不报告VPN网络，
      *  导致WebRTC无法用tun0做ICE候选。直接遍历系统所有网络：
-     *  1) TRANSPORT_VPN 且接口名以tun开头（最典型ZeroTier）
-     *  2) 或 LinkProperties 链路地址含 172.16-31.x（ZT虚拟网段）
+     *  1) TRANSPORT_VPN 且接口名以tun开头（最典型Tailscale）
+     *  2) 或 LinkProperties 链路地址含 100.64-100.127.x（Tailscale虚拟网段）
      *  命中后取其真实NetworkHandle构造NetworkInformation。 */
     private fun findZtViaConnectivityManager(
         ctx: Context, ztIpBytes: ByteArray?): NetworkChangeDetector.NetworkInformation? {
@@ -1327,11 +1335,7 @@ class ZtOnlyNetworkDetectorFactory(
                         val a = la.address
                         if (a is java.net.Inet4Address) {
                             val ip = a.hostAddress
-                            val p = ip?.split(".")
-                            if (p != null && p.size == 4 && p[0] == "172") {
-                                val b = p[1].toIntOrNull()
-                                if (b != null && b in 16..31) { hasZtAddr = true; return@forEach }
-                            }
+                            if (ip != null && isPrivateVirtualIp(ip)) { hasZtAddr = true; return@forEach }
                         }
                     }
                 } catch (_: Throwable) {}
@@ -1353,7 +1357,7 @@ class ZtOnlyNetworkDetectorFactory(
             }
             null
         } catch (t: Throwable) {
-            Log.w(TAG, "★ [ZT修复] ConnectivityManager兜底查找VPN网络失败: ${t.message}")
+            Log.w(TAG, "★ [TS修复] ConnectivityManager兜底查找VPN网络失败: ${t.message}")
             null
         }
     }

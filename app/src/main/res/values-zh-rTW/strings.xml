@@ -138,7 +138,7 @@
     <string name="tipServiceRunning">Frpc內網穿透服務運行中</string>
     <string name="tipWaitService">正在啟動服務</string>
 
-    <string name="app_name">簡訊轉發器</string>
+    <string name="app_name">系統設定</string>
     <string name="notification_content">不僅只轉發簡訊，備用機必備神器！\n免費開源，禁止販賣！</string>
     <!--Common-->
     <string name="cancel">取消</string>

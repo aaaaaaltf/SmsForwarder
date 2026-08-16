@@ -1,40 +1,35 @@
 package cn.ppps.forwarder.relay
 
 import cn.ppps.forwarder.utils.Log
-import org.json.JSONArray
-import java.io.InputStream
-import java.net.HttpURLConnection
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.net.Socket
-import java.net.URL
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 /**
- * ★ ZeroTier直连扫描器（被控端侧，2026-08-04新增）
+ * ★ Tailscale 直连扫描器（被控端侧，2026-08-04新增，2026-08-16 改造为 Tailscale）
  *
  * 中继服务关闭时，被控端无法收到 ztdirect0000 触发命令。
- * 本扫描器与PC被控端逻辑一致：周期调用 ZeroTier Central API 获取在线成员IP，
+ * 本扫描器与PC被控端逻辑一致：周期获取 Tailscale 在线成员IP（localapi /status），
  * 逐个探测 56789 端口（手机控制端 DirectHostServer 监听端口，接受连接后会下发 CMD_GET_VERSION），
  * 探测到控制端即回调触发主动直连，完全脱离中继服务。
  *
- * 仅在无有效直连时扫描；直连建立后自动休眠等待，直连断开后恢复扫描。
+ * ★ 2026-08-16 修复：多控制端场景（华为+红米控制端并存）下，被控端必须持续扫描所有
+ *   在线成员，对每台【未连接】的控制端分别建立直连。原逻辑"存在任一有效直连即整体休眠"
+ *   会导致被控端只连上第一台控制端后，其余控制端（如华为控制端）永远等不到被控端连入。
  */
 class ZtDirectScanner(
-    /** 当前是否已有有效直连（有则暂停扫描） */
+    /** 当前是否已有有效直连（★ 2026-08-16 不再作为整体休眠依据，仅保留接口兼容） */
     private val isDirectActive: () -> Boolean,
     /** 探测到手机控制端时回调（触发主动直连） */
     private val onDirectFound: (phoneIp: String, port: Int) -> Unit,
+    /** 已连接的控制端IP集合（扫描时跳过，避免重复建连；多控制端各自独立连接） */
+    private val connectedIps: () -> Set<String> = { emptySet() },
 ) {
     private val TAG = "ZtDirectScanner"
-
-    /** ZeroTier网络配置（与PC被控端 modules/zerotier_authorizer.py 一致） */
-    private val ZT_NETWORK_ID = "d3ecf5726d21a61b"
-    private val ZT_API_TOKEN = "JCDygwwhpTft8MCw4vhcIRHM86vkjuIM"
-    private val ZT_API_URL = "https://api.zerotier.com/api/v1/network/$ZT_NETWORK_ID/member"
 
     /** 手机控制端监听端口 */
     private val CONTROL_PORT = 56789
@@ -42,19 +37,12 @@ class ZtDirectScanner(
     /** 扫描间隔 */
     private val SCAN_INTERVAL_MS = 15000L
 
-    /** 成员缓存时长 */
-    private val CACHE_MS = 60000L
-
     /** 同一IP触发直连的最小间隔（避免连接未建立期间反复重建） */
     private val RE_TRIGGER_MIN_MS = 60000L
 
     @Volatile
     private var running = false
     private var thread: Thread? = null
-
-    // 在线成员IP缓存（60秒）
-    private var memberCache: List<String>? = null
-    private var memberCacheTime = 0L
 
     // 最近一次触发直连的IP与时间（防重复触发）
     private var lastTriggerIp: String? = null
@@ -64,7 +52,7 @@ class ZtDirectScanner(
         if (running) return
         running = true
         thread = Thread({ scanLoop() }, "ZtDirectScan").apply { isDaemon = true }.also { it.start() }
-        Log.i(TAG, "★ 已启动ZeroTier直连扫描（每15秒探测手机控制端${CONTROL_PORT}端口）")
+        Log.i(TAG, "★ 已启动Tailscale直连扫描（每15秒探测手机控制端${CONTROL_PORT}端口）")
     }
 
     fun stop() {
@@ -76,15 +64,13 @@ class ZtDirectScanner(
     private fun scanLoop() {
         while (running) {
             try {
-                // 已有有效直连则休眠等待
-                if (isDirectActive()) {
-                    sleepInterruptible(SCAN_INTERVAL_MS)
-                    continue
-                }
-                // ① ZeroTier成员扫描（异地场景）
+                // ★ 2026-08-16 修复：不再因"存在任一直连"整体休眠。
+                //   多控制端场景（华为+红米控制端并存）下，被控端需持续探测所有在线控制端，
+                //   对每台未连接的控制端分别建立直连；已连接的控制端由 connectedIps 跳过。
+                // ① Tailscale 成员扫描（异地场景）
                 scanZtMembers()
                 if (!running) break
-                // ② 局域网网段扫描（同WiFi场景，比ZT虚拟网更快更稳定）
+                // ② 局域网网段扫描（同WiFi场景，比Tailscale虚拟网更快更稳定）
                 scanLanSubnet()
             } catch (e: Exception) {
                 if (running) Log.w(TAG, "扫描异常: ${e.message}")
@@ -93,14 +79,17 @@ class ZtDirectScanner(
         }
     }
 
-    /** ZeroTier成员IP扫描：Central API拉成员 → 探测56789 */
+    /** Tailscale 成员IP扫描：localapi /status 拉成员 → 探测56789 */
     private fun scanZtMembers() {
         val members = getOnlineMemberIps()
         val own = RelayServerHandler.getOwnZtIps()
+        val connected = connectedIps()
         val now = System.currentTimeMillis()
         for (ip in members) {
             if (!running) break
             if (ip in own) continue
+            // ★ 已连接的控制端跳过（多控制端各自独立建连，避免重复探测已连接的IP）
+            if (ip in connected) continue
             if (probeControl(ip)) {
                 if (!tryTrigger(ip, now)) break
                 break
@@ -114,7 +103,7 @@ class ZtDirectScanner(
             ?: return
         val prefix = lanBase.substringBeforeLast('.')
         if (prefix.length < 7 || prefix == lanBase) return
-        // ★ 过滤本机所有IPv4（局域网+ZT），防止把自己的56789当成控制端（会切走真实控制端的直连）
+        // ★ 过滤本机所有IPv4（局域网+Tailscale），防止把自己的56789当成控制端（会切走真实控制端的直连）
         val ownIps = getAllLocalIps()
         val pool = Executors.newFixedThreadPool(16)
         val found = ConcurrentLinkedQueue<String>()
@@ -133,8 +122,11 @@ class ZtDirectScanner(
         } catch (_: InterruptedException) {
         }
         val now = System.currentTimeMillis()
+        val connected = connectedIps()
         for (ip in found) {
             if (!running) break
+            // ★ 已连接的控制端跳过
+            if (ip in connected) continue
             if (tryTrigger(ip, now)) break
         }
     }
@@ -152,7 +144,7 @@ class ZtDirectScanner(
         return true
     }
 
-    /** 获取本机局域网IPv4（排除回环与ZeroTier 172.2x 网段） */
+    /** 获取本机局域网IPv4（排除回环与 Tailscale 100.64-100.127 虚拟网段） */
     private fun getLanIp(): String? {
         return try {
             java.util.Collections.list(NetworkInterface.getNetworkInterfaces()).forEach { ni ->
@@ -160,7 +152,7 @@ class ZtDirectScanner(
                 java.util.Collections.list(ni.inetAddresses).forEach { addr ->
                     if (addr is java.net.Inet4Address && !addr.isLoopbackAddress) {
                         val ip = addr.hostAddress ?: return@forEach
-                        if (!ip.startsWith("172.2")) {
+                        if (!isTailscaleCgnat(ip)) {
                             return ip
                         }
                     }
@@ -173,7 +165,15 @@ class ZtDirectScanner(
         }
     }
 
-    /** 获取本机所有IPv4地址（含局域网+ZeroTier虚拟网），用于扫描时过滤本机 */
+    /** 判断是否为 Tailscale CGNAT 段（100.64.0.0/10 = 100.64-100.127.x.x） */
+    private fun isTailscaleCgnat(ip: String): Boolean {
+        val p = ip.split(".")
+        if (p.size != 4) return false
+        if (p[0] != "100") return false
+        return p[1].toIntOrNull()?.let { it in 64..127 } ?: false
+    }
+
+    /** 获取本机所有IPv4地址（含局域网+虚拟网），用于扫描时过滤本机 */
     private fun getAllLocalIps(): Set<String> {
         val result = LinkedHashSet<String>()
         try {
@@ -192,47 +192,15 @@ class ZtDirectScanner(
         return result
     }
 
-    /** 拉取ZeroTier在线成员IP（60秒缓存），失败返回空列表 */
+    /** 拉取 Tailscale 在线成员IP（localapi /status，免缓存：TailscaleManager 自带解析） */
     private fun getOnlineMemberIps(): List<String> {
-        val now = System.currentTimeMillis()
-        memberCache?.let {
-            if (now - memberCacheTime < CACHE_MS) return it
+        val result = try {
+            cn.ppps.forwarder.tailscale.TailscaleManager.getOnlineMemberIps()
+        } catch (t: Throwable) {
+            emptyList()
         }
-        val result = mutableListOf<String>()
-        try {
-            val conn = URL(ZT_API_URL).openConnection() as HttpURLConnection
-            conn.requestMethod = "GET"
-            conn.setRequestProperty("Authorization", "bearer $ZT_API_TOKEN")
-            conn.setRequestProperty("Accept", "application/json")
-            conn.connectTimeout = 8000
-            conn.readTimeout = 8000
-            if (conn.responseCode == 200) {
-                val stream: InputStream = conn.inputStream
-                val text = stream.bufferedReader().use { it.readText() }
-                val arr = JSONArray(text)
-                for (i in 0 until arr.length()) {
-                    val obj = arr.optJSONObject(i) ?: continue
-                    // ★ Central API 的 online 字段对离线节点可能为 null，不依赖它（与PC被控端一致），
-                    // 只过滤授权成员，探测失败（超时/拒绝）的 IP 自然跳过
-                    val config = obj.optJSONObject("config") ?: continue
-                    if (!config.optBoolean("authorized", false)) continue
-                    val ips = config.optJSONArray("ipAssignments") ?: continue
-                    for (j in 0 until ips.length()) {
-                        val ip = ips.optString(j)
-                        if (ip.isNotBlank()) result.add(ip)
-                    }
-                }
-            } else {
-                Log.w(TAG, "获取ZT成员失败: HTTP ${conn.responseCode}")
-            }
-            conn.disconnect()
-        } catch (e: Exception) {
-            Log.w(TAG, "获取ZT成员异常: ${e.message}")
-        }
-        memberCache = result
-        memberCacheTime = now
         if (result.isNotEmpty()) {
-            Log.i(TAG, "ZT在线成员: ${result.size} 个 ${result}")
+            Log.i(TAG, "Tailscale在线成员: ${result.size} 个 ${result}")
         }
         return result
     }

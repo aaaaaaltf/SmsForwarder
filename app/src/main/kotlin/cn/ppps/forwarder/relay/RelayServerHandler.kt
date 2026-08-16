@@ -156,9 +156,9 @@ object RelayServerHandler {
     /** ★ 命令来源通道常量：供ScreenStreamManager等按通道决定推流模式 */
     const val CHANNEL_RELAY = 0    // 命令经中继连接到达（被控端→中继56786）
     const val CHANNEL_DIRECT = 1   // 命令经直连监听(56786)到达（控制端ZT/局域网直连）
-    const val CHANNEL_ZT = 2       // 命令经ZT直连(56789)到达（被控端主动连接控制端）
+    const val CHANNEL_ZT = 2       // 命令经TS直连(56789)到达（被控端主动连接控制端）
 
-    /** ★ ZT直连启动器（由RelayServerService设置，触发后主动连接控制端56789） */
+    /** ★ TS直连启动器（由RelayServerService设置，触发后主动连接控制端56789） */
     var ztDirectLauncher: ((phoneIp: String, port: Int) -> Unit)? = null
 
     /** ★ 文件下载取消标志（控制端发送CMD_FS_CANCEL后置为true，下载线程每块发送前检查） */
@@ -175,30 +175,33 @@ object RelayServerHandler {
     @Volatile
     private var fsAckBlock = -1L
 
-    /** ★ 本机ZeroTier IP缓存（60秒） */
+    /** ★ 本机虚拟网IP缓存（60秒）：Tailscale 100.64-100.127.x */
     private var ownZtIpsCache: Set<String>? = null
     private var ownZtIpsCacheTime = 0L
 
-    /** 获取本机ZeroTier IP（172.2x网段，与PC被控端逻辑一致） */
+    /** 获取本机虚拟网IP（Tailscale 100.64.x，与PC被控端逻辑一致） */
     fun getOwnZtIps(): Set<String> {
         val now = System.currentTimeMillis()
         if (ownZtIpsCache != null && now - ownZtIpsCacheTime < 60000) return ownZtIpsCache!!
         val ips = LinkedHashSet<String>()
+        // ★ 2026-08-16 修复：只使用 Tailscale 后端 Self IP（自己 App 的节点）。
+        //   不再枚举网卡——同一手机上"控制端App的VPN接口IP"也会被 NetworkInterface 枚举到，
+        //   导致把控制端IP(如100.106.79.58)误判为本机 → scanZtMembers 的 ip in own 跳过控制端探测，
+        //   isOwnIp 也误判 → 中继关闭后被控端无法通过扫描发现控制端，彻底连不上。
         try {
-            java.util.Collections.list(java.net.NetworkInterface.getNetworkInterfaces()).forEach { ni ->
-                java.util.Collections.list(ni.inetAddresses).forEach { addr ->
-                    val ip = addr.hostAddress ?: return@forEach
-                    if (!addr.isLoopbackAddress && ip.startsWith("172.2")) {
-                        ips.add(ip)
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "获取本机ZT IP失败: ${e.message}")
+            cn.ppps.forwarder.tailscale.TailscaleManager.getSelfIp()?.let { ips.add(it) }
+        } catch (_: Throwable) {
         }
         ownZtIpsCache = ips
         ownZtIpsCacheTime = now
         return ips
+    }
+
+    /** 判断是否为 Tailscale CGNAT 段（100.64.0.0/10） */
+    private fun isTailscaleCgnat(ip: String): Boolean {
+        val p = ip.split(".")
+        if (p.size != 4 || p[0] != "100") return false
+        return p[1].toIntOrNull()?.let { it in 64..127 } ?: false
     }
 
     private fun success(data: Any?): String {
@@ -236,7 +239,7 @@ object RelayServerHandler {
             when (cmd) {
                 RelayCommands.CMD_GET_CONFIG -> RelayCommands.RSP_CONFIG to success(handleConfig())
 
-                // ★ ZeroTier直连请求（中继在线时触发）：负载 "目标ZT IP|控制端ZT IP|端口"
+                // ★ Tailscale直连请求（中继在线时触发）：负载 "目标Tailscale IP|控制端Tailscale IP|端口"
                 RelayCommands.CMD_ZT_DIRECT_CONNECT -> {
                     val parts = payloadText.split("|")
                     if (parts.size >= 3) {
@@ -244,10 +247,10 @@ object RelayServerHandler {
                         val phoneIp = parts[1].trim()
                         val port = parts.getOrNull(2)?.trim()?.toIntOrNull() ?: RelayCommands.ZT_DIRECT_PORT
                         if (targetIp in getOwnZtIps()) {
-                            Log.i(TAG, "★ 收到ZT直连请求，目标匹配本机，主动连接控制端 $phoneIp:$port")
+                            Log.i(TAG, "★ 收到TS直连请求，目标匹配本机，主动连接控制端 $phoneIp:$port")
                             ztDirectLauncher?.invoke(phoneIp, port)
                         } else {
-                            Log.i(TAG, "ZT直连目标 $targetIp 不是本机 (本机: ${getOwnZtIps()})，忽略")
+                            Log.i(TAG, "TS直连目标 $targetIp 不是本机 (本机: ${getOwnZtIps()})，忽略")
                         }
                     }
                     null  // 直连触发无需响应
@@ -595,12 +598,12 @@ object RelayServerHandler {
                     webrtc = mgr
                     val cb = makeWebrtcSignalingCallback(s)
                     // ★★★ 2026-08-12 中继优先模式：OFFER经中继到达(CHANNEL_RELAY)→relayPreferred=true
-                    //   （媒体走TURN中继转发）；经ZT直连/直连监听到达(CHANNEL_ZT/DIRECT)→relayPreferred=false
-                    //   （媒体走ZT/WiFi host直连兜底）。符合"中继优先，中继不可用时才ZT直连"。
+                    //   （媒体走TURN中继转发）；经TS直连/直连监听到达(CHANNEL_ZT/DIRECT)→relayPreferred=false
+                    //   （媒体走TS/WiFi host直连兜底）。符合"中继优先，中继不可用时才TS直连"。
                     val relayPreferred = (channel == CHANNEL_RELAY)
                     Log.i(TAG, "★ [WebRTC OFFER IN] 开始异步启动 WebRtcSessionManager.startWithOffer"
                         + " channel=$channel relayPreferred=$relayPreferred"
-                        + "（${if (relayPreferred) "中继优先→媒体走TURN中继" else "直连兜底→媒体走ZT/WiFi直连"}）...")
+                        + "（${if (relayPreferred) "中继优先→媒体走TURN中继" else "直连兜底→媒体走TS/WiFi直连"}）...")
                     // 启动放到子线程（createAnswer/setRemoteDescription 会阻塞）
                     Thread {
                         try {
@@ -979,7 +982,7 @@ object RelayServerHandler {
 
     /**
      * 启动文件下载（后台线程）：RSP_FS_GET(大小|文件名|状态) → CMD_FS_DATA分块(128KB) → CMD_FS_DONE
-     * 通过命令来源通道sender（中继client/直连listener/ZT直连）推送数据。
+     * 通过命令来源通道sender（中继client/直连listener/TS直连）推送数据。
      *
      * ★ 2026-08-06 大文件下载稳定性修复（参考PC端微信_download_send_file_blocked，经过长期测试）：
      *   1) 同步发送：每块用sendSync等待实际写入完成+flush成功，失败立即判定（不再异步假活）

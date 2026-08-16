@@ -21,7 +21,7 @@ class RelaySettings private constructor() {
         var enableServerAutorun: Boolean by SharedPreference(SP_RELAY_ENABLE_SERVER_AUTORUN, false)
 
         /**
-         * ★ 直连模式开关（已弃用，2026-08-05起被控端固定中继云优先，中继不可达自动走ZT直连）
+         * ★ 直连模式开关（已弃用，2026-08-05起被控端固定中继云优先，中继不可达自动走TS直连）
          * true=被控端监听56786接受控制端直连
          * false=传统中继模式（被控端主动连接中继56786）【当前默认，中继优先】
          */
