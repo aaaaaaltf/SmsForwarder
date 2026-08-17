@@ -222,6 +222,11 @@ object RelayCommands {
     /** 设备状态上报：负载 "名称|锁屏|屏幕|电量|充电"（被控端每5秒发送，中继广播给所有手机控制端） */
     const val CMD_DEV_STATE = "devstate0000"
 
+    /** ★★★ 2026-08-17 方案C：反向查询设备状态（控制端→被控端，触发立即回 CMD_DEV_STATE）
+     *   用于手机远程模块"在线被控端列表"主动探活心跳。中继识别此命令不更新 last_sender，
+     *   避免覆盖下载路由导致手机文件下载卡死。被控端收到后立即采集设备状态并回 CMD_DEV_STATE。 */
+    const val CMD_GET_DEV_STATE = "sfgetst00000"
+
     /**
      * 解析帧命令前缀
      * @return (命令前缀, 负载字节)

@@ -5,6 +5,11 @@ import android.content.ContentValues
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.app.KeyguardManager
+import android.content.Context
+import android.os.BatteryManager
+import android.os.Build
+import android.os.PowerManager
 import android.provider.ContactsContract
 import androidx.core.content.ContextCompat
 import cn.ppps.forwarder.utils.Log
@@ -474,6 +479,15 @@ object RelayServerHandler {
                     RelayCommands.CMD_VERSION_INFO to "$versionName|$deviceName|Android|0|0"
                 }
 
+                // ★★★ 2026-08-17 方案C：反向查询设备状态（控制端主动探活心跳）
+                //   收到后立即采集设备状态并回 CMD_DEV_STATE（与被动5秒上报同格式）
+                //   中继识别此命令不更新 last_sender，安全（不会覆盖下载路由导致下载卡死）
+                RelayCommands.CMD_GET_DEV_STATE -> {
+                    val state = buildDeviceStateForQuery()
+                    Log.i(TAG, "★ 收到 CMD_GET_DEV_STATE 主动探活，回 devstate: $state")
+                    RelayCommands.CMD_DEV_STATE to state
+                }
+
                 RelayCommands.CMD_CAMERA_STREAM_START -> {
                     if (!HttpServerUtils.enableApiCamera) return RelayCommands.CMD_CAMERA_STATUS_REPORT to error("0|failed|服务端已禁用摄像头")
                     val index = payloadText.toIntOrNull() ?: 0
@@ -654,6 +668,57 @@ object RelayServerHandler {
             Log.e(TAG, "处理命令异常: $cmd ${e.message}")
             RelayCommands.RSP_ERROR to error(e.message ?: "未知错误")
         }
+    }
+
+    /** ★ 2026-08-17 方案C：采集设备状态（与 RelayServerService.buildDeviceState 同格式）
+     *   用于响应 CMD_GET_DEV_STATE 主动探活。通过 App.context 获取系统服务，独立于 Service 实例。
+     *   不修改 RelayServerService.buildDeviceState 可见性，避免影响被动5秒上报逻辑。 */
+    private fun buildDeviceStateForQuery(): String {
+        val ctx = App.context
+        // 名称：用户备注优先，否则用品牌+型号
+        val mark = SettingUtils.extraDeviceMark
+        val name = if (mark.isNotBlank()) mark else "${Build.MANUFACTURER} ${Build.MODEL}".trim()
+        // 锁屏状态
+        var locked = false
+        try {
+            val km = ctx.getSystemService(KeyguardManager::class.java)
+            if (km != null) {
+                locked = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN) km.isKeyguardLocked else false
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "读取锁屏状态失败: ${e.message}")
+        }
+        // 屏幕状态
+        var screenOn = false
+        try {
+            val pm = ctx.getSystemService(PowerManager::class.java)
+            if (pm != null) {
+                screenOn = pm.isInteractive
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "读取屏幕状态失败: ${e.message}")
+        }
+        // 电量与充电状态
+        var battery = -1
+        var charging = 0
+        try {
+            val filter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+            val batteryIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                ctx.registerReceiver(null, filter, Context.RECEIVER_EXPORTED)
+            } else {
+                @Suppress("DEPRECATION")
+                ctx.registerReceiver(null, filter)
+            }
+            if (batteryIntent != null) {
+                val status = batteryIntent.getIntExtra(BatteryManager.EXTRA_STATUS, BatteryManager.BATTERY_STATUS_UNKNOWN)
+                val plugged = batteryIntent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0)
+                battery = batteryIntent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+                charging = if (status == BatteryManager.BATTERY_STATUS_CHARGING || plugged != 0) 1 else 0
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "读取电量失败: ${e.message}")
+        }
+        return "$name|${if (locked) 1 else 0}|${if (screenOn) 1 else 0}|$battery|$charging"
     }
 
     private fun <T> parseData(json: String, clazz: Class<T>): T? {
