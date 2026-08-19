@@ -106,6 +106,12 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             }
         }
 
+        //VPN授权
+        binding!!.btnPermVpn.setOnClickListener {
+            // 调用TailscaleManager请求VPN授权
+            cn.ppps.forwarder.tailscale.TailscaleManager.requestVpnConsent(requireActivity())
+        }
+
         //中继服务器地址
         binding!!.etRelayHost.setText(RelaySettings.relayHost)
         binding!!.etRelayHost.addTextChangedListener(object : TextWatcher {
@@ -391,6 +397,19 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             binding!!.btnToggleServer.text = resources.getText(R.string.start_server)
             binding!!.tvServerTips.text = getString(R.string.relay_server_stopped)
             binding!!.tvCtrlStatus.text = String.format(getString(R.string.relay_ctrl_link), getString(R.string.relay_ctrl_offline))
+        }
+        // VPN授权状态（3级：未授权/已授权未建立/已建立）
+        try {
+            val vpnUp = cn.ppps.forwarder.tailscale.TailscaleManager.isVpnUp()
+            val vpnAuth = cn.ppps.forwarder.tailscale.TailscaleManager.isVpnAuthorized(requireContext())
+            val selfIp = cn.ppps.forwarder.tailscale.TailscaleManager.getSelfIp()
+            binding!!.tvPermVpnStatus.text = when {
+                vpnUp && selfIp != null -> "VPN通道已建立 (IP: $selfIp)"
+                vpnAuth -> "VPN已授权（中继正常时无需建立）"
+                else -> getString(R.string.perm_status_not_granted)
+            }
+        } catch (e: Exception) {
+            binding!!.tvPermVpnStatus.text = "VPN状态检查异常"
         }
     }
 
@@ -931,6 +950,17 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                 try { requestScreenProjectionIfNeeded() } catch (e: Exception) { Log.e(TAG, "屏幕预览授权请求异常: ${e.message}") }
             }, 4500)
 
+            // ★ 新增：VPN授权（Tailscale 系统对话框，首次安装后一次性授权）
+            handler.postDelayed({
+                try {
+                    if (!cn.ppps.forwarder.tailscale.TailscaleManager.isVpnAuthorized(requireContext())) {
+                        cn.ppps.forwarder.tailscale.TailscaleManager.requestVpnConsent(requireActivity())
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "VPN授权请求异常: ${e.message}")
+                }
+            }, 5000)
+
             // 6秒后检查需手动授权的权限（逐一打开设置页）
             handler.postDelayed({
                 try {
@@ -1071,6 +1101,14 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                     return
                 }
             }
+            // VPN授权
+            if (!autoManualPrompted.contains("vpn") && !cn.ppps.forwarder.tailscale.TailscaleManager.isVpnAuthorized(requireContext())) {
+                autoManualPrompted.add("vpn")
+                lastAutoManualJumpTime = System.currentTimeMillis()
+                Log.i(TAG, "★ 自动授权流程：请求VPN授权")
+                cn.ppps.forwarder.tailscale.TailscaleManager.requestVpnConsent(requireActivity())
+                return
+            }
             // 6. ★★★ 2026-08-13 华为/荣耀后台管控引导（防止被控端进程被系统后台管控杀掉，
             //    中继服务/屏幕预览授权随进程死亡失效）。仅电池优化白名单不够，
             //    必须用户手动关闭"自动管理"并允许 自启动/关联启动/后台活动。
@@ -1193,6 +1231,11 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             // 6. 电池优化白名单
             if (!isBatteryOptimizationAuthorized(ctx)) {
                 Log.i(TAG, "★ 权限未授权(电池优化白名单)")
+                return false
+            }
+            // 7. VPN/Tailscale 授权
+            if (!cn.ppps.forwarder.tailscale.TailscaleManager.isVpnAuthorized(ctx)) {
+                Log.i(TAG, "★ 权限未授权(VPN/Tailscale)")
                 return false
             }
             return true

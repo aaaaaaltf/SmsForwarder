@@ -1381,6 +1381,10 @@
     <string name="perm_screen_tips">System media projection authorization for screen preview (re-grant after every app update)</string>
     <string name="perm_screen_btn">Grant Screen</string>
 
+    <string name="perm_vpn_title">Tailscale VPN Permission</string>
+    <string name="perm_vpn_tips">Direct mode requires a VPN tunnel; one-time grant after first install</string>
+    <string name="perm_vpn_btn">Grant VPN</string>
+
     <string name="perm_status_granted">Granted</string>
     <string name="perm_status_not_granted">Not granted</string>
 </resources>

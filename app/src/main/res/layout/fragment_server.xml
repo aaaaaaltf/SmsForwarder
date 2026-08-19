@@ -720,6 +720,45 @@
 
             </LinearLayout>
 
+            <!-- 7. VPN授权（Tailscale VPN 系统对话框） -->
+            <LinearLayout
+                style="@style/BarStyle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content">
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="@string/perm_vpn_title"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/tv_perm_vpn_status"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="@string/perm_vpn_tips"
+                        android:textSize="@dimen/text_size_mini"
+                        tools:ignore="SmallSp" />
+
+                </LinearLayout>
+
+                <com.xuexiang.xui.widget.button.ButtonView
+                    android:id="@+id/btn_perm_vpn"
+                    style="@style/ButtonView.Blue"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:minWidth="110dp"
+                    android:padding="5dp"
+                    android:text="@string/perm_vpn_btn" />
+
+            </LinearLayout>
+
             <LinearLayout
                 style="@style/BarStyle"
                 android:layout_width="match_parent"

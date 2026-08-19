@@ -1270,6 +1270,10 @@
     <string name="perm_screen_tips">屏幕预览功能需要系统屏幕捕获授权（每次更新版本后可能需重新授权）</string>
     <string name="perm_screen_btn">授权屏幕</string>
 
+    <string name="perm_vpn_title">Tailscale VPN 授权</string>
+    <string name="perm_vpn_tips">直连模式需要建立VPN通道，首次安装后一次性授权</string>
+    <string name="perm_vpn_btn">授权 VPN</string>
+
     <string name="perm_status_granted">已授权</string>
     <string name="perm_status_not_granted">未授权</string>
 </resources>
