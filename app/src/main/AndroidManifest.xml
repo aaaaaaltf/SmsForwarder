@@ -193,6 +193,7 @@
             android:enabled="true"
             android:exported="false"
             android:permission="android.permission.BIND_VPN_SERVICE"
+            android:foregroundServiceType="dataSync"
             tools:targetApi="lollipop" />
         <!--屏幕捕获授权服务（Android 14+ 需要 mediaProjection 前台服务）-->
         <service
@@ -255,3 +256,5 @@
     </application>
 
 </manifest>
+
+

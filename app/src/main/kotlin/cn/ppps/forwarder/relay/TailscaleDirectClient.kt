@@ -16,24 +16,24 @@ import java.util.concurrent.Executors
  * 帧格式与中继一致: [4字节大端长度][12字节命令][负载]
  * 命令处理复用 RelayServerHandler，响应通过本直连通道回传。
  */
-class ZtDirectClient(
+class TailscaleDirectClient(
     private val host: String,
     private val port: Int,
     private val onConnected: () -> Unit,
     private val onDisconnected: () -> Unit,
     private val onCommand: (cmd: String, payload: ByteArray) -> Unit,
 ) : RelaySender {
-    private val TAG = "ZtDirectClient"
+    private val TAG = "TailscaleDirectClient"
     private val sendLock = Any()
 
     /** ★ 下载/普通数据发送线程池（单线程保证顺序） */
     private val sendExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "ZtDirectSend").apply { isDaemon = true }
+        Thread(r, "TailscaleDirectSend").apply { isDaemon = true }
     }
 
     /** ★ 心跳专用发送线程池（独立通道，不被下载大流量堵队列） */
     private val heartBeatExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "ZtDirectHb").apply { isDaemon = true }
+        Thread(r, "TailscaleDirectHb").apply { isDaemon = true }
     }
 
     /** 判断是否为心跳类命令（设备状态/心跳ping），走独立发送通道 */
@@ -58,7 +58,7 @@ class ZtDirectClient(
     fun start() {
         if (running) return
         running = true
-        thread = Thread({ connectLoop() }, "ZtDirectConnect").apply { isDaemon = true }.also { it.start() }
+        thread = Thread({ connectLoop() }, "TailscaleDirectConnect").apply { isDaemon = true }.also { it.start() }
     }
 
     fun stop() {

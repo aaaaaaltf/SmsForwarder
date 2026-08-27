@@ -23,7 +23,7 @@ import java.net.InetSocketAddress
  *
  * 两种模式：
  * 1. 中继模式：被控端主动连中继56791(PUSHER)，控制端连中继56791(LISTENER)，中继桥接
- * 2. 直连/ZT模式：被控端监听56791，控制端直接连接被控端
+ * 2. 直连/TS模式：被控端监听56791，控制端直接连接被控端
  *
  * 音频参数：采样率 8000Hz、单声道、16bit PCM，与控制端 AudioTrack 配置严格一致。
  */
@@ -57,6 +57,9 @@ object MicrophoneStreamManager {
     private var wakeLock: PowerManager.WakeLock? = null
 
     fun lastError(): String = lastErrMsg ?: "未知错误"
+
+    /** 是否正在采集推麦克风（供 RelayServerService 判断"会话进行中"，会话期间不降频） */
+    fun isStreaming(): Boolean = running
 
     /**
      * ★★★ 2026-08-13 检测是否有其他应用正在使用麦克风（如微信视频通话）→ 返回占用应用的包名，无占用返回null。
@@ -167,7 +170,7 @@ object MicrophoneStreamManager {
      * @param s 命令通道发送器（用于发送CMD_MIC_DATA_READY通知）
      * @param relayHost 中继服务器地址（中继模式下PUSHER连接）
      * @param clientId 被控端pc_id（用于生成会话ID）
-     * @param channel 命令来源通道：CHANNEL_RELAY/CHANNEL_DIRECT/CHANNEL_ZT
+     * @param channel 命令来源通道：CHANNEL_RELAY/CHANNEL_DIRECT/CHANNEL_TS
      * @return 启动成功返回会话ID（控制端据此连接数据通道），失败返回null
      */
     @Synchronized

@@ -78,7 +78,7 @@ object ScreenStreamManager {
      * @param clientId 被控端pc_id（用于中继56788 PUSHER/LISTENER 配对）
      * @param fps 帧率
      * @param quality JPEG质量(10~90)
-     * @param channel 命令来源通道：RelayServerHandler.CHANNEL_RELAY=中继 / CHANNEL_DIRECT=直连监听(56786) / CHANNEL_ZT=TS直连(56789)
+     * @param channel 命令来源通道：RelayServerHandler.CHANNEL_RELAY=中继 / CHANNEL_DIRECT=直连监听(56786) / CHANNEL_TS=TS直连(56789)
      * @return 是否成功启动
      */
     @Synchronized
@@ -207,7 +207,7 @@ object ScreenStreamManager {
         val proj = projection ?: return
         val metrics = cn.ppps.forwarder.App.context.resources.displayMetrics
         // ★ 2026-08-06修复：限制推流分辨率（原代码直接用全屏尺寸1080x2400，每帧JPEG 200KB+，
-        //   弱网（ZT隧道丢包/高延迟）下TCP写阻塞帧传不出去→黑屏）。
+        //   弱网（TS隧道丢包/高延迟）下TCP写阻塞帧传不出去→黑屏）。
         //   按比例缩放到 MAX_WIDTH/MAX_HEIGHT 以内，帧体积缩小数倍，弱网传输成功率大增。
         var width = metrics.widthPixels
         var height = metrics.heightPixels
@@ -295,6 +295,19 @@ object ScreenStreamManager {
             }
         } catch (e: Exception) {
             if (running) Log.e(TAG, "屏幕推流中断: ${e.message}")
+        } finally {
+            // ★★★ 2026-08-27 省电 + 缺陷修复：采集循环一结束（正常停止 / 写阻塞看门狗断开 / 对端掉线抛异常）
+            //   必须立刻释放 VirtualDisplay 与 ImageReader 并把 running 归位。
+            //   旧实现直接 return，导致：
+            //    1) VirtualDisplay 仍带 VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR，系统合成器持续把整屏镜像到
+            //       一个没人读的 ImageReader 上（GPU + 内存拷贝长期占用，灭屏也不停），是实打实的耗电项；
+            //    2) running 仍为 true → 控制端下一次 rdstrt 会命中"已在运行"分支直接返回 true，
+            //       但实际上没有任何线程在推流（表现为"预览黑屏且再也起不来"）。
+            //   这里同时中断看门狗线程，避免它在 running 已false 后继续空转 3 秒轮询。
+            running = false
+            try { watchdog.interrupt() } catch (_: Exception) {}
+            cleanup()
+            Log.i(TAG, "屏幕推流已结束，VirtualDisplay/ImageReader 已释放")
         }
     }
 

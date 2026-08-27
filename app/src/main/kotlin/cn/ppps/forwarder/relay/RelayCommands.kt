@@ -71,11 +71,15 @@ object RelayCommands {
     const val RSP_SCREEN_CTRL = "sfscreen0000"
 
     // ==================== Tailscale直连（中继关闭时被控端主动连接控制端56789） ====================
-    /** Tailscale直连请求（控制端→被控端，负载: 目标Tailscale IP|控制端Tailscale IP|端口） */
-    const val CMD_ZT_DIRECT_CONNECT = "ztdirect0000"
+    /**
+     * Tailscale直连请求（控制端→被控端，负载: 目标Tailscale IP|控制端Tailscale IP|端口）
+     * ★ 值 "ztdirect0000" 为历史命名（ZeroTier 时代），实际表示 Tailscale 直连；
+     *   它是三端（Java控制端 / Kotlin手机被控端 / Python PC端）共用的线上协议命令字，值不可修改。
+     */
+    const val CMD_TS_DIRECT_CONNECT = "ztdirect0000"
 
     /** 手机控制端TS直连监听端口（DirectHostServer） */
-    const val ZT_DIRECT_PORT = 56789
+    const val TS_DIRECT_PORT = 56789
 
     /** PC协议版本查询（控制端用于确认被控端在线，兼容PC被控端协议） */
     const val CMD_GET_VERSION = "ver000000000"

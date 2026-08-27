@@ -22,8 +22,8 @@ import cn.ppps.forwarder.relay.RelaySender
 import cn.ppps.forwarder.relay.RelayServerClient
 import cn.ppps.forwarder.relay.RelayServerHandler
 import cn.ppps.forwarder.relay.RelayServerListener
-import cn.ppps.forwarder.relay.ZtDirectClient
-import cn.ppps.forwarder.relay.ZtDirectScanner
+import cn.ppps.forwarder.relay.TailscaleDirectClient
+import cn.ppps.forwarder.relay.TailscaleDirectScanner
 import cn.ppps.forwarder.utils.ACTION_START
 import cn.ppps.forwarder.utils.ACTION_STOP
 import cn.ppps.forwarder.utils.FRONT_CHANNEL_ID
@@ -40,7 +40,8 @@ import java.util.concurrent.Executors
 /**
  * 被控端中继服务（前台服务）
  * 主动连接中继服务，接收控制端命令并响应。
- * ★ 每5秒上报设备状态（名称/锁屏/屏幕/电量/充电），由中继广播给所有手机控制端实时显示。
+ * ★ 周期上报设备状态（名称/锁屏/屏幕/电量/充电），由中继广播给所有手机控制端实时显示；
+ *   忙时（亮屏或有控制端连接/推流中）每 5 秒一次，纯待机时降为每 30 秒一次（省电，见 scheduleStateReport）。
  */
 class RelayServerService : Service() {
 
@@ -51,12 +52,18 @@ class RelayServerService : Service() {
     private var stateTimer: Timer? = null
 
     // ★ Tailscale直连客户端（多控制端：phoneIp → client，中继关闭时被控端主动连接控制端56789）
-    private val ztDirectClients = ConcurrentHashMap<String, ZtDirectClient>()
+    private val tsDirectClients = ConcurrentHashMap<String, TailscaleDirectClient>()
 
     // ★ Tailscale直连扫描器（中继关闭时自动发现控制端，与PC被控端扫描兜底一致）
-    private var ztScanner: ZtDirectScanner? = null
+    private var tsScanner: TailscaleDirectScanner? = null
 
     companion object {
+        /** ★ 省电：忙时设备状态上报间隔（与历史行为一致） */
+        private const val STATE_REPORT_BUSY_MS = 5000L
+
+        /** ★ 省电：灭屏且无控制端连接时的状态上报间隔 */
+        private const val STATE_REPORT_IDLE_MS = 30000L
+
         @Volatile
         var isRunning = false
 
@@ -115,6 +122,14 @@ class RelayServerService : Service() {
         isRunning = true
         executor = Executors.newFixedThreadPool(2)
 
+        // ★ 提前初始化 Tailscale 后端，确保 VPN 授权弹窗能被 MainActivity 触发
+        cn.ppps.forwarder.tailscale.TailscaleManager.ensureStarted(this)
+        // ★ 2026-08-25 需求：被控端启动成功后，直连模式下 VPN 自动开启。
+        //   中继连接是否可达由 connectLoop 后台异步判定：若中继实际可达，
+        //   onConnected 会回调 setRelayConnected(true) 自动关闭 VPN（节省资源）；
+        //   若中继不可达（直连模式），VPN 保持开启，保证控制端可经 Tailscale 直连。
+        cn.ppps.forwarder.tailscale.TailscaleManager.ensureVpnUp(this)
+
         // ★ 恢复已保存的屏幕捕获授权（复用上次授权的Intent，App重启后无需重新授权）
         if (ScreenProjectionService.restore(this)) {
             Log.i(TAG, "已恢复屏幕捕获授权，远程屏幕控制可用")
@@ -137,7 +152,7 @@ class RelayServerService : Service() {
             Log.i(TAG, "被控端连接已断开")
             // ★ 2026-08-16 中继联动：中继不可用 → 自动开启 Tailscale 直连
             cn.ppps.forwarder.tailscale.TailscaleManager.setRelayConnected(this, false)
-            // ★ 中继断开后由 ZtDirectScanner 自动探测并建立 TS 直连（扫描器每15秒探测56789），
+            // ★ 中继断开后由 TailscaleDirectScanner 自动探测并建立 TS 直连（扫描器每15秒探测56789），
             //   不再自动操作 Tailscale 开关（2026-08-13 取消：避免无障碍窗口出现在被控端；Tailscale 无公开API可编程开关）
         }
         // ★ 中继连接的命令处理：响应经中继回传（控制端经中继56782/56787接收）
@@ -156,7 +171,7 @@ class RelayServerService : Service() {
             }
             Unit
         }
-        // ★ 直连监听(56786)的命令处理：响应经来源连接回传（控制端ZT/局域网直连被控端时，多控制端按来源回发）
+        // ★ 直连监听(56786)的命令处理：响应经来源连接回传（控制端TS/局域网直连被控端时，多控制端按来源回发）
         val onDirectCommand: (Long, String, ByteArray) -> Unit = { connId: Long, cmd: String, payload: ByteArray ->
             executor?.execute {
                 try {
@@ -236,7 +251,7 @@ class RelayServerService : Service() {
         // 摄像头推流复用中继连接发送视频帧（直连预览时被控端视频仍经中继56788推流）
         cn.ppps.forwarder.relay.CameraStreamManager.setClient(c)
 
-        // ★ 同时启动直连监听(56786)：接受控制端 ZT/局域网直连（中继关闭时仍可被控制，恢复原直连能力）
+        // ★ 同时启动直连监听(56786)：接受控制端 TS/局域网直连（中继关闭时仍可被控制，恢复原直连能力）
         if (listener == null) {
             val l = RelayServerListener(
                 port = RelaySettings.relayServerPort,
@@ -250,32 +265,69 @@ class RelayServerService : Service() {
             cn.ppps.forwarder.relay.CameraStreamManager.addSender(l)
         }
         // ★ Tailscale直连：设置启动器（收到ztdirect0000时触发主动连接控制端56789，兜底通道）
-        RelayServerHandler.ztDirectLauncher = { phoneIp, port ->
-            startZtDirect(phoneIp, port)
+        RelayServerHandler.tsDirectLauncher = { phoneIp, port ->
+            startTailscaleDirect(phoneIp, port)
         }
         // ★ Tailscale直连扫描兜底：中继关闭时自动发现手机控制端并主动连接（与PC被控端一致）
         // ★ 2026-08-16 修复：多控制端场景下持续扫描所有未连接的控制端（华为+红米控制端并存），
         //   每台控制端各自建立独立直连。已连接的控制端IP由 connectedIps 提供，扫描时跳过。
-        ztScanner = ZtDirectScanner(
-            isDirectActive = { ztDirectClients.values.any { it.isConnected() } },
-            onDirectFound = { phoneIp, port -> startZtDirect(phoneIp, port) },
-            connectedIps = { ztDirectClients.keys.toSet() },
+        tsScanner = TailscaleDirectScanner(
+            isDirectActive = { tsDirectClients.values.any { it.isConnected() } },
+            onDirectFound = { phoneIp, port -> startTailscaleDirect(phoneIp, port) },
+            connectedIps = { tsDirectClients.keys.toSet() },
+            // ★ 2026-08-27 省电：灭屏且无人连接时直连扫描自动降频（详见 TailscaleDirectScanner）
+            isBusy = { isBusyNow() },
         ).also { it.start() }
-        // ★ 启动设备状态周期上报（每5秒）
+        // ★ 启动设备状态周期上报（忙时5秒，待机30秒）
         startStateReport()
     }
 
+    /**
+     * ★ 2026-08-27 省电：判断被控端当前是否"有人在用"。
+     * 任一条件成立即视为忙：
+     *  - 亮屏（用户正在操作本机，或控制端正在点亮屏幕）
+     *  - 中继侧有控制端在线（SYS_CTRL_ON 广播维护）
+     *  - 直连监听(56786) / TS直连(56789) 有控制端连接
+     *  - 摄像头 / 屏幕 / 麦克风任一路媒体流仍在推（会话进行中一律全速）
+     * 只用于决定"发现类/状态类"周期任务的频率，不影响任何数据传输通路。
+     */
+    private fun isBusyNow(): Boolean {
+        if (isScreenOn()) return true
+        if (isControllerOnline) return true
+        try {
+            if (listener?.hasController() == true) return true
+            if (tsDirectClients.values.any { it.isConnected() }) return true
+            if (cn.ppps.forwarder.relay.CameraStreamManager.isStreaming()) return true
+            if (cn.ppps.forwarder.relay.ScreenStreamManager.isStreaming()) return true
+            if (cn.ppps.forwarder.relay.MicrophoneStreamManager.isStreaming()) return true
+        } catch (e: Exception) {
+            Log.w(TAG, "忙碌状态判断异常(按忙处理): ${e.message}")
+            return true
+        }
+        return false
+    }
+
+    /** 屏幕是否点亮（查询失败按"亮"处理，宁可多耗电也不降频影响功能） */
+    private fun isScreenOn(): Boolean {
+        return try {
+            val pm = getSystemService(PowerManager::class.java)
+            pm == null || pm.isInteractive
+        } catch (e: Exception) {
+            true
+        }
+    }
+
     /** ★ 启动Tailscale直连客户端（主动连接手机控制端56789，中继关闭时仍可控制，多控制端各自独立连接） */
-    private fun startZtDirect(phoneIp: String, port: Int) {
-        Log.i(TAG, "★ startZtDirect: 连接手机控制端 $phoneIp:$port")
-        // ★ 防止自连：本机IP（局域网/ZT）直接忽略——扫描器可能把本机56789(控制端App同机运行)当成控制端，
+    private fun startTailscaleDirect(phoneIp: String, port: Int) {
+        Log.i(TAG, "★ startTailscaleDirect: 连接手机控制端 $phoneIp:$port")
+        // ★ 防止自连：本机IP（局域网/TS）直接忽略——扫描器可能把本机56789(控制端App同机运行)当成控制端，
         //   自连会占住 isDirectActive 使扫描器休眠，导致真实控制端(华为/PC)永不被发现
         if (isOwnIp(phoneIp)) {
             Log.i(TAG, "★ 忽略本机IP直连 $phoneIp（防止自连）")
             return
         }
         // ★ 多控制端：每台控制端独立连接（与PC被控端_zt_direct_clients一致），已连接的直接复用
-        val existing = ztDirectClients[phoneIp]
+        val existing = tsDirectClients[phoneIp]
         if (existing != null && existing.isConnected()) {
             Log.i(TAG, "★ 已有到 $phoneIp 的TS直连，复用")
             return
@@ -284,9 +336,9 @@ class RelayServerService : Service() {
             // ★ 移除旧通道的摄像头帧发送权
             cn.ppps.forwarder.relay.CameraStreamManager.removeSender(it)
             it.stop()
-            ztDirectClients.remove(phoneIp)
+            tsDirectClients.remove(phoneIp)
         }
-        val c = ZtDirectClient(
+        val c = TailscaleDirectClient(
             host = phoneIp,
             port = port,
             onConnected = {
@@ -301,11 +353,11 @@ class RelayServerService : Service() {
                     try {
                         // ★ 2026-08-06：传入该控制端TS直连client作为sender（文件下载二进制推送回发该控制端）
                         Log.i(TAG, "★ TS直连 handle命令: cmd=$cmd payloadLen=${payload.size} phoneIp=$phoneIp")
-                        val result = RelayServerHandler.handle(cmd, payload, RelayServerHandler.CHANNEL_ZT, ztDirectClients[phoneIp])
+                        val result = RelayServerHandler.handle(cmd, payload, RelayServerHandler.CHANNEL_TS, tsDirectClients[phoneIp])
                         if (result != null) {
                             // ★ 响应经来源通道回传（查map取该控制端最新连接）
                             Log.i(TAG, "★ TS直连 响应发送: respCmd=${result.first} respLen=${result.second.length} phoneIp=$phoneIp")
-                            ztDirectClients[phoneIp]?.send(result.first, result.second)
+                            tsDirectClients[phoneIp]?.send(result.first, result.second)
                         } else {
                             Log.w(TAG, "TS直连 handle 无响应: cmd=$cmd phoneIp=$phoneIp")
                         }
@@ -316,17 +368,17 @@ class RelayServerService : Service() {
             },
         )
         c.start()
-        ztDirectClients[phoneIp] = c
+        tsDirectClients[phoneIp] = c
         // ★ 注册TS直连为摄像头帧发送通道（中继关闭直连控制时摄像头仍可用）
         cn.ppps.forwarder.relay.CameraStreamManager.addSender(c)
     }
 
     /** ★ 判断目标IP是否本机（仅自己App的Tailscale IP + 局域网IP），防止被控端自连自己的控制端App */
     private fun isOwnIp(target: String): Boolean {
-        // ★ 2026-08-16 修复：Tailscale 本机IP用 getOwnZtIps()（只含自己App节点IP）。
+        // ★ 2026-08-16 修复：Tailscale 本机IP用 getOwnTsIps()（只含自己App节点IP）。
         //   原实现遍历 NetworkInterface，会把同一手机上"控制端App的VPN接口IP"误判为本机，
-        //   导致 startZtDirect 忽略对控制端的直连。
-        if (target in RelayServerHandler.getOwnZtIps()) return true
+        //   导致 startTailscaleDirect 忽略对控制端的直连。
+        if (target in RelayServerHandler.getOwnTsIps()) return true
         return try {
             java.util.Collections.list(java.net.NetworkInterface.getNetworkInterfaces()).any { ni ->
                 if (!ni.isUp || ni.isLoopback) return@any false
@@ -351,25 +403,43 @@ class RelayServerService : Service() {
         return p[1].toIntOrNull()?.let { it in 64..127 } ?: false
     }
 
-    /** 启动设备状态上报定时器：每5秒发送 devstate0000（名称|锁屏|屏幕|电量|充电） */
+    /** 启动设备状态周期上报定时器：忙时每5秒，待机时每30秒发送 devstate0000（名称|锁屏|屏幕|电量|充电） */
     private fun startStateReport() {
         if (stateTimer != null) return
         stateTimer = Timer("DevStateReport", true)
-        stateTimer?.scheduleAtFixedRate(object : TimerTask() {
-            override fun run() {
-                try {
-                    val state = buildDeviceState()
-                    // ★ 设备状态上报：中继连接 + 直连监听（广播所有已接入控制端）+ TS直连（广播所有控制端）
-                    client?.send(RelayCommands.CMD_DEV_STATE, state)
-                    listener?.broadcast(RelayCommands.CMD_DEV_STATE, state)
-                    for (c in ztDirectClients.values) {
-                        c.send(RelayCommands.CMD_DEV_STATE, state)
+        scheduleStateReport(2000L)
+    }
+
+    /**
+     * ★ 2026-08-27 省电：状态上报改为"一次一排"（schedule 而非 scheduleAtFixedRate），
+     *   好让每一轮都能根据当前忙/闲重新决定下一次间隔。
+     *   依据：buildDeviceState() 每轮要做 KeyguardManager.isKeyguardLocked + PowerManager.isInteractive
+     *   + 一次 ACTION_BATTERY_CHANGED 粘性广播查询，再向中继/直连监听/全部TS直连三路各发一帧；
+     *   旧实现固定 5 秒一轮 = 每小时 720 次这种唤醒，而灭屏无人连接时这些状态变化极慢，
+     *   改成 30 秒可去掉约 83% 的唤醒，控制端看到的电量/锁屏最多晚 30 秒（且控制端一连上就回到 5 秒）。
+     */
+    private fun scheduleStateReport(delayMs: Long) {
+        val t = stateTimer ?: return
+        try {
+            t.schedule(object : TimerTask() {
+                override fun run() {
+                    try {
+                        val state = buildDeviceState()
+                        // ★ 设备状态上报：中继连接 + 直连监听（广播所有已接入控制端）+ TS直连（广播所有控制端）
+                        client?.send(RelayCommands.CMD_DEV_STATE, state)
+                        listener?.broadcast(RelayCommands.CMD_DEV_STATE, state)
+                        for (c in tsDirectClients.values) {
+                            c.send(RelayCommands.CMD_DEV_STATE, state)
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "设备状态上报异常: ${e.message}")
                     }
-                } catch (e: Exception) {
-                    Log.w(TAG, "设备状态上报异常: ${e.message}")
+                    scheduleStateReport(if (isBusyNow()) STATE_REPORT_BUSY_MS else STATE_REPORT_IDLE_MS)
                 }
-            }
-        }, 2000, 5000)
+            }, delayMs)
+        } catch (e: IllegalStateException) {
+            // timer 已 cancel（服务停止），正常退出
+        }
     }
 
     /** 采集并拼接设备状态：名称|锁屏|屏幕|电量|充电 */
@@ -425,6 +495,8 @@ class RelayServerService : Service() {
         isRunning = false
         isConnected = false
         isControllerOnline = false
+        // ★ 2026-08-25 停止VPN掉线恢复看门狗（服务停止后不再自动拉起VPN）
+        cn.ppps.forwarder.tailscale.TailscaleManager.stopVpnWatchdog()
         stateTimer?.cancel()
         stateTimer = null
         client?.stop()
@@ -432,13 +504,16 @@ class RelayServerService : Service() {
         listener?.stop()
         listener = null
         // ★ 停止全部TS直连（多控制端）
-        ztDirectClients.values.forEach { it.stop() }
-        ztDirectClients.clear()
+        tsDirectClients.values.forEach { it.stop() }
+        tsDirectClients.clear()
         // ★ 停止TS直连扫描器
-        ztScanner?.stop()
-        ztScanner = null
-        RelayServerHandler.ztDirectLauncher = null
+        tsScanner?.stop()
+        tsScanner = null
+        RelayServerHandler.tsDirectLauncher = null
         cn.ppps.forwarder.relay.CameraStreamManager.setClient(null)
+        // ★ 2026-08-27 省电修复：麦克风此前从未在服务销毁时停止——MicrophoneStreamManager 持有
+        //   无超时的 PARTIAL_WAKE_LOCK + 常驻 AudioRecord，服务被系统重建/重启后会继续录音并保持CPU不休眠。
+        cn.ppps.forwarder.relay.MicrophoneStreamManager.stop()
         cn.ppps.forwarder.relay.ScreenStreamManager.releaseProjection()
         // ★ 停止屏幕捕获前台服务（与投影释放同步，避免常驻）
         ScreenProjectionService.stop(this)

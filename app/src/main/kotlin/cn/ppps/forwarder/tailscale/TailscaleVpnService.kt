@@ -93,7 +93,13 @@ class TailscaleVpnService : VpnService(), IPNService {
                 val nm = getSystemService(android.app.NotificationManager::class.java)
                 nm.createNotificationChannel(android.app.NotificationChannel("tailscale_vpn", "Tailscale VPN", android.app.NotificationManager.IMPORTANCE_MIN))
             }
-            startForeground(id, notification)
+            if (android.os.Build.VERSION.SDK_INT >= 34) {
+                // ★ 2026-08-26 Android 14+ 必须传 foregroundServiceTypes；specialUse 对应 Manifest 中声明的类型
+                startForeground(id, notification,
+                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+            } else {
+                startForeground(id, notification)
+            }
         } catch (t: Throwable) {
             Log.w(TAG, "startForeground 失败: ${t.message}")
         }
@@ -211,3 +217,5 @@ private class TailscaleParcelFd(private val fd: android.os.ParcelFileDescriptor)
     @Throws(Exception::class)
     override fun detach(): Int = fd.detachFd()
 }
+
+

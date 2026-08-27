@@ -160,11 +160,11 @@ object RelayServerHandler {
 
     /** ★ 命令来源通道常量：供ScreenStreamManager等按通道决定推流模式 */
     const val CHANNEL_RELAY = 0    // 命令经中继连接到达（被控端→中继56786）
-    const val CHANNEL_DIRECT = 1   // 命令经直连监听(56786)到达（控制端ZT/局域网直连）
-    const val CHANNEL_ZT = 2       // 命令经TS直连(56789)到达（被控端主动连接控制端）
+    const val CHANNEL_DIRECT = 1   // 命令经直连监听(56786)到达（控制端TS/局域网直连）
+    const val CHANNEL_TS = 2       // 命令经TS直连(56789)到达（被控端主动连接控制端）
 
     /** ★ TS直连启动器（由RelayServerService设置，触发后主动连接控制端56789） */
-    var ztDirectLauncher: ((phoneIp: String, port: Int) -> Unit)? = null
+    var tsDirectLauncher: ((phoneIp: String, port: Int) -> Unit)? = null
 
     /** ★ 文件下载取消标志（控制端发送CMD_FS_CANCEL后置为true，下载线程每块发送前检查） */
     @Volatile
@@ -181,24 +181,24 @@ object RelayServerHandler {
     private var fsAckBlock = -1L
 
     /** ★ 本机虚拟网IP缓存（60秒）：Tailscale 100.64-100.127.x */
-    private var ownZtIpsCache: Set<String>? = null
-    private var ownZtIpsCacheTime = 0L
+    private var ownTsIpsCache: Set<String>? = null
+    private var ownTsIpsCacheTime = 0L
 
     /** 获取本机虚拟网IP（Tailscale 100.64.x，与PC被控端逻辑一致） */
-    fun getOwnZtIps(): Set<String> {
+    fun getOwnTsIps(): Set<String> {
         val now = System.currentTimeMillis()
-        if (ownZtIpsCache != null && now - ownZtIpsCacheTime < 60000) return ownZtIpsCache!!
+        if (ownTsIpsCache != null && now - ownTsIpsCacheTime < 60000) return ownTsIpsCache!!
         val ips = LinkedHashSet<String>()
         // ★ 2026-08-16 修复：只使用 Tailscale 后端 Self IP（自己 App 的节点）。
         //   不再枚举网卡——同一手机上"控制端App的VPN接口IP"也会被 NetworkInterface 枚举到，
-        //   导致把控制端IP(如100.106.79.58)误判为本机 → scanZtMembers 的 ip in own 跳过控制端探测，
+        //   导致把控制端IP(如100.106.79.58)误判为本机 → scanTsMembers 的 ip in own 跳过控制端探测，
         //   isOwnIp 也误判 → 中继关闭后被控端无法通过扫描发现控制端，彻底连不上。
         try {
             cn.ppps.forwarder.tailscale.TailscaleManager.getSelfIp()?.let { ips.add(it) }
         } catch (_: Throwable) {
         }
-        ownZtIpsCache = ips
-        ownZtIpsCacheTime = now
+        ownTsIpsCache = ips
+        ownTsIpsCacheTime = now
         return ips
     }
 
@@ -233,7 +233,7 @@ object RelayServerHandler {
 
     /**
      * 处理收到的命令
-     * @param channel 命令来源通道：CHANNEL_RELAY / CHANNEL_DIRECT / CHANNEL_ZT（供屏幕推流模式选择）
+     * @param channel 命令来源通道：CHANNEL_RELAY / CHANNEL_DIRECT / CHANNEL_TS（供屏幕推流模式选择）
      * @param sender 命令来源通道的发送器（★ 2026-08-06新增：文件下载等二进制推送用，由RelayServerService传入）
      * @return (响应命令, 响应负载JSON)，未知命令返回 null
      */
@@ -245,17 +245,17 @@ object RelayServerHandler {
                 RelayCommands.CMD_GET_CONFIG -> RelayCommands.RSP_CONFIG to success(handleConfig())
 
                 // ★ Tailscale直连请求（中继在线时触发）：负载 "目标Tailscale IP|控制端Tailscale IP|端口"
-                RelayCommands.CMD_ZT_DIRECT_CONNECT -> {
+                RelayCommands.CMD_TS_DIRECT_CONNECT -> {
                     val parts = payloadText.split("|")
                     if (parts.size >= 3) {
                         val targetIp = parts[0].trim()
                         val phoneIp = parts[1].trim()
-                        val port = parts.getOrNull(2)?.trim()?.toIntOrNull() ?: RelayCommands.ZT_DIRECT_PORT
-                        if (targetIp in getOwnZtIps()) {
+                        val port = parts.getOrNull(2)?.trim()?.toIntOrNull() ?: RelayCommands.TS_DIRECT_PORT
+                        if (targetIp in getOwnTsIps()) {
                             Log.i(TAG, "★ 收到TS直连请求，目标匹配本机，主动连接控制端 $phoneIp:$port")
-                            ztDirectLauncher?.invoke(phoneIp, port)
+                            tsDirectLauncher?.invoke(phoneIp, port)
                         } else {
-                            Log.i(TAG, "TS直连目标 $targetIp 不是本机 (本机: ${getOwnZtIps()})，忽略")
+                            Log.i(TAG, "TS直连目标 $targetIp 不是本机 (本机: ${getOwnTsIps()})，忽略")
                         }
                     }
                     null  // 直连触发无需响应
@@ -370,7 +370,7 @@ object RelayServerHandler {
                     val fps = parts.getOrNull(2)?.toIntOrNull() ?: 15
                     val quality = parts.getOrNull(4)?.toIntOrNull() ?: 50
                     val clientId = parts.getOrNull(5)?.toIntOrNull() ?: -1
-                    // ★ 按命令来源通道决定推流模式（中继→PUSHER；直连/ZT→监听56788）
+                    // ★ 按命令来源通道决定推流模式（中继→PUSHER；直连/TS→监听56788）
                     val ok = ScreenStreamManager.startStream(RelaySettings.relayHost, clientId, fps, quality, channel)
                     if (ok) {
                         RelayCommands.RSP_RD_START_ACK to RelayCommands.RELAY_VIDEO_PORT.toString()
@@ -612,7 +612,7 @@ object RelayServerHandler {
                     webrtc = mgr
                     val cb = makeWebrtcSignalingCallback(s)
                     // ★★★ 2026-08-12 中继优先模式：OFFER经中继到达(CHANNEL_RELAY)→relayPreferred=true
-                    //   （媒体走TURN中继转发）；经TS直连/直连监听到达(CHANNEL_ZT/DIRECT)→relayPreferred=false
+                    //   （媒体走TURN中继转发）；经TS直连/直连监听到达(CHANNEL_TS/DIRECT)→relayPreferred=false
                     //   （媒体走TS/WiFi host直连兜底）。符合"中继优先，中继不可用时才TS直连"。
                     val relayPreferred = (channel == CHANNEL_RELAY)
                     Log.i(TAG, "★ [WebRTC OFFER IN] 开始异步启动 WebRtcSessionManager.startWithOffer"

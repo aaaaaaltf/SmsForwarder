@@ -110,7 +110,7 @@ class WebRtcSessionManager(
     @Volatile private var signalingCallback: SignalingCallback? = null
     @Volatile private var currentCameraIndex: Int = 0
     @Volatile private var running = false
-    /** ★★★ 2026-08-12 中继优先模式：true=中继服务在线，媒体走TURN relay（中继转发）；false=ZT/WiFi直连兜底 */
+    /** ★★★ 2026-08-12 中继优先模式：true=中继服务在线，媒体走TURN relay（中继转发）；false=TS/WiFi直连兜底 */
     @Volatile private var relayPreferred: Boolean = true
 
     // ★★★ 2026-08-14 周期关键帧机制（修复"只传一帧"）：
@@ -127,7 +127,7 @@ class WebRtcSessionManager(
 
     // ★ 2026-08-11 ICE连接宽容策略v2：
     //   - 之前：everConnected + 15秒 → 失败案例：ICE瞬时CONNECTED(选到了一个假候选对)后立即FAILED，
-    //     15秒内 WebRTC 还没来得及用其他候选对（如ZT host↔host）重试就被判定为失败。
+    //     15秒内 WebRTC 还没来得及用其他候选对（如TS host↔host）重试就被判定为失败。
     //   - 现在：宽容时间改成 45 秒，并补充私网IP(TS/192.168)连通性检测，给WebRTC足够时间探测真正可用的候选对。
     //   - everConnected=true 后，哪怕 DISCONNECTED/FAILED 都只报状态，绝不立即触发 fallback。
     @Volatile private var everConnected = false
@@ -268,11 +268,11 @@ class WebRtcSessionManager(
         //   - relayPreferred=false（TS直连兜底）：注入TS专用检测器 → host候选=Tailscale IP(100.64.x)。
         if (!relayPreferred) {
             try {
-                val ztIp = findZtIpAddress()
-                if (ztIp != null) {
+                val tsIp = findTsIpAddress()
+                if (tsIp != null) {
                     org.webrtc.NetworkMonitor.getInstance()
-                        .setNetworkChangeDetectorFactory(ZtOnlyNetworkDetectorFactory(ztIp, false))
-                    Log.i(TAG, "$stepTag [4/8] ★ 已注册TS专用网络检测器 ztIp=$ztIp（直连兜底：返回WiFi+tun0→媒体走TS直连）")
+                        .setNetworkChangeDetectorFactory(TsOnlyNetworkDetectorFactory(tsIp, false))
+                    Log.i(TAG, "$stepTag [4/8] ★ 已注册TS专用网络检测器 tsIp=$tsIp（直连兜底：返回WiFi+tun0→媒体走TS直连）")
                 } else {
                     Log.w(TAG, "$stepTag [4/8] 未找到本机Tailscale IP(100.64-100.127.x)，使用默认网络检测器")
                 }
@@ -479,18 +479,18 @@ class WebRtcSessionManager(
                 //   —— relayPreferred=false（中继离线/直连模式）才发送TS候选兜底。
                 if ("host" == candType && !relayPreferred) {
                     try {
-                        val ztIp = findZtIpAddress()
-                        if (ztIp != null && ztIp != candIp) {
+                        val tsIp = findTsIpAddress()
+                        if (tsIp != null && tsIp != candIp) {
                             val parts = candidate.sdp.split(" ").toMutableList()
                             if (parts.size > 5) {
-                                parts[4] = ztIp
-                                val ztSdp = parts.joinToString(" ")
-                                val ztCand = IceCandidate(candidate.sdpMid, candidate.sdpMLineIndex, ztSdp)
-                                val ztSdp64 = Base64.getEncoder().encodeToString(
-                                    ztCand.sdp.toByteArray(StandardCharsets.UTF_8))
-                                val ztPayload = "ANSWERER|${candidate.sdpMid}|${candidate.sdpMLineIndex}|$ztSdp64"
-                                cb.onSignalingMessage(RelayCommands.CMD_WEBRTC_CANDIDATE, ztPayload)
-                                Log.i(TAG, "★ [TS修复] host候选IP ${candIp}:${candPort} 改写为Tailscale IP $ztIp 发送")
+                                parts[4] = tsIp
+                                val tsSdp = parts.joinToString(" ")
+                                val tsCand = IceCandidate(candidate.sdpMid, candidate.sdpMLineIndex, tsSdp)
+                                val tsSdp64 = Base64.getEncoder().encodeToString(
+                                    tsCand.sdp.toByteArray(StandardCharsets.UTF_8))
+                                val tsPayload = "ANSWERER|${candidate.sdpMid}|${candidate.sdpMLineIndex}|$tsSdp64"
+                                cb.onSignalingMessage(RelayCommands.CMD_WEBRTC_CANDIDATE, tsPayload)
+                                Log.i(TAG, "★ [TS修复] host候选IP ${candIp}:${candPort} 改写为Tailscale IP $tsIp 发送")
                             }
                         }
                     } catch (_: Throwable) {}
@@ -1191,7 +1191,7 @@ class WebRtcSessionManager(
 // ==================== ★★★ 2026-08-12 TS直连候选修复辅助类 ====================
 
 /** 查找本机虚拟网段IP（Tailscale 100.64.0.0/10） */
-fun findZtIpAddress(): String? {
+fun findTsIpAddress(): String? {
     return try {
         val nis = java.net.NetworkInterface.getNetworkInterfaces()
         while (nis.hasMoreElements()) {
@@ -1228,14 +1228,14 @@ private fun isPrivateVirtualIp(ip: String): Boolean {
  *  - relayPreferred=false（直连兜底）：返回 WiFi + tun0(修正IP) → 媒体走TS直连
  *  背景：Android网络监控给Tailscale VPN(tun0)生成的UDP host候选是底层WiFi IP而非Tailscale IP，
  *  跨设备TS直连ICE两端候选都不含Tailscale IP → ICE=FAILED。v2注入NetworkChangeDetector修正。 */
-class ZtOnlyNetworkDetectorFactory(
-    private val ztIp: String,
+class TsOnlyNetworkDetectorFactory(
+    private val tsIp: String,
     private val relayPreferred: Boolean
 ) : NetworkChangeDetectorFactory {
     private val TAG = "WebRtcSessionMgr"
     override fun create(observer: NetworkChangeDetector.Observer, context: Context): NetworkChangeDetector {
         val base = NetworkMonitorAutoDetect(observer, context)
-        val ztIpBytes = parseIpv4(ztIp)
+        val tsIpBytes = parseIpv4(tsIp)
         return object : NetworkChangeDetector {
             override fun getCurrentConnectionType(): NetworkChangeDetector.ConnectionType =
                 base.currentConnectionType
@@ -1244,20 +1244,20 @@ class ZtOnlyNetworkDetectorFactory(
 
             override fun getActiveNetworkList(): MutableList<NetworkChangeDetector.NetworkInformation> {
                 val orig = base.activeNetworkList
-                var zt: NetworkChangeDetector.NetworkInformation? = null
+                var tunNet: NetworkChangeDetector.NetworkInformation? = null
                 if (orig != null) {
                     for (ni in orig) {
-                        if (isZtNetwork(ni)) { zt = ni; break }
+                        if (isTsNetwork(ni)) { tunNet = ni; break }
                     }
                 }
                 // ★★★ 2026-08-12 兜底：部分ROM(华为EMUI等) NetworkMonitorAutoDetect 不报告
-                //   Tailscale VPN(tun0)网络 → orig里找不到TS网络 → zt==null 返回全部网络
+                //   Tailscale VPN(tun0)网络 → orig里找不到TS网络 → tunNet==null 返回全部网络
                 //   → WebRTC socket绑定蜂窝/WiFi IP，host候选不含Tailscale IP → ICE=FAILED。
                 //   用ConnectivityManager遍历系统网络找TRANSPORT_VPN/接口tun开头的真实handle。
-                if (zt == null) {
-                    zt = findZtViaConnectivityManager(context, ztIpBytes)
-                    if (zt != null) {
-                        Log.i(TAG, "★ [TS修复] orig无tun0，ConnectivityManager兜底找到VPN网络 name=${zt.name} handle=${zt.handle}")
+                if (tunNet == null) {
+                    tunNet = findTsViaConnectivityManager(context, tsIpBytes)
+                    if (tunNet != null) {
+                        Log.i(TAG, "★ [TS修复] orig无tun0，ConnectivityManager兜底找到VPN网络 name=${tunNet.name} handle=${tunNet.handle}")
                     }
                 }
                 // ★★★ 2026-08-12 中继环境修复：不再"只返回tun0"——
@@ -1272,13 +1272,13 @@ class ZtOnlyNetworkDetectorFactory(
                 orig?.forEach { ni ->
                     if (ni.type == NetworkChangeDetector.ConnectionType.CONNECTION_WIFI) out.add(ni)
                 }
-                if (!relayPreferred && zt != null && ztIpBytes != null) {
+                if (!relayPreferred && tunNet != null && tsIpBytes != null) {
                     // 直连兜底模式：修正IP后的TS网络（tun0）
                     val fixed = NetworkChangeDetector.NetworkInformation(
-                        zt.name, zt.type, zt.underlyingTypeForVpn, zt.handle,
-                        arrayOf(NetworkChangeDetector.IPAddress(ztIpBytes)))
+                        tunNet.name, tunNet.type, tunNet.underlyingTypeForVpn, tunNet.handle,
+                        arrayOf(NetworkChangeDetector.IPAddress(tsIpBytes)))
                     out.add(fixed)
-                    Log.i(TAG, "★ [TS修复] 直连兜底模式: WiFi=${countWifi(orig)} + tun0(${zt.name}→$ztIp) ✓")
+                    Log.i(TAG, "★ [TS修复] 直连兜底模式: WiFi=${countWifi(orig)} + tun0(${tunNet.name}→$tsIp) ✓")
                 } else if (relayPreferred) {
                     Log.i(TAG, "★ [中继优先] 候选网络仅WiFi（不含tun0），媒体将走TURN relay中继转发")
                 }
@@ -1290,7 +1290,7 @@ class ZtOnlyNetworkDetectorFactory(
         }
     }
 
-    private fun isZtNetwork(ni: NetworkChangeDetector.NetworkInformation): Boolean {
+    private fun isTsNetwork(ni: NetworkChangeDetector.NetworkInformation): Boolean {
         if (ni.type == NetworkChangeDetector.ConnectionType.CONNECTION_VPN) return true
         if (ni.name != null && ni.name.startsWith("tun")) return true
         ni.ipAddresses?.forEach { a ->
@@ -1318,8 +1318,8 @@ class ZtOnlyNetworkDetectorFactory(
      *  1) TRANSPORT_VPN 且接口名以tun开头（最典型Tailscale）
      *  2) 或 LinkProperties 链路地址含 100.64-100.127.x（Tailscale虚拟网段）
      *  命中后取其真实NetworkHandle构造NetworkInformation。 */
-    private fun findZtViaConnectivityManager(
-        ctx: Context, ztIpBytes: ByteArray?): NetworkChangeDetector.NetworkInformation? {
+    private fun findTsViaConnectivityManager(
+        ctx: Context, tsIpBytes: ByteArray?): NetworkChangeDetector.NetworkInformation? {
         return try {
             val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
                 ?: return null
@@ -1329,21 +1329,21 @@ class ZtOnlyNetworkDetectorFactory(
                 val iface = lp.interfaceName
                 val isVpnTransport = caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)
                 val isTunName = iface?.startsWith("tun") == true
-                var hasZtAddr = false
+                var hasTsAddr = false
                 try {
                     lp.linkAddresses.forEach { la ->
                         val a = la.address
                         if (a is java.net.Inet4Address) {
                             val ip = a.hostAddress
-                            if (ip != null && isPrivateVirtualIp(ip)) { hasZtAddr = true; return@forEach }
+                            if (ip != null && isPrivateVirtualIp(ip)) { hasTsAddr = true; return@forEach }
                         }
                     }
                 } catch (_: Throwable) {}
-                if (isVpnTransport || isTunName || hasZtAddr) {
+                if (isVpnTransport || isTunName || hasTsAddr) {
                     val name = iface ?: "tun0"
                     val handle = n.networkHandle
-                    val ips = if (ztIpBytes != null) {
-                        arrayOf(NetworkChangeDetector.IPAddress(ztIpBytes))
+                    val ips = if (tsIpBytes != null) {
+                        arrayOf(NetworkChangeDetector.IPAddress(tsIpBytes))
                     } else {
                         emptyArray<NetworkChangeDetector.IPAddress>()
                     }

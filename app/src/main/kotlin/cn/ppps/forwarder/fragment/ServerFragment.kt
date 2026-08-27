@@ -251,8 +251,12 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             }
         }
 
-        //启动更新UI定时器
-        handler.post(runnable)
+        // ★ 2026-08-27 省电：UI 定时刷新改到 onResume/onPause 挂/摘（见下面两个回调）。
+        //   旧代码在这里 handler.post(runnable) 且只在 onDestroy 取消，而被控端绝大部分时间处于
+        //   "Activity 已 stop 但未销毁"的后台状态 → 每 5 秒仍执行一次 refreshButtonText()，
+        //   其中含 VpnService.prepare() 的 binder 调用 + TailscaleManager.getSelfIp()
+        //   （= 一次 libtailscale localapi /status 的 Go/JNI 重入，超时上限 15 秒）。
+        //   界面不可见时这些刷新没有任何意义，却每小时制造 720 次唤醒。
 
         // ★★★ 2026-08-12 首次运行自动授权：无需点击"一键授权"，启动时自动触发完整授权流程
         //   已授权完成的权限不会重复弹窗（autoAuthorizeDone持久化标记）；用户拒绝的权限下次启动仍会提示。
@@ -270,6 +274,9 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
     override fun onResume() {
         super.onResume()
         refreshButtonText()
+        // ★ 2026-08-27 省电：界面可见时才启动 5 秒刷新（onPause 里摘掉）
+        handler.removeCallbacks(runnable)
+        handler.postDelayed(runnable, 5000)
         // ★ 2026-08-11 自动恢复已保存的 MediaProjection 授权（App 重启后无需再次弹窗确认）
         //   Android 13 及以下：SP 中保存的 resultCode+Intent 可直接恢复
         //   Android 14+：token 随系统会话管理，恢复可能失败（需重新授权），失败时静默跳过
@@ -1355,6 +1362,16 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                 XToastUtils.toast("以下权限仍需手动开启: ${stillPending.joinToString("、")}，请再次点击一键授权")
             }
         }
+    }
+
+    /**
+     * ★ 2026-08-27 省电：界面不可见立即停止 5 秒轮询。
+     *   被控端的常态是"启动完服务后就把 App 划到后台/锁屏"，此时旧代码仍每小时轮询 720 次
+     *   VpnService.prepare + libtailscale localapi /status（Go/JNI 重入）。
+     */
+    override fun onPause() {
+        super.onPause()
+        handler.removeCallbacks(runnable)
     }
 
     override fun onDestroy() {

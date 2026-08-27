@@ -80,6 +80,61 @@ object CameraStreamManager {
     /** 唤醒锁：防止关屏后 CPU 深度休眠中断摄像头推流 */
     private var wakeLock: PowerManager.WakeLock? = null
 
+    /**
+     * ★ 2026-08-27 省电：摄像头"无人接收"自动收尾。
+     *   依据：摄像头推流由控制端命令开启、也靠控制端命令关闭；若控制端进程被杀/网络掉线而 STOP 命令丢失，
+     *   本端会一直开着摄像头 + 每帧做 640x480 YUV→JPEG 编码 + 持有 PARTIAL_WAKE_LOCK（见 acquireWakeLock），
+     *   这是被控端最贵的一种"空转"：摄像头供电、ISP、CPU 三样同时满载，且灭屏也不会休眠。
+     *   策略：连续 NO_CONSUMER_IDLE_MS 内【所有】发送通道（中继client / 直连监听56786 / TS直连56789）
+     *   都没有成功送出过一帧（即全部处于未连接状态）→ 自动 stop() 释放摄像头与 WakeLock。
+     *   【只在直连场景生效，绝不切断中继会话】中继模式下被控端与中继的 client 通道恒为已连接，
+     *   因此只要中继在线就不会触发；实际能救回来的是"控制端经 TS/局域网直连看摄像头后掉线/被杀"
+     *   这一类 STOP 命令丢失的场景——也正是最容易长时间空转烧电的场景。
+     */
+    private const val NO_CONSUMER_IDLE_MS = 60000L
+
+    /** 最近一次"存在已连接接收通道"的时间戳 */
+    @Volatile
+    private var lastConsumerSeenTime = 0L
+
+    private var idleWatchdog: Thread? = null
+
+    /** 标记已触发空闲停止，避免看门狗反复调用 stop() */
+    @Volatile
+    private var idleStopTriggered = false
+
+    /** 记录一次"有人在收流"（由取帧回调调用，代价仅一次时间戳写入） */
+    private fun touchConsumer() {
+        lastConsumerSeenTime = System.currentTimeMillis()
+    }
+
+    /** 启动空闲看门狗：每10秒检查一次是否有接收方，连续超时则自动停流（省电收尾） */
+    private fun startIdleWatchdog() {
+        lastConsumerSeenTime = System.currentTimeMillis()
+        idleStopTriggered = false
+        if (idleWatchdog?.isAlive == true) return
+        idleWatchdog = Thread({
+            while (running && !idleStopTriggered) {
+                try {
+                    Thread.sleep(10000)
+                } catch (_: InterruptedException) {
+                    break
+                }
+                if (!running) break
+                val idleMs = System.currentTimeMillis() - lastConsumerSeenTime
+                if (idleMs > NO_CONSUMER_IDLE_MS) {
+                    idleStopTriggered = true
+                    Log.i(TAG, "★ 省电：摄像头连续 ${idleMs / 1000}s 无任何已连接接收通道（控制端可能已掉线），自动停流释放相机与WakeLock")
+                    // 必须在独立线程调用：stop() 内部会等待 camera 线程的 onClosed，
+                    // 若在 cameraHandler 线程里调用会自己等自己（靠 1500ms 超时兜底）
+                    stop()
+                    break
+                }
+            }
+        }, "CameraIdleWatchdog").apply { isDaemon = true }
+        idleWatchdog!!.start()
+    }
+
     fun lastError(): String = lastError ?: "未知错误"
 
     /** 摄像头推流期间持有 PARTIAL_WAKE_LOCK，防止关屏后 CPU 休眠中断推流 */
@@ -150,6 +205,8 @@ object CameraStreamManager {
             if (index == cameraIndex) {
                 // ★ 同一摄像头继续推流：推进流ID，让控制端识别为新会话（过滤中继缓冲的旧流帧）
                 streamId = maxOf(System.currentTimeMillis(), streamId + 1)
+                // ★ 省电：控制端重新打开同一路摄像头 = 明确"有人在收流"，重置空闲计时
+                touchConsumer()
                 Log.i(TAG, "摄像头流已在运行(camera=$cameraIndex)，推进流ID继续推流")
                 return true
             }
@@ -179,17 +236,21 @@ object CameraStreamManager {
             Log.e(TAG, "启动摄像头流失败: ${e.message}")
         }
         if (!opened) {
-            // ★ 自动重试一次：应对 MIUI 等系统的瞬时相机策略限制（如后台限制、相机短暂占用）
-            Log.w(TAG, "摄像头打开失败(${lastError})，500ms后自动重试一次")
-            try {
-                Thread.sleep(500)
-            } catch (_: InterruptedException) {
-            }
-            try {
-                opened = tryOpenCamera(index)
-            } catch (e: Exception) {
-                lastError = e.message
-                Log.e(TAG, "重试摄像头失败: ${e.message}")
+            // ★ 2026-08-26 优化重试策略：第1次500ms（瞬时占用），第2次3s（Android 14 FGS后台camera权限冻结窗口）
+            for (retry in 1..2) {
+                val waitMs = if (retry == 1) 500L else 3000L
+                Log.w(TAG, "摄像头打开失败(${lastError})，第${retry}次等待${waitMs}ms后重试")
+                try {
+                    Thread.sleep(waitMs)
+                } catch (_: InterruptedException) {
+                }
+                try {
+                    opened = tryOpenCamera(index)
+                    if (opened) break
+                } catch (e: Exception) {
+                    lastError = e.message
+                    Log.e(TAG, "第${retry}次重试摄像头失败: ${e.message}")
+                }
             }
         }
         if (!opened) {
@@ -198,6 +259,8 @@ object CameraStreamManager {
         }
         running = true
         acquireWakeLock()
+        // ★ 2026-08-27 省电：启动"无人收流"看门狗（控制端掉线导致 STOP 丢失时自动释放摄像头与WakeLock）
+        startIdleWatchdog()
         return true
     }
 
@@ -256,6 +319,8 @@ object CameraStreamManager {
                                 }
                             }
                             if (!sent) client?.send(RelayCommands.CMD_CAMERA_STREAM_FRAME, data)
+                            // ★ 省电：本帧确实送达了至少一条已连接通道 → 记为"有人在收流"
+                            if (sent) touchConsumer()
                         } catch (_: Exception) {
                         }
                         // ★ 流控：帧发送后sleep，防止中继服务器缓冲区溢出导致画面卡死
@@ -505,3 +570,4 @@ object CameraStreamManager {
         }
     }
 }
+

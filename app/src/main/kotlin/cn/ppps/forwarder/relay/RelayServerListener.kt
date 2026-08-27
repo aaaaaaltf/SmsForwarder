@@ -15,7 +15,7 @@ import java.util.concurrent.atomic.AtomicLong
  *
  * 监听 0.0.0.0:56786，接受手机控制端直接 TCP 连接。
  * ★ 2026-08-05 多连接改造：acceptLoop 不再阻塞（原实现 receiveLoop 阻塞在 accept 循环内，
- *   单个控制端连接占住后，其他控制端（ZT/局域网）连接只完成 TCP 握手、永不 accept，命令无响应）。
+ *   单个控制端连接占住后，其他控制端（TS/局域网）连接只完成 TCP 握手、永不 accept，命令无响应）。
  *   现在每连接独立线程处理，命令响应按来源连接回发（sendTo），设备状态/视频帧单播给最新连接（send）。
  * 帧格式与 RelayServerClient 完全一致：
  *   [4字节大端长度][12字节命令][负载]

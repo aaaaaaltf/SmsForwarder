@@ -1,10 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+    远程触摸无障碍服务配置。
+    ★ 2026-08-27 省电：本服务只用于 dispatchGesture（模拟点击/滑动）与 performGlobalAction（锁屏），
+      代码从不读取窗口内容（onAccessibilityEvent 是空实现，全仓无 rootInActiveWindow / windows 引用），
+      因此去掉 canRetrieveWindowContent 与 flagRetrieveInteractiveWindows：
+      否则系统每次窗口状态变化都要为被控端构建并跨进程投递整棵窗口内容树——被控端是一台全天正常使用的手机，
+      窗口切换非常频繁，这部分开销完全是白跑的 CPU/IPC。
+    ★ 2026-08-27 省电：notificationTimeout 100ms → 1000ms。事件既然全部丢弃，100ms 的合并窗口只会把
+      同一批事件拆成更多次 IPC 回调；放宽到 1 秒可减少唤醒次数，对远程触摸无影响
+      （触摸指令走 Socket 命令通道，不经过无障碍事件）。
+-->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:accessibilityEventTypes="typeWindowStateChanged"
     android:accessibilityFeedbackType="feedbackGeneric"
-    android:accessibilityFlags="flagDefault|flagRetrieveInteractiveWindows"
+    android:accessibilityFlags="flagDefault"
     android:canPerformGestures="true"
-    android:canRetrieveWindowContent="true"
     android:description="@string/accessibility_touch_service_desc"
-    android:notificationTimeout="100"
+    android:notificationTimeout="1000"
     android:settingsActivity="" />
