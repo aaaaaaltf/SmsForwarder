@@ -112,6 +112,20 @@ object RelayServerHandler {
                     try {
                         try { webrtc?.close() } catch (_: Throwable) {}
                         webrtc = null
+                        // ★★★ 2026-08-28 省电：控制端已经不在了，就不要"回退到老模式"。
+                        //   回退的语义是"WebRTC 通道打不开，但控制端还在看"——此时才需要改用 JPEG+PCM 继续服务。
+                        //   实际线上最常见的 onError 是【控制端进程被杀/网络掉线】：ICE 在 45 秒宽容期后判 FAILED →
+                        //   onError → 老代码无条件重启摄像头(JPEG编码)+麦克风(AudioRecord)+PARTIAL_WAKE_LOCK，
+                        //   而 send() 是异步投递到 sendExecutor（不抛异常），采集循环因此永远不会自己结束，
+                        //   表现就是"没人看的时候摄像头/麦克风/CPU 编码器还在全速跑"，是被控端最贵的空转。
+                        //   这里先给 6 秒等命令通道恢复（正常网络抖动/重连窗口内即可救回，功能不受影响），
+                        //   仍不可用则说明对端确实走了：只清理，不再重启任何采集，释放相机/麦克风/WakeLock。
+                        if (!waitForConnection(fallbackSender, 6000L)) {
+                            Log.w(TAG, "★ WebRTC 回退取消：控制端命令通道已断开($reason)，只释放采集资源，不重启老模式推流")
+                            try { CameraStreamManager.stop() } catch (_: Throwable) {}
+                            try { MicrophoneStreamManager.stop() } catch (_: Throwable) {}
+                            return@Thread
+                        }
                         // —— 1) 老摄像头：JPEG推（纯音频模式跳过，不占用摄像头）
                         if (!webrtcIsAudioOnly) {
                             val okCam = CameraStreamManager.start(fallbackCamera)

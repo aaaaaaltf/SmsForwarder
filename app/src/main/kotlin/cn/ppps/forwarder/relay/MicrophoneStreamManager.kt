@@ -56,6 +56,29 @@ object MicrophoneStreamManager {
     /** 唤醒锁：防止关屏后 CPU 深度休眠中断麦克风采集 */
     private var wakeLock: PowerManager.WakeLock? = null
 
+    /**
+     * ★ 2026-08-28 省电：麦克风"无人接收"自动收尾（与 CameraStreamManager 同一策略）。
+     *   依据：麦克风推流由控制端命令开启、也只能靠控制端命令关闭。控制端进程被杀/网络掉线时
+     *   STOP 命令丢失，而本端 s.send(CMD_MIC_FRAME) 是【异步投递到 sendExecutor】——即使 socket 已失效
+     *   也不会向采集循环抛异常，于是采集循环里的 while (running) 永远不退：
+     *   AudioRecord 持续录音 + 每 40ms 一次线程唤醒 + PARTIAL_WAKE_LOCK 让 CPU 无法深睡，灭屏也不停，
+     *   这是被控端第二贵的空转（第一是同样没人看的摄像头）。
+     *   策略：看门狗每 IDLE_CHECK_INTERVAL_MS 查一次命令通道，连续 NO_CONSUMER_OFFLINE_ROUNDS 轮
+     *   （10s×6=60s）sender 都不可用 → 判定对端已走 → stop() 释放 AudioRecord 与 WakeLock。
+     *   控制端还连着就永远不会触发，"麦克风监听"功能不受影响；掉线后重新点一次即可恢复，
+     *   行为与手动开关完全一致。
+     */
+    private const val NO_CONSUMER_OFFLINE_ROUNDS = 6
+
+    /** 空闲看门狗轮询间隔（10 秒 × 6 轮 = 60 秒判定窗口） */
+    private const val IDLE_CHECK_INTERVAL_MS = 10000L
+
+    /** 已触发空闲停止标志，避免看门狗反复调用 stop() */
+    @Volatile
+    private var idleStopTriggered = false
+
+    private var idleWatchdog: Thread? = null
+
     fun lastError(): String = lastErrMsg ?: "未知错误"
 
     /** 是否正在采集推麦克风（供 RelayServerService 判断"会话进行中"，会话期间不降频） */
@@ -165,6 +188,54 @@ object MicrophoneStreamManager {
     }
 
     /**
+     * ★ 2026-08-28 省电：启动"无人收流"看门狗（详见 NO_CONSUMER_OFFLINE_ROUNDS 注释）。
+     *   只在命令通道确实不可用时收尾，任何还连着的控制端都会让计数归零，绝不切断正常会话。
+     *   stop() 不是 @Synchronized 的阻塞等待（stopInternal 不 join 采集线程），在本线程调用安全。
+     */
+    private fun startIdleWatchdog() {
+        // ★ 不复用旧线程：旧线程可能正处于"检测到 running=false 即将退出"的尾巴上，
+        //   复用会让本次新会话完全没有省电收尾。先收旧的再开新的，代价仅一个短生命周期线程。
+        stopIdleWatchdog()
+        idleStopTriggered = false
+        idleWatchdog = Thread({
+            var offlineRounds = 0
+            while (running && !idleStopTriggered) {
+                try {
+                    Thread.sleep(IDLE_CHECK_INTERVAL_MS)
+                } catch (_: InterruptedException) {
+                    break
+                }
+                if (!running || idleStopTriggered) break
+                val s = sender
+                if (s == null) break          // 已被 stopInternal 清理，无需再管
+                if (s.isConnected()) {
+                    offlineRounds = 0          // 控制端还在 → 继续全速采集
+                    continue
+                }
+                offlineRounds++
+                if (offlineRounds < NO_CONSUMER_OFFLINE_ROUNDS) continue
+                idleStopTriggered = true
+                Log.i(TAG, "★ 省电：麦克风命令通道连续 ${offlineRounds * IDLE_CHECK_INTERVAL_MS / 1000}s 不可用（控制端可能已掉线），自动停止采集并释放 WakeLock")
+                try {
+                    stop()
+                } catch (_: Throwable) {
+                }
+                break
+            }
+        }, "MicIdleWatchdog").apply { isDaemon = true }
+        idleWatchdog!!.start()
+    }
+
+    /** ★ 省电：会话结束时收掉空闲看门狗（避免残留线程下一轮误停新会话） */
+    private fun stopIdleWatchdog() {
+        try {
+            idleWatchdog?.interrupt()
+        } catch (_: Exception) {
+        }
+        idleWatchdog = null
+    }
+
+    /**
      * 启动麦克风采集推流（数据通道模式）
      *
      * @param s 命令通道发送器（用于发送CMD_MIC_DATA_READY通知）
@@ -211,6 +282,8 @@ object MicrophoneStreamManager {
             sender = s
             running = true
             acquireWakeLock()
+            // ★ 2026-08-28 省电：挂上"无人收流"看门狗（控制端掉线导致 STOP 丢失时自动释放麦克风与WakeLock）
+            startIdleWatchdog()
 
             // ★ 生成会话ID并连接数据通道
             val sessionId = "mic_${clientId}_${System.currentTimeMillis()}"
@@ -377,6 +450,8 @@ object MicrophoneStreamManager {
             sender = s
             running = true
             acquireWakeLock()
+            // ★ 2026-08-28 省电：挂上"无人收流"看门狗（控制端掉线导致 STOP 丢失时自动释放麦克风与WakeLock）
+            startIdleWatchdog()
 
             captureThread = Thread({ captureLoopCommandChannel() }, "MicCapture-CmdCh").apply { start() }
             return true
@@ -397,6 +472,8 @@ object MicrophoneStreamManager {
 
     private fun stopInternal() {
         running = false
+        // ★ 省电看门狗随会话一起收掉（无论正常停止还是空闲自停）
+        stopIdleWatchdog()
         try { captureThread?.interrupt() } catch (_: Exception) {}
         try { serverSocket?.close() } catch (_: Exception) {}
         serverSocket = null

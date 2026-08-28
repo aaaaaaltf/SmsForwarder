@@ -135,6 +135,24 @@ class WebRtcSessionManager(
     @Volatile private var iceFailedPendingRunnable: Runnable? = null
     private val ICE_FAILED_TOLERANCE_MS = 45000L
 
+    // ★★★ 2026-08-28 省电：对端存活看门狗（补上 WebRTC 唯一的"没人看却还在采集编码"的漏洞）。
+    //   【现状】本类的会话只由控制端的 CMD_WEBRTC_HANGUP 或 onError 关闭；而 onIceConnectionChange
+    //   对 DISCONNECTED 的处理是"仅上报状态、绝不主动关闭"（第 5 节注释，为避免网络抖动误杀）。
+    //   于是控制端进程被杀 / 直接锁屏后台冻结 / 断网时：被控端这一侧的 PeerConnection 仍然"活着"，
+    //   Camera2 采集 + SurfaceTexture/EGL + H264 硬编码 + AudioRecord 全部继续满载运行，
+    //   且 WebRTC 自己不会退——实测红米上单是 native 编码日志就几百行/秒，这是被控端最贵的持续耗电项。
+    //   【判据】用 libwebrtc 自带的"是否还在收到对端任何报文"信号 onIceConnectionReceivingChange：
+    //   只要对端在，RTCP(含 periodic PLI / RR) 会秒级持续进来，receiving 恒为 true；
+    //   对端消失后 libwebrtc 会在数十秒内把 receiving 置 false。
+    //   连续 PEER_GONE_MS（180 秒）没有任何入站报文 → 认定对端已走 → close()（与控制端主动挂断同一条路径）。
+    //   【为什么安全】会话必须曾经连过（everConnected）才启用；180 秒零入站远超任何正常抖动窗口；
+    //   close() 走的是 CMD_WEBRTC_HANGUP 用的同一个 closeInternal，不引入新的释放顺序。
+    @Volatile private var iceReceiving = false
+    @Volatile private var lastInboundActivityTime = 0L
+    private val PEER_GONE_MS = 180000L
+    private val LIVENESS_CHECK_INTERVAL_MS = 15000L
+    private var livenessWatchdog: Thread? = null
+
     /**
      * 收到控制端 OFFER：启动摄像头+麦克风 → 设置远端SDP → 生成ANSWER → 通过callback发回
      * @param cameraIndex 0=后, 1=前 (与原 CameraStreamManager 索引一致)
@@ -153,6 +171,10 @@ class WebRtcSessionManager(
         }
         running = true
         this.relayPreferred = relayPreferred
+        // ★ 2026-08-28 省电：启动"对端已走"存活看门狗（控制端掉线/被杀时自动释放摄像头+编码器+麦克风）
+        iceReceiving = false
+        lastInboundActivityTime = 0L
+        startLivenessWatchdog()
         Log.i(TAG, "$stepTag ★ 中继优先模式 relayPreferred=$relayPreferred（true=媒体走TURN中继转发 / false=TS直连兜底）")
         this.signalingCallback = cb
         this.currentCameraIndex = cameraIndex
@@ -399,6 +421,8 @@ class WebRtcSessionManager(
                     PeerConnection.IceConnectionState.CONNECTED,
                     PeerConnection.IceConnectionState.COMPLETED -> {
                         everConnected = true  // ★ 关键：一旦连通过，后续一切状态都给宽容窗口
+                        // ★ 2026-08-28 省电：刚连通即视为"有入站数据"，给存活看门狗一个起点
+                        lastInboundActivityTime = System.currentTimeMillis()
                         Log.i(TAG, "★ ICE到达CONNECTED/COMPLETED → 激活宽容策略(everConnected=true)")
                         cb.onStatus("connected", "ICE连接成功，音视频已开始传输")
                     }
@@ -440,7 +464,12 @@ class WebRtcSessionManager(
                     else -> {}
                 }
             }
-            override fun onIceConnectionReceivingChange(receiving: Boolean) {}
+            // ★ 2026-08-28 省电：入站数据有无 = 对端是否还在（详见 PEER_GONE_MS 注释）
+            override fun onIceConnectionReceivingChange(receiving: Boolean) {
+                iceReceiving = receiving
+                if (receiving) lastInboundActivityTime = System.currentTimeMillis()
+                Log.i(TAG, "onIceConnectionReceivingChange: $receiving")
+            }
             override fun onIceGatheringChange(state: PeerConnection.IceGatheringState?) {
                 Log.i(TAG, "onIceGatheringChange: $state")
                 if (state == PeerConnection.IceGatheringState.COMPLETE) {
@@ -779,6 +808,52 @@ class WebRtcSessionManager(
         }
     }
 
+    /**
+     * ★ 2026-08-28 省电：对端存活看门狗。见 PEER_GONE_MS 处的说明。
+     *   线程独立于 WebRTC 捕获线程，调用 close() 不会触发 2026-08-14 修过的"捕获线程自等死锁"。
+     */
+    private fun startLivenessWatchdog() {
+        stopLivenessWatchdog()
+        livenessWatchdog = Thread({
+            while (running) {
+                try {
+                    Thread.sleep(LIVENESS_CHECK_INTERVAL_MS)
+                } catch (_: InterruptedException) {
+                    break
+                }
+                if (!running) break
+                // 还没连通过：交给 ICE 的 30/45 秒宽容逻辑处理，这里不插手
+                if (!everConnected) {
+                    lastInboundActivityTime = System.currentTimeMillis()
+                    continue
+                }
+                if (iceReceiving) {
+                    lastInboundActivityTime = System.currentTimeMillis()
+                    continue
+                }
+                val since = System.currentTimeMillis() - lastInboundActivityTime
+                if (since < PEER_GONE_MS) continue
+                Log.w(TAG, "$TAG ★ 省电：已连续 ${since / 1000}s 收不到对端任何报文（控制端可能已退出/被杀），关闭 WebRTC 会话释放摄像头+编码器+麦克风")
+                try {
+                    close()
+                } catch (t: Throwable) {
+                    Log.w(TAG, "$TAG 存活看门狗关闭会话异常: ${t.message}")
+                }
+                break
+            }
+        }, "WebRtcLiveness").apply { isDaemon = true }
+        livenessWatchdog!!.start()
+    }
+
+    /** ★ 省电：随会话结束收掉看门狗线程 */
+    private fun stopLivenessWatchdog() {
+        try {
+            livenessWatchdog?.interrupt()
+        } catch (_: Throwable) {
+        }
+        livenessWatchdog = null
+    }
+
     /** ★★★ 2026-08-14 启动周期关键帧线程：每2秒对videoTrack做setEnabled(false→true)抖动，
      *  强制VideoStreamEncoder重新输出关键帧。解决"只传一帧"——华为EMUI传感器时间戳异常导致
      *  控制端P帧解码全部失败且无PLI恢复时，周期性关键帧保证画面2秒内恢复。 */
@@ -820,6 +895,10 @@ class WebRtcSessionManager(
         running = false
         // ★★★ 2026-08-14 停止周期关键帧线程
         try { keyFrameTimer?.interrupt() } catch (_: Throwable) {}
+        // ★ 2026-08-28 省电：会话结束一并收掉对端存活看门狗（防止残留线程误关下一个会话）
+        stopLivenessWatchdog()
+        iceReceiving = false
+        lastInboundActivityTime = 0L
         keyFrameTimer = null
         videoTrackRef = null
         try { videoCapturer?.stopCapture() } catch (_: Throwable) {}

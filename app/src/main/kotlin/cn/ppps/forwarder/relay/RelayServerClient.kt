@@ -39,9 +39,43 @@ class RelayServerClient(
     private val onConnected: () -> Unit,
     private val onDisconnected: () -> Unit,
     private val onCommand: (cmd: String, payload: ByteArray) -> Unit,
+    /**
+     * ★ 2026-08-28 省电：是否处于"有人在用"状态（亮屏或有控制端连接/推流中）。
+     *   仅用于决定【中继连不上时的重连间隔】，不影响任何已建立连接的收发。
+     *   默认恒为 true → 未接入该判据时与改造前完全一致（固定 5 秒重连）。
+     */
+    private val isBusy: () -> Boolean = { true },
 ) : RelaySender {
     private val TAG = "RelayServerClient"
     private val sendLock = Any()
+
+    /** ★ 省电：忙时（亮屏/有人在用）重连间隔，与改造前一致 */
+    private val reconnectBusyMs = 5000L
+
+    /** ★ 省电：待机（灭屏且无控制端连接）重连起始间隔 */
+    private val reconnectIdleBaseMs = 5000L
+
+    /** ★ 省电：待机重连间隔上限（指数退避到此封顶：5s→10s→20s） */
+    private val reconnectIdleMaxMs = 20000L
+
+    /**
+     * 连续失败次数 → 下一次重连等待时间。
+     * 省电依据：中继域名不可达时（直连模式/断网/中继服务下线），旧实现每 5 秒无条件发起一次
+     * TCP connect（8 秒连接超时），等于每小时 720 次把 Wi-Fi/移动射频从低功耗里拉出来，
+     * 是被控端待机时最主要的持续唤醒源之一（RelayServerClient.connectLoop:113）。
+     * 灭屏无人时退避到 20 秒（唤醒量降到 1/4），亮屏或有人在用立即回到 5 秒原节奏。
+     */
+    private fun nextRetryDelayMs(failures: Int): Long {
+        val busy = try { isBusy() } catch (_: Throwable) { true }
+        if (busy) return reconnectBusyMs
+        var delay = reconnectIdleBaseMs
+        var i = 1
+        while (i < failures && delay < reconnectIdleMaxMs) {
+            delay *= 2
+            i++
+        }
+        return minOf(delay, reconnectIdleMaxMs)
+    }
 
     /** ★ 下载/普通数据发送线程池（单线程保证顺序） */
     private val sendExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
@@ -87,6 +121,8 @@ class RelayServerClient(
     }
 
     private fun connectLoop() {
+        // ★ 2026-08-28 省电：连续失败计数（用于退避 + 日志节流），成功连接后归零
+        var consecutiveFailures = 0
         while (running) {
             try {
                 val s = Socket()
@@ -100,17 +136,24 @@ class RelayServerClient(
                     return
                 }
                 socket = s
+                consecutiveFailures = 0
                 Log.i(TAG, "已连接中继服务 $host:$port")
                 onConnected()
                 receiveLoop(s)
             } catch (e: Exception) {
-                if (running) Log.w(TAG, "连接中继失败: ${e.message}")
+                consecutiveFailures++
+                // ★ 省电：连不上时旧实现每 5 秒写一条 WARN（且本项目的 Log 会落盘写文件），
+                //   中继长期不可达时等于每天数万条磁盘写入。改为首次与每 4 次打印，间隔越长打印越少，
+                //   排障信息仍在（首条完整保留）。
+                if (running && (consecutiveFailures == 1 || consecutiveFailures % 4 == 0)) {
+                    Log.w(TAG, "连接中继失败(第${consecutiveFailures}次): ${e.message}")
+                }
             }
             socket = null
             if (running) onDisconnected()
             if (running) {
                 try {
-                    Thread.sleep(5000)
+                    Thread.sleep(nextRetryDelayMs(consecutiveFailures))
                 } catch (_: InterruptedException) {
                 }
             }

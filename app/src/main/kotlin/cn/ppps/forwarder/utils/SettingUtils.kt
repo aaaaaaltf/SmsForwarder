@@ -25,6 +25,9 @@ class SettingUtils private constructor() {
         //★★★ 2026-08-15 华为/荣耀"应用启动管理（允许后台活动）"引导已提示过（持久化，只提示一次）
         var huaweiKeepaliveGuided: Boolean by SharedPreference(SP_HUAWEI_KEEPALIVE_GUIDED, false)
 
+        //★★★ 2026-08-28 权限与保活自检：OEM（MIUI/EMUI 等）自启动/后台活动引导已提示过（持久化，只引导一次）
+        var oemAutostartGuided: Boolean by SharedPreference(SP_OEM_AUTOSTART_GUIDED, false)
+
         //是否转发短信
         var enableSms: Boolean by SharedPreference(SP_ENABLE_SMS, false)
 

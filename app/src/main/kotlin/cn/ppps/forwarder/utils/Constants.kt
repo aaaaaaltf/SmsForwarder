@@ -36,6 +36,8 @@ const val SP_AUTO_AUTHORIZE_DONE = "sp_auto_authorize_done"
 const val SP_BATTERY_AUTH_GUIDED = "sp_battery_auth_guided"
 // ★★★ 2026-08-15 华为/荣耀"应用启动管理（允许后台活动）"引导已提示过（持久化，只提示一次）
 const val SP_HUAWEI_KEEPALIVE_GUIDED = "sp_huawei_keepalive_guided"
+// ★★★ 2026-08-28 权限与保活自检：OEM（MIUI/EMUI 等）自启动/后台活动引导已提示过（持久化，只引导一次）
+const val SP_OEM_AUTOSTART_GUIDED = "sp_oem_autostart_guided"
 
 //数据库
 const val DATABASE_NAME = "sms_forwarder.db"

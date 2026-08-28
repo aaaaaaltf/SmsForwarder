@@ -51,10 +51,56 @@ object TailscaleManager {
      */
     private val NEEDS_LOGIN_STATES = setOf("NeedsLogin", "NoState", "InUseOtherUser")
 
+    /**
+     * ★ 2026-08-28 节点泄漏修复的安全网开关（见 oauthCreateAuthKey / startLogin）。
+     *
+     * 根治手段是【复用已持久化的节点身份】（startLogin 里的 hasRegisteredIdentity() 判断），
+     * 实测同一 App 连续冷启动 3 次 NodeID/sha1 完全不变、尾网计数不增。
+     * 此开关只在"身份确实丢了"的兜底注册路径上生效：若 statestore 因清除数据/备份恢复/存储损坏
+     * 而丢失，下一次登录会注册一个新节点；
+     *   ephemeral=false → 该孤儿节点会永久留在尾网里（就是本次要修的泄漏形态）；
+     *   ephemeral=true  → 该节点在本机重新注册并顶替它之后，会被 tailnet 自动回收。
+     *
+     * 【改 true 之前必须先只读确认】tailnet 开了自动授权，否则新节点会停在未授权状态、
+     *   直连全断。当前实测：全部现有节点 authorized=True（含全部 tag:remote-device 节点），
+     *   即自动授权已开启，所以这个开关可以安全切换。
+     * 默认保持 false：与既有部署行为一致，且此时清理仍由 purgeStaleDevicesSync() 负责。
+     */
+    private const val AUTHKEY_EPHEMERAL = false
+
     /** ★ VPN 关闭专用后台线程：serviceDisconnect 绝不能在 Go 回调线程或主线程上执行 */
     private val vpnCloseHandler: android.os.Handler by lazy {
         android.os.Handler(android.os.HandlerThread("TsVpnClose").apply { start() }.looper)
     }
+
+    /**
+     * ★ 2026-08-28 省电：由 RelayServerService 注入的"当前是否有人在用"判据
+     *   （亮屏 / 有控制端连接 / 有媒体流在推）。未注入（null）时一律按"忙"处理，
+     *   即保持改造前的固定 10 秒巡检节奏，绝不因为省电判断不可用而降低直连可靠性。
+     */
+    @Volatile
+    var busyProvider: (() -> Boolean)? = null
+
+    /** 忙时 VPN 看门狗巡检间隔（与改造前一致） */
+    private const val VPN_WATCHDOG_BUSY_MS = 10000L
+
+    /**
+     * ★ 省电：待机（灭屏且无任何控制端连接/推流）且 VPN 通道【已正常建立】时的巡检间隔。
+     *   依据：旧实现无论 VPN 是否正常，看门狗都固定每 10 秒醒一次，而在隧道健康时这一轮
+     *   除了 isRelayConnected()/vpnEstablished 两次判断外什么都不做——纯粹的无效唤醒
+     *   （8640 次/天）。隧道在跑时 Go 侧自己会维持 keepalive 与重连，把空闲巡检放宽到 30 秒，
+     *   最坏只是"被 ROM 杀掉的 VPN 晚 20 秒被发现"，而有人亮屏操作时立刻回到 10 秒。
+     */
+    private const val VPN_WATCHDOG_IDLE_MS = 30000L
+
+    /**
+     * ★ 省电：VPN【拉不起来】时的递增退避上限。
+     *   依据：隧道未建立时看门狗每 10 秒会 startVpnService() 一次（VpnService.prepare binder 查询
+     *   + startForegroundService + Go 侧 builder.establish 全量重配）。若本机因授权被 ROM 冻结、
+     *   Go 后端异常等原因一直建立不起来，旧实现就是每 10 秒一次"全量重建 VPN"的死循环，
+     *   既费电又会把正在变慢的首次建立打断。改为 10s→20s→40s→60s 封顶，一旦建立成功立即复位。
+     */
+    private const val VPN_WATCHDOG_MAX_MS = 60000L
 
     @Volatile
     private var app: Application? = null
@@ -99,7 +145,8 @@ object TailscaleManager {
         }
         try {
             val tagsArr = org.json.JSONArray().put(OAUTH_DEVICE_TAG)
-            val createObj = JSONObject().put("reusable", true).put("ephemeral", false).put("tags", tagsArr)
+            val createObj = JSONObject().put("reusable", true)
+                .put("ephemeral", AUTHKEY_EPHEMERAL).put("tags", tagsArr)
             val devicesObj = JSONObject().put("create", createObj)
             val capsObj = JSONObject().put("devices", devicesObj)
             val body = JSONObject().put("capabilities", capsObj)
@@ -399,18 +446,42 @@ object TailscaleManager {
     @Volatile
     private var vpnWatchdogRunning = false
 
+    /**
+     * ★ 省电：看门狗当前是否"有人在用"。busyProvider 未注入（或异常）时按忙处理，
+     *   宁可不省电也不能让直连恢复变慢。
+     */
+    private fun isBusyNow(): Boolean {
+        val p = busyProvider ?: return true
+        return try {
+            p()
+        } catch (_: Throwable) {
+            true
+        }
+    }
+
     fun startVpnWatchdog(ctx: Context) {
         if (vpnWatchdogRunning) return
         vpnWatchdogRunning = true
         Thread({
             try {
+                // ★ 连续"拉起 VPN 但仍未建立"的轮数，用于递增退避（建立成功即归零）
+                var downRounds = 0
                 while (vpnWatchdogRunning) {
-                    Thread.sleep(10000)
+                    // ★ 2026-08-28 省电：间隔按"忙/闲 + 隧道状态"自适应，详见 VPN_WATCHDOG_* 常量注释
+                    val up = TailscaleVpnService.vpnEstablished
+                    val sleepMs = if (up) {
+                        downRounds = 0
+                        if (isBusyNow()) VPN_WATCHDOG_BUSY_MS else VPN_WATCHDOG_IDLE_MS
+                    } else {
+                        minOf(VPN_WATCHDOG_BUSY_MS shl downRounds.coerceAtMost(3), VPN_WATCHDOG_MAX_MS)
+                    }
+                    Thread.sleep(sleepMs)
                     if (!vpnWatchdogRunning) break
                     if (isRelayConnected()) break                // 中继模式无需VPN
                     if (TailscaleVpnService.vpnEstablished) continue  // VPN在，保持
                     if (!isVpnAuthorized(ctx)) break             // 未授权，等界面授权后由ensureVpnUp重启
-                    Log.i(TAG, "★ VPN看门狗：检测到VPN未建立，重新启动")
+                    Log.i(TAG, "★ VPN看门狗：检测到VPN未建立，重新启动（第${downRounds + 1}轮，下轮间隔${minOf(VPN_WATCHDOG_BUSY_MS shl (downRounds + 1).coerceAtMost(3), VPN_WATCHDOG_MAX_MS) / 1000}s）")
+                    downRounds++
                     startVpnService(ctx)
                 }
             } catch (t: Throwable) {

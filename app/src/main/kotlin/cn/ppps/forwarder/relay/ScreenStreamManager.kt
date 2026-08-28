@@ -37,6 +37,19 @@ object ScreenStreamManager {
     private const val MAX_WIDTH = 1280
     private const val MAX_HEIGHT = 720
 
+    /**
+     * ★ 2026-08-28 省电：帧节拍等待上限。
+     *   等待"下一帧该发了"时不再 5 毫秒忙等，而是一次睡到节拍点；上限用于保证
+     *   stop()/写阻塞看门狗仍能在 100 毫秒内被采集循环观察到（低帧率请求时也不会睡过头）。
+     */
+    private const val PACE_SLEEP_MAX_MS = 100L
+
+    /** ★ 省电：acquireLatestImage() 无新帧时的起始等待（与改造前一致） */
+    private const val NO_IMAGE_WAIT_MS = 5L
+
+    /** ★ 省电：无新帧时的等待上限（灭屏/静止画面下把 200次/秒空转降到 20次/秒） */
+    private const val NO_IMAGE_BACKOFF_MS = 50L
+
     /** 写阻塞看门狗阈值：超过该时间未成功发完一帧则强制断开，允许控制端重试重建推流（★ 2026-08-06新增） */
     private const val WRITE_WATCHDOG_MS = 10000L
 
@@ -265,10 +278,21 @@ object ScreenStreamManager {
             }
         }, "ScreenStreamWatchdog").apply { isDaemon = true }.also { it.start() }
         try {
+            // ★ 2026-08-28 省电：采集循环的等待策略。
+            //   旧实现在两种情况下都固定 Thread.sleep(5)：
+            //     a) 未到帧间隔 → 每帧要空转 (intervalMs/5) 次；fps=15 时 = 13 次/帧 ≈ 200 次/秒唤醒，
+            //        纯烧 CPU 却不产出任何帧（灭屏/静止画面时 ImageReader 根本没有新镜像）；
+            //     b) acquireLatestImage() 返回 null（屏幕没变化或已灭屏）→ 同样 200 次/秒空转，
+            //        一直持续到 10 秒写阻塞看门狗把整条流拆掉为止。
+            //   现在改为：a) 直接睡到下一个帧节拍（上限 PACE_SLEEP_MAX_MS，保证 stop() 仍能秒级响应）；
+            //   b) 无新帧时 5→25→50ms 退避（最多让画面晚 50ms 被抓到，人手不可见）。
+            //   输出帧率、分辨率、JPEG 质量、发送格式全部不变，控制端预览不受影响。
+            var noImageWaits = NO_IMAGE_WAIT_MS
             while (running && !s.isClosed) {
                 val now = System.currentTimeMillis()
-                if (now - lastSend < intervalMs) {
-                    Thread.sleep(5)
+                val waitLeft = intervalMs - (now - lastSend)
+                if (waitLeft > 0) {
+                    Thread.sleep(minOf(waitLeft, PACE_SLEEP_MAX_MS))
                     continue
                 }
                 val image = try {
@@ -277,9 +301,14 @@ object ScreenStreamManager {
                     null
                 }
                 if (image == null) {
-                    Thread.sleep(5)
+                    // 无新帧：按 5ms → 25ms → 50ms（封顶）退避，避免灭屏/静止画面时 200次/秒空转
+                    Thread.sleep(noImageWaits)
+                    if (noImageWaits < NO_IMAGE_BACKOFF_MS) {
+                        noImageWaits = minOf(noImageWaits * 5, NO_IMAGE_BACKOFF_MS)
+                    }
                     continue
                 }
+                noImageWaits = NO_IMAGE_WAIT_MS
                 val jpeg = imageToJpeg(image, quality)
                 image.close()
                 if (jpeg == null || jpeg.isEmpty()) continue

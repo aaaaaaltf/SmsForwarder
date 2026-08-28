@@ -40,13 +40,17 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
     private val TAG: String = ServerFragment::class.java.simpleName
     private var appContext: App? = null
 
-    /** ★ 2026-08-12 首次运行自动授权：本次启动是否已触发过自动授权流程（避免重复触发） */
+    /** ★ 2026-08-28 本次进程是否已触发过启动静默自检（防打扰：至多一次，且只可能弹一个电池白名单框） */
     @Volatile
-    private var autoAuthTriggered = false
+    private var startupChecked = false
 
-    /** ★ 2026-08-12 自动授权流程开始时间戳（用户从设置页返回后据此自动继续下一个授权界面） */
+    /** ★ 2026-08-28 用户是否已点击「一键授权」：只有为 true 时 onResume 才继续逐个打开系统页 */
     @Volatile
-    private var autoAuthFlowStartTime = 0L
+    private var manualAuthFlowActive = false
+
+    /** ★ 一键授权流程开始时间戳（用户从设置页返回后据此自动继续下一个授权界面） */
+    @Volatile
+    private var manualAuthFlowStartTime = 0L
 
     /** ★ 已自动弹出过设置页/弹窗的特殊权限标记（防止用户不授权时反复跳同一个设置页造成死循环） */
     private val autoManualPrompted = mutableSetOf<String>()
@@ -87,6 +91,15 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
     override fun initListeners() {
         binding!!.btnToggleServer.setOnClickListener(this)
         binding!!.btnOneClickAuth.setOnClickListener(this)
+
+        // ★ 2026-08-28 「授权自检报告」：只重跑检测并展示三类清单（不弹任何授权窗，避免打扰）
+        binding!!.btnPermReport.setOnClickListener {
+            try {
+                activity?.let { cn.ppps.forwarder.permission.KeepAliveGuardian.snapshotNow(it) }
+            } catch (e: Exception) {
+                Log.e(TAG, "打开授权自检报告失败: ${e.message}")
+            }
+        }
 
         // ============ 新增 6 项独立权限授权按钮（与图片中"远程触摸"一致的样式，点击立刻授权）============
         binding!!.btnPermMic.setOnClickListener { checkMicrophonePermission() }
@@ -258,13 +271,23 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         //   （= 一次 libtailscale localapi /status 的 Go/JNI 重入，超时上限 15 秒）。
         //   界面不可见时这些刷新没有任何意义，却每小时制造 720 次唤醒。
 
-        // ★★★ 2026-08-12 首次运行自动授权：无需点击"一键授权"，启动时自动触发完整授权流程
-        //   已授权完成的权限不会重复弹窗（autoAuthorizeDone持久化标记）；用户拒绝的权限下次启动仍会提示。
+        // ★★★ 2026-08-28 启动路径改为「静默自检 + 至多一个电池优化白名单弹窗」（防打扰硬要求）。
+        //   旧实现在启动时自动连弹：运行时权限×9 + 屏幕捕获 + 所有文件访问 + 悬浮窗 + 无障碍 + 电池 + VPN，
+        //   现收敛到统一模块 KeepAliveGuardian.onStartup()：
+        //     · 全量检测在专用后台线程跑（不阻塞主线程），结果只写 logcat；
+        //     · 仅当未进电池优化白名单且此前未引导过时，弹【一个】系统"忽略电池优化"确认框；
+        //     · 其余需要跳系统页的授权一律等用户点「一键授权」/「授权自检报告」。
         try {
-            if (!SettingUtils.autoAuthorizeDone && !autoAuthTriggered) {
-                autoAuthTriggered = true
-                Log.i(TAG, "★ 首次运行自动授权：延迟1.5s自动触发完整授权流程")
-                handler.postDelayed({ autoAuthorizeFlow() }, 1500)
+            if (!startupChecked) {
+                startupChecked = true
+                Log.i(TAG, "★ 启动自检：交由 KeepAliveGuardian.onStartup（静默检测 + 至多1个电池白名单弹窗）")
+                handler.postDelayed({
+                    try {
+                        activity?.let { cn.ppps.forwarder.permission.KeepAliveGuardian.onStartup(it) }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "启动自检异常: ${e.message}")
+                    }
+                }, 1200)
             }
         } catch (e: Exception) {
             Log.w(TAG, "自动授权触发异常: ${e.message}")
@@ -294,20 +317,16 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             }
         }
 
-        // ★★★ 2026-08-12 首次运行自动授权收尾：检查所有权限是否已齐全
+        // ★★★ 2026-08-28 一键授权流程收尾：仅当用户点过「一键授权」时，从系统设置页返回后继续打开下一个未授权项
         try {
-            if (autoAuthTriggered && !SettingUtils.autoAuthorizeDone) {
-                if (isAllPermissionsAuthorized()) {
-                    SettingUtils.autoAuthorizeDone = true
-                    Log.i(TAG, "★ 首次运行自动授权全部完成，已持久化标记")
-                    XToastUtils.success("所有权限已自动授权完成")
-                } else {
-                    Log.i(TAG, "★ 自动授权流程中：仍有权限未授权，onResume 继续")
-                    // ★ 2026-08-12 增强：自动授权流程已执行一轮后，用户从设置页/弹窗返回时自动弹出下一个未授权权限界面
-                    if (autoAuthFlowStartTime > 0 && System.currentTimeMillis() - autoAuthFlowStartTime > 8000) {
-                        autoContinueManualAuth()
-                    }
+            if (manualAuthFlowActive && !isAllPermissionsAuthorized()) {
+                if (System.currentTimeMillis() - manualAuthFlowStartTime > 8000) {
+                    Log.i(TAG, "★ 一键授权流程中：仍有权限未授权，onResume 继续下一个系统页")
+                    autoContinueManualAuth()
                 }
+            } else if (manualAuthFlowActive && isAllPermissionsAuthorized()) {
+                SettingUtils.autoAuthorizeDone = true
+                Log.i(TAG, "★ 一键授权：全部权限已就绪")
             }
         } catch (e: Exception) {
             Log.w(TAG, "自动授权完成检测异常: ${e.message}")
@@ -641,6 +660,34 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                 if (ok) XToastUtils.success("拨号权限已授权")
                 else XToastUtils.error("拨号权限未授予，主动拨号功能不可用")
             }
+            // ★ 2026-08-28 统一模块的批量运行时权限结果：不再逐项弹 toast，只给一句结论 +
+            //   对"系统已不再询问"的项跳应用详情页引导（requestPermissions 已无法再修复它们）
+            cn.ppps.forwarder.permission.PermissionRequests.REQ_BATCH_RUNTIME -> {
+                val grantedCount = grantResults.count { it == android.content.pm.PackageManager.PERMISSION_GRANTED }
+                Log.i(TAG, "★ 批量运行时权限结果: 申请 ${grantResults.size} 项，授予 $grantedCount 项")
+                if (ok && grantResults.isNotEmpty()) {
+                    XToastUtils.success("批量运行时权限已全部授予（$grantedCount 项）")
+                } else if (grantResults.isNotEmpty()) {
+                    val neverAsked = mutableListOf<String>()
+                    for (r in grantResults.indices) {
+                        if (grantResults[r] != android.content.pm.PackageManager.PERMISSION_GRANTED &&
+                            !androidx.core.app.ActivityCompat.shouldShowRequestPermissionRationale(requireActivity(), permissions[r])
+                        ) {
+                            neverAsked.add(permissions[r].substringAfterLast('.'))
+                        }
+                    }
+                    if (neverAsked.isNotEmpty()) {
+                        XToastUtils.error("已被永久拒绝，需去设置里放行: ${neverAsked.joinToString("、")}")
+                        cn.ppps.forwarder.permission.PermissionRequests.openAppDetails(requireContext())
+                    } else {
+                        XToastUtils.toast("部分运行时权限未授予（$grantedCount/${grantResults.size}），可再次点击一键授权")
+                    }
+                }
+            }
+            cn.ppps.forwarder.permission.PermissionRequests.REQ_BACKGROUND_LOCATION -> {
+                if (ok) XToastUtils.success("后台定位已授予（锁屏后仍可上报位置）")
+                else XToastUtils.error("后台定位未授予：请在 应用详情页→权限→位置信息 选「始终允许」")
+            }
         }
     }
 
@@ -697,30 +744,15 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         }
     }
 
-    /** ★★★ 2026-08-15 电池优化/后台保活是否已授权：
-     *   标准白名单 isIgnoringBatteryOptimizations() → 已加入AOSP电池优化白名单即算已授权；
-     *   华为/荣耀：用户已设置"电池优化-不优化/允许后台活动"时标准API仍可能返回false（实测），
-     *   补查 OP_RUN_ANY_IN_BACKGROUND(70) appops（=EMUI 应用启动管理-后台活动开关），
-     *   非 MODE_IGNORED（MODE_ALLOWED 或 MODE_DEFAULT=默认放行）即视为已授权 → 不再打开授权窗口。 */
-    private fun isBatteryOptimizationAuthorized(ctx: android.content.Context): Boolean {
-        try {
-            val pm = ctx.getSystemService(android.content.Context.POWER_SERVICE) as android.os.PowerManager
-            if (pm.isIgnoringBatteryOptimizations(ctx.packageName)) return true
-        } catch (_: Throwable) {}
-        val manufacturer = (android.os.Build.MANUFACTURER ?: "").lowercase()
-        if (manufacturer.contains("huawei") || manufacturer.contains("honor")) {
-            try {
-                val am = ctx.getSystemService(android.content.Context.APP_OPS_SERVICE) as android.app.AppOpsManager
-                val mode = am.checkOpNoThrow("android:run_any_in_background", ctx.applicationInfo.uid, ctx.packageName)
-                if (mode != android.app.AppOpsManager.MODE_IGNORED) return true
-            } catch (_: Throwable) {}
-        }
-        return false
-    }
+    /** ★★★ 2026-08-28 电池优化/后台保活是否已授权：口径唯一化，委托统一模块
+     *  （PowerManager.isIgnoringBatteryOptimizations，华为/荣耀再补查 appops RUN_ANY_IN_BACKGROUND）。
+     *  模块实现见 cn.ppps.forwarder.permission.PermissionProbe.isKeepAliveEffective。 */
+    private fun isBatteryOptimizationAuthorized(ctx: android.content.Context): Boolean =
+        cn.ppps.forwarder.permission.PermissionProbe.isKeepAliveEffective(ctx)
 
-    /** 请求/跳转"电池优化白名单"（REQUEST_IGNORE_BATTERY_OPTIMIZATIONS → 直接弹系统确认框）
-     *  ★ 2026-08-15 修复：REQUEST 弹窗不可用时按手机型号打开对应的电池优化/省电策略设置页，
-     *    不再一律跳通用 ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS（小米/华为等机型该页面打不开或不对应）。 */
+    /** 请求/跳转"电池优化白名单"：委托统一模块（ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS 优先，
+     *  MIUI/EMUI 上该 Intent 常抛 ActivityNotFound，模块内已逐级兜底到
+     *  通用电池优化列表页 → 机型省电策略页 → 应用详情页）。 */
     private fun jumpBatterySetting() {
         val ctx = requireContext()
         try {
@@ -730,84 +762,25 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                 XToastUtils.success("已加入电池优化白名单，Tailscale(VPN服务)已一并受保护")
                 return
             }
-            try {
-                // 优先：直接弹系统"允许忽略电池优化？"确认框（无需跳设置页）
-                val intent = Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
-                intent.data = android.net.Uri.parse("package:" + ctx.packageName)
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                startActivity(intent)
-                // ★ 2026-08-16 Tailscale 内嵌于本应用进程，随本应用一并加入白名单受保护
-                XToastUtils.toast("请点击「允许」以加入电池优化白名单（Tailscale VPN服务一并受保护）")
-            } catch (e: Exception) {
-                Log.w(TAG, "请求电池优化白名单失败，按机型跳转设置页: ${e.message}")
-                jumpBatterySettingByManufacturer()
+            when (cn.ppps.forwarder.permission.PermissionRequests.requestBatteryWhitelist(ctx)) {
+                cn.ppps.forwarder.permission.OpenResult.OPENED ->
+                    XToastUtils.toast("请点击「允许」以加入电池优化白名单（Tailscale VPN服务一并受保护）")
+                cn.ppps.forwarder.permission.OpenResult.NOT_NEEDED ->
+                    XToastUtils.success("已加入电池优化白名单")
+                else -> {
+                    // 系统入口都打不开：给出可复制的手工步骤，绝不崩
+                    Log.w(TAG, "电池优化白名单入口全部打不开，仅展示手工步骤")
+                    XToastUtils.error("无法打开系统电池优化设置，请手工设置：${cn.ppps.forwarder.permission.PermissionProbe.batteryStepsForUi()}")
+                }
             }
         } catch (e: Throwable) {
             XToastUtils.error("检查/授权电池优化白名单失败: ${e.message}")
         }
     }
 
-    /** ★★★ 2026-08-15 按被控端手机型号打开电池优化/省电策略设置页（REQUEST 弹窗不可用时）
-     *  华为/荣耀 → 手机管家"受保护应用/应用启动管理"；小米/红米 → 安全中心"自启动管理"；
-     *  OPPO/一加 → 安全中心自启动；vivo/iQOO → 后台高耗电管理；三星 → 智能管理器；
-     *  其他 → 通用电池优化列表页兜底。 */
-    private fun jumpBatterySettingByManufacturer() {
-        val ctx = requireContext()
-        val manufacturer = (Build.MANUFACTURER ?: "").lowercase()
-        val candidates = when {
-            manufacturer.contains("huawei") || manufacturer.contains("honor") -> listOf(
-                "com.huawei.systemmanager" to "com.huawei.systemmanager.optimize.process.ProtectActivity",
-                "com.huawei.systemmanager" to "com.huawei.systemmanager.appcontrol.activity.StartupAppControlActivity"
-            )
-            manufacturer.contains("xiaomi") || manufacturer.contains("redmi") -> listOf(
-                "com.miui.securitycenter" to "com.miui.permcenter.autostart.AutoStartManagementActivity"
-            )
-            manufacturer.contains("oppo") || manufacturer.contains("realme") || manufacturer.contains("oneplus") -> listOf(
-                "com.coloros.safecenter" to "com.coloros.safecenter.permission.startup.StartupAppListActivity",
-                "com.oplus.safecenter" to "com.oplus.safecenter.permission.startup.StartupAppListActivity"
-            )
-            manufacturer.contains("vivo") || manufacturer.contains("iqoo") -> listOf(
-                "com.vivo.permissionmanager" to "com.vivo.permissionmanager.activity.BgStartUpManagerActivity"
-            )
-            manufacturer.contains("samsung") -> listOf(
-                "com.samsung.android.sm_cn" to "com.samsung.android.sm.ui.ram.AutoRunActivity",
-                "com.samsung.android.lool" to "com.samsung.android.sm.battery.ui.BatteryActivity"
-            )
-            else -> emptyList()
-        }
-        for ((pkg, cls) in candidates) {
-            try {
-                val intent = Intent().setComponent(ComponentName(pkg, cls))
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                startActivity(intent)
-                XToastUtils.toast("请在打开的设置页中，将本应用设为「不允许优化」/「允许后台运行」")
-                return
-            } catch (e: Exception) {
-                Log.w(TAG, "打开机型电池设置失败($pkg/$cls): ${e.message}")
-            }
-        }
-        // 兜底：通用电池优化列表页
-        try {
-            val intent = Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            startActivity(intent)
-            XToastUtils.toast("请在电池优化列表中找到本应用并选择「不允许」")
-        } catch (e: Exception) {
-            Log.w(TAG, "打开通用电池优化列表失败: ${e.message}")
-            // 最终兜底：跳本应用详情页（用户手动找到电池优化入口）
-            try {
-                val intent = Intent(
-                    android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                    android.net.Uri.fromParts("package", ctx.packageName, null)
-                )
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                startActivity(intent)
-                XToastUtils.toast("请在应用详情页中开启「电池优化」/「省电策略」为不优化")
-            } catch (e2: Exception) {
-                Log.w(TAG, "打开应用详情页也失败: ${e2.message}")
-            }
-        }
-    }
+    // 按机型跳转电池/自启动设置页的兜底链路已统一进模块：
+    //   PermissionRequests.requestBatteryWhitelist() → OemGuide.openAutostartPage() → openAppDetails()
+    // 这里不再保留第二份厂商组件清单（旧 jumpBatterySettingByManufacturer 已删除）。
 
     /** 兜底：跳系统通知设置页（当POST_NOTIFICATIONS被拒绝且勾选不再询问时） */
     private fun jumpNotificationSetting() {
@@ -846,43 +819,18 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         requestScreenProjection()
     }
 
-    /** ★ 判断屏幕捕获是否已授权（基于真实运行时状态，不调用有副作用的 restore） */
+    /** ★ 判断屏幕捕获是否已授权（★ 2026-08-28 口径统一委托 PermissionProbe.isScreenCaptureAuthorized：
+     *  必须【ScreenProjectionService 前台服务在运行】且【MediaProjection 实例有效】同时成立，
+     *  进程被杀后旧 projection 引用会误判"已授权"，故服务不在即视为未授权 → 需重新弹窗）。*/
     private fun isScreenProjectionAuthorized(): Boolean {
-        // ★★★ 2026-08-13 修复：MediaProjection 生命周期绑定 ScreenProjectionService 前台服务，
-        //   被控端进程被系统杀掉（华为后台管控/内存压力）后服务随进程死亡，重启后无授权可恢复，
-        //   但 ScreenStreamManager.projection 旧引用仍非空（isReady()=projection!=null 误判"已授权"），
-        //   导致一键授权/自动授权跳过 MediaProjection 弹窗 → 屏幕预览永久失效。
-        //   授权判定必须【前台服务在运行】且【MediaProjection 有效】同时成立，服务不在→视为未授权→重新弹窗。
-        val serviceRunning = try {
-            val am = requireContext().getSystemService(android.content.Context.ACTIVITY_SERVICE) as android.app.ActivityManager
-            am.getRunningServices(200).any { it.service.className == "cn.ppps.forwarder.service.ScreenProjectionService" }
+        val authorized = try {
+            cn.ppps.forwarder.permission.PermissionProbe.isScreenCaptureAuthorized(requireContext())
         } catch (e: Throwable) {
+            Log.w(TAG, "检查屏幕预览授权异常: ${e.message}")
             false
         }
-        if (!serviceRunning) {
-            Log.i(TAG, "★ 屏幕预览授权检查: ScreenProjectionService 未运行 → 未授权（需重新授权）")
-            return false
-        }
-        val runtimeReady = try {
-            cn.ppps.forwarder.relay.ScreenStreamManager.isReady()
-        } catch (e: Throwable) {
-            Log.w(TAG, "检查ScreenStreamManager.isReady异常: ${e.message}")
-            false
-        }
-        if (serviceRunning && runtimeReady) {
-            Log.i(TAG, "★ 屏幕预览授权检查: 前台服务运行中 + MediaProjection 有效 → 已授权")
-            return true
-        }
-        // 回退：SP 中曾保存过 RESULT_OK 也无效——必须【服务在运行 + projection 有效】才算真授权
-        try {
-            val prefs = requireContext().getSharedPreferences("screen_projection", android.content.Context.MODE_PRIVATE)
-            val resultCode = prefs.getInt("result_code", 0)
-            Log.i(TAG, "★ 屏幕预览授权检查: SP result_code=$resultCode, serviceRunning=$serviceRunning, runtimeReady=$runtimeReady")
-            return resultCode == android.app.Activity.RESULT_OK && serviceRunning && runtimeReady
-        } catch (e: Throwable) {
-            Log.w(TAG, "读取屏幕预览SP授权状态失败: ${e.message}")
-        }
-        return false
+        Log.i(TAG, "★ 屏幕预览授权检查（模块）: $authorized")
+        return authorized
     }
 
     /** 请求屏幕捕获授权（MediaProjection 系统对话框） */
@@ -905,12 +853,26 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
      */
     private fun oneClickAuthorize() {
         XToastUtils.toast("开始一键授权，请按提示操作...")
+        manualAuthFlowActive = true
+        manualAuthFlowStartTime = System.currentTimeMillis()
 
         try {
+            // ★ 2026-08-28 第 0 步（统一模块）：对"项目实际用到的"仍未授予的运行时权限做一次批量申请，
+            //   永久拒绝项由模块剔除（系统不会再弹框），后台定位单独走第二步。
+            try {
+                val batched = cn.ppps.forwarder.permission.PermissionRequests.requestMissingRuntimeBatch(requireActivity())
+                if (batched.isNotEmpty()) {
+                    Log.i(TAG, "★ 一键授权：批量申请 ${batched.size} 项运行时权限")
+                    cn.ppps.forwarder.permission.PermissionRequests.requestBackgroundLocation(requireActivity())
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "批量运行时权限申请异常（回退到分组申请）: ${e.message}")
+            }
+
             // 第一步：逐批请求运行时权限（复用已有方法，每批独立请求）
             // 顺序：短信 → 电话 → 联系人 → 定位 → 相机 → 麦克风 → 存储 → 通知 → CALL_PHONE
             // ★ 不使用一次性批量请求，因为 ACCESS_BACKGROUND_LOCATION 等权限需要单独请求，
-            //   一次请求过多权限在部分MIUI系统上会崩溃
+            //   一次请求过多权限在部分MIUI系统上会崩溃；批量申请未覆盖到的（如被永久拒绝后重新放行）由此兜底
             checkReadSmsPermission()
 
             // 延迟请求下一批，避免对话框冲突
@@ -977,76 +939,34 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                     XToastUtils.error("权限检查异常: ${e.message}")
                 }
             }, 6000)
+
+            // ★ 2026-08-28 7.5 秒后出「三类清单」报告（已自动处理 / 需手工确认+精确步骤 / 不支持自动），
+            //   让用户一眼看到还剩什么；同时写 logcat（tag=KeepAliveGuardian）便于 adb 无人化核对。
+            handler.postDelayed({
+                try {
+                    activity?.let { cn.ppps.forwarder.permission.KeepAliveGuardian.reportAndGuide(it) }
+                } catch (e: Exception) {
+                    Log.e(TAG, "生成授权报告异常: ${e.message}")
+                }
+            }, 7500)
         } catch (e: Exception) {
             Log.e(TAG, "一键授权异常: ${e.message}")
             XToastUtils.error("授权失败: ${e.message}")
         }
     }
 
-    // ==================== ★★★ 2026-08-12 首次运行自动授权 ====================
+    // ==================== ★★★ 2026-08-28 启动路径与一键授权共用统一模块 ====================
+    //
+    // 旧的 autoAuthorizeFlow()（启动时自动连弹所有授权界面）已删除：
+    //   需求硬约束「启动时不要弹一堆窗口——启动路径只做静默检测 + 至多一个电池白名单弹窗」。
+    //   启动路径现在只调用 cn.ppps.forwarder.permission.KeepAliveGuardian.onStartup()；
+    //   完整授权链路保留在 oneClickAuthorize()（用户主动触发）+ autoContinueManualAuth()（返回后继续）里，
+    //   两侧的"检测口径"都收敛到 PermissionProbe / PermissionRequests，避免两处判定不一致。
 
     /**
-     * ★ 首次运行自动授权流程：与一键授权相同，但无需用户点击按钮，启动时自动触发。
-     * 已授权的权限系统自动跳过，未授权的自动弹出授权界面（运行时权限弹系统框、
-     * 屏幕投影弹MediaProjection框、特殊权限自动跳设置页）。
-     * 特殊权限逐个弹出：用户从设置页返回后 onResume 自动继续下一个，无需点击一键授权。
-     */
-    private fun autoAuthorizeFlow() {
-        try {
-            Log.i(TAG, "★ autoAuthorizeFlow 开始：自动弹出所有未授权权限的授权界面")
-            autoAuthFlowStartTime = System.currentTimeMillis()
-            // 1. 逐批请求运行时权限（复用已有方法，每批独立请求，已授权自动跳过）
-            checkReadSmsPermission()
-            handler.postDelayed({
-                try { checkCallPermission() } catch (e: Exception) { Log.e(TAG, "电话读取权限请求异常: ${e.message}") }
-            }, 500)
-            handler.postDelayed({
-                try { checkContactsPermission() } catch (e: Exception) { Log.e(TAG, "联系人权限请求异常: ${e.message}") }
-            }, 1000)
-            handler.postDelayed({
-                try { checkLocationPermission() } catch (e: Exception) { Log.e(TAG, "定位权限请求异常: ${e.message}") }
-            }, 1500)
-            handler.postDelayed({
-                try { checkCameraPermission() } catch (e: Exception) { Log.e(TAG, "相机权限请求异常: ${e.message}") }
-            }, 2000)
-            handler.postDelayed({
-                try { checkMicrophonePermission() } catch (e: Exception) { Log.e(TAG, "麦克风权限请求异常: ${e.message}") }
-            }, 2500)
-            handler.postDelayed({
-                try { checkStorageRuntimePermission() } catch (e: Exception) { Log.e(TAG, "存储权限请求异常: ${e.message}") }
-            }, 3000)
-            handler.postDelayed({
-                try { checkNotificationPermission() } catch (e: Exception) { Log.e(TAG, "通知权限请求异常: ${e.message}") }
-            }, 3500)
-            handler.postDelayed({
-                try { checkCallPhonePermission() } catch (e: Exception) { Log.e(TAG, "CALL_PHONE权限请求异常: ${e.message}") }
-            }, 4000)
-            // 2. 6s 后自动弹出第一个需手动授权的特殊权限（屏幕预览/所有文件访问/悬浮窗/无障碍/电池优化）
-            handler.postDelayed({
-                try { autoContinueManualAuth() } catch (e: Exception) { Log.e(TAG, "自动授权特殊权限异常: ${e.message}") }
-            }, 6000)
-            // 3. 12s 后收尾检测（若已全部完成则持久化，onResume 也会双保险检测）
-            handler.postDelayed({
-                try {
-                    if (isAllPermissionsAuthorized()) {
-                        SettingUtils.autoAuthorizeDone = true
-                        Log.i(TAG, "★ autoAuthorizeFlow 全部权限已授权，持久化标记完成")
-                    } else {
-                        Log.i(TAG, "★ autoAuthorizeFlow 执行完一轮，仍有权限未授权（返回应用时自动继续弹出）")
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "autoAuthorizeFlow 收尾检测异常: ${e.message}")
-                }
-            }, 12000)
-        } catch (e: Exception) {
-            Log.e(TAG, "autoAuthorizeFlow 异常: ${e.message}")
-        }
-    }
-
-    /**
-     * ★ 自动授权流程中逐个弹出"需手动授权"的特殊权限界面（每次只弹一个）：
-     * 屏幕预览(MediaProjection 系统弹窗) → 所有文件访问 → 悬浮窗 → 无障碍服务 → 电池优化白名单。
-     * 用户从设置页返回后 onResume 会再次调用本方法自动继续下一个，无需点击"一键授权"。
+     * ★ 一键授权流程中逐个弹出"需手动授权"的特殊权限界面（每次只弹一个）：
+     * 屏幕预览(MediaProjection 系统弹窗) → 所有文件访问 → 悬浮窗 → 无障碍服务 → 电池优化白名单 → OEM 自启动。
+     * 用户从设置页返回后 onResume 会再次调用本方法自动继续下一个。
      * autoManualPrompted 记录已弹出过的，避免用户不授权时反复跳同一个设置页造成死循环。
      */
     private fun autoContinueManualAuth() {
@@ -1116,16 +1036,22 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                 cn.ppps.forwarder.tailscale.TailscaleManager.requestVpnConsent(requireActivity())
                 return
             }
-            // 6. ★★★ 2026-08-13 华为/荣耀后台管控引导（防止被控端进程被系统后台管控杀掉，
-            //    中继服务/屏幕预览授权随进程死亡失效）。仅电池优化白名单不够，
-            //    必须用户手动关闭"自动管理"并允许 自启动/关联启动/后台活动。
-            // ★★★ 2026-08-15 修复"已授权仍重复弹窗"：电池优化已授权 或 已引导过（持久化）→ 不再跳转
-            if (isHuaweiDevice() && !isBatteryOptimizationAuthorized(ctx) && !SettingUtils.huaweiKeepaliveGuided) {
-                if (autoManualPrompted.add("huawei_keepalive")) {
+            // 6. ★★★ 2026-08-28 OEM 自启动 / 后台限制引导（原来只覆盖华为，现按统一模块泛化到
+            //    MIUI/EMUI/ColorOS/OriginOS）：仅电池优化白名单不够，国产 ROM 的后台管控会直接杀进程，
+            //    中继服务/屏幕预览授权随进程死亡失效，必须用户手动允许 自启动/关联启动/后台活动。
+            //    触发条件：保活未真正生效，或系统根本不开放自启动状态读取（MIUI）；只引导一次。
+            if (cn.ppps.forwarder.permission.RomType.needsOemGuide &&
+                (!isBatteryOptimizationAuthorized(ctx) ||
+                        cn.ppps.forwarder.permission.OemGuide.probeAutostartState(ctx) !=
+                        cn.ppps.forwarder.permission.GrantState.GRANTED) &&
+                !SettingUtils.oemAutostartGuided
+            ) {
+                if (autoManualPrompted.add("oem_autostart")) {
                     lastAutoManualJumpTime = now
-                    SettingUtils.huaweiKeepaliveGuided = true
-                    Log.i(TAG, "★ 自动授权继续：跳转华为应用启动管理（防后台管控杀进程，已持久化huaweiKeepaliveGuided只提示一次）")
-                    jumpHuaweiStartupSetting()
+                    SettingUtils.oemAutostartGuided = true
+                    if (isHuaweiDevice()) SettingUtils.huaweiKeepaliveGuided = true
+                    Log.i(TAG, "★ 一键授权继续：跳转 ${cn.ppps.forwarder.permission.RomType.describe()} 自启动/后台管理页（只引导一次）")
+                    openOemAutostartSetting()
                     return
                 }
             }
@@ -1144,111 +1070,42 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         return m.contains("huawei") || m.contains("honor")
     }
 
-    /** ★★★ 2026-08-13 华为/荣耀后台管控：跳转"应用启动管理"页面，引导用户改为手动管理并允许后台活动。
-     *  华为后台管控会在后台杀掉被控端进程，仅电池优化白名单不够，
-     *  必须用户手动关闭"自动管理"并允许 自启动/关联启动/后台活动。
-     *
-     *  ★★★ 2026-08-14 修复"没有打开设置中的相应界面"：
-     *    华为 Android 12 上启动管理Activity(StartupNormalAppListActivity / StartupAppControlActivity)
-     *    均要求系统权限 com.huawei.permission.external_app_settings.USE_COMPONENT，
-     *    第三方应用直接 startActivity 会抛 SecurityException（adb 实测确认），
-     *    因此无法 Intent 直达启动管理页。改为跳转【本应用详情页】(com.android.settings 可导出、
-     *    实测可用)，华为详情页内有"启动管理"入口，用户点击后进入启动控制页设置
-     *    自启动/关联启动/后台活动。 */
-    private fun jumpHuaweiStartupSetting() {
-        try {
-            val intent = Intent(
-                android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                android.net.Uri.fromParts("package", requireContext().packageName, null)
-            )
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            startActivity(intent)
-            XToastUtils.toast("请在应用详情页点击「启动管理」，关闭自动管理，并允许自启动/关联启动/后台活动")
-        } catch (e: Exception) {
-            Log.w(TAG, "打开应用详情页失败: ${e.message}")
-            // 兜底：老版本EMUI尝试直达启动管理页（部分版本可能仍可打开）
-            try {
-                val intent2 = Intent().setClassName("com.huawei.systemmanager", "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity")
-                intent2.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                startActivity(intent2)
-            } catch (e2: Exception) {
-                Log.w(TAG, "打开华为启动管理页也失败: ${e2.message}")
+    /** ★★★ 2026-08-28 跳转 OEM 自启动 / 后台活动管理页（MIUI 安全中心、EMUI 手机管家等），
+     *  实现统一在 OemGuide：先按 resolveActivity 校验组件存在再拉起（避免 MIUI/EMUI 抛
+     *  ActivityNotFoundException / SecurityException 把被控端带崩），
+     *  打不开则退回本应用详情页 + 在 UI 上给出【可复制的手工步骤】。 */
+    private fun openOemAutostartSetting() {
+        val ctx = requireContext()
+        val steps = cn.ppps.forwarder.permission.OemGuide.manualSteps()
+        when (cn.ppps.forwarder.permission.OemGuide.openAutostartPage(ctx)) {
+            cn.ppps.forwarder.permission.OpenResult.OPENED ->
+                XToastUtils.toast("请在打开的页面里允许 SmsForwarder 自启动 / 后台活动（${cn.ppps.forwarder.permission.RomType.describe()}）")
+            else -> {
+                Log.w(TAG, "未找到 ${cn.ppps.forwarder.permission.RomType.describe()} 自启动管理入口，退回应用详情页并展示手工步骤")
+                cn.ppps.forwarder.permission.PermissionRequests.openAppDetails(ctx)
+                XToastUtils.error("该 ROM 无直达入口，请照步骤手工设置：$steps")
             }
         }
     }
 
-    /** ★ 检查所有关键权限是否已全部授权（含运行时权限+特殊权限） */
+    /** 兼容旧调用点：华为/荣耀后台管控引导（现统一走 openOemAutostartSetting）。 */
+    private fun jumpHuaweiStartupSetting() {
+        openOemAutostartSetting()
+    }
+
+    /** ★ 检查所有关键权限是否已全部授权（★ 2026-08-28 口径统一到 PermissionProbe/KeepAliveReport，
+     *  不再在本类里维护第二份权限清单。优先复用 3 秒内的最近一次报告，避免重复 binder 轮询）。*/
     private fun isAllPermissionsAuthorized(): Boolean {
-        try {
-            val ctx = requireContext()
-            // 1. 运行时权限
-            val runtimePerms = mutableListOf<String>()
-            if (android.os.Build.VERSION.SDK_INT < 33) {
-                runtimePerms.add(android.Manifest.permission.READ_EXTERNAL_STORAGE)
+        return try {
+            val fresh = cn.ppps.forwarder.permission.KeepAliveGuardian.lastReport()
+            if (fresh != null && System.currentTimeMillis() - fresh.generatedAt < 3000) {
+                fresh.allClear
+            } else {
+                cn.ppps.forwarder.permission.KeepAliveGuardian.diagnoseSync(requireContext()).allClear
             }
-            runtimePerms.addAll(listOf(
-                android.Manifest.permission.READ_SMS,
-                // ★ 2026-08-12 修复：清单未声明 RECEIVE_SMS（仅有 READ_SMS），检查它会导致 isAllPermissionsAuthorized 永远为 false，autoAuthorizeDone 无法持久化、每次启动都重复触发自动授权
-                android.Manifest.permission.READ_PHONE_STATE,
-                android.Manifest.permission.READ_CONTACTS,
-                android.Manifest.permission.WRITE_CONTACTS,
-                android.Manifest.permission.ACCESS_FINE_LOCATION,
-                android.Manifest.permission.ACCESS_COARSE_LOCATION,
-                android.Manifest.permission.CAMERA,
-                android.Manifest.permission.RECORD_AUDIO,
-                android.Manifest.permission.CALL_PHONE
-            ))
-            if (android.os.Build.VERSION.SDK_INT >= 33) {
-                runtimePerms.add("android.permission.POST_NOTIFICATIONS")
-            }
-            // 防止重复
-            val checked = HashSet<String>()
-            for (p in runtimePerms) {
-                if (!checked.add(p)) continue
-                try {
-                    if (androidx.core.content.ContextCompat.checkSelfPermission(ctx, p)
-                        != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-                        Log.i(TAG, "★ 权限未授权(运行时): $p")
-                        return false
-                    }
-                } catch (_: Throwable) {}
-            }
-            // 2. 所有文件访问（Android 11+）
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R
-                && !android.os.Environment.isExternalStorageManager()) {
-                Log.i(TAG, "★ 权限未授权(所有文件访问)")
-                return false
-            }
-            // 3. 悬浮窗
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M
-                && !android.provider.Settings.canDrawOverlays(ctx)) {
-                Log.i(TAG, "★ 权限未授权(悬浮窗)")
-                return false
-            }
-            // 4. 无障碍服务（远程触摸）
-            if (cn.ppps.forwarder.relay.TouchControlService.instance == null) {
-                Log.i(TAG, "★ 权限未授权(无障碍服务)")
-                return false
-            }
-            // 5. 屏幕预览（MediaProjection）
-            if (!isScreenProjectionAuthorized()) {
-                Log.i(TAG, "★ 权限未授权(屏幕预览)")
-                return false
-            }
-            // 6. 电池优化白名单
-            if (!isBatteryOptimizationAuthorized(ctx)) {
-                Log.i(TAG, "★ 权限未授权(电池优化白名单)")
-                return false
-            }
-            // 7. VPN/Tailscale 授权
-            if (!cn.ppps.forwarder.tailscale.TailscaleManager.isVpnAuthorized(ctx)) {
-                Log.i(TAG, "★ 权限未授权(VPN/Tailscale)")
-                return false
-            }
-            return true
         } catch (e: Exception) {
             Log.w(TAG, "isAllPermissionsAuthorized 异常: ${e.message}")
-            return false
+            false
         }
     }
 
@@ -1267,100 +1124,79 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         //   但授权后会保存到 SP，App 重启后通过 onResume() 中调用 ScreenProjectionService.restore() 自动恢复。
 
         // 1. 所有文件访问权限（MANAGE_EXTERNAL_STORAGE）
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R && !android.os.Environment.isExternalStorageManager()) {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R &&
+            !cn.ppps.forwarder.permission.PermissionProbe.isAllFilesAccessGranted(ctx)
+        ) {
             pendingItems.add("所有文件访问权限")
-            try {
-                val intent = Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
-                intent.data = android.net.Uri.parse("package:" + requireContext().packageName)
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                startActivity(intent)
+            val r = cn.ppps.forwarder.permission.PermissionRequests.openAllFilesAccess(ctx)
+            if (r == cn.ppps.forwarder.permission.OpenResult.OPENED) {
                 XToastUtils.toast("请开启「所有文件访问权限」后返回应用")
                 return // 一次只打开一个设置页，用户返回后再继续
-            } catch (e: Exception) {
-                Log.w(TAG, "打开所有文件访问设置失败: ${e.message}")
-                try {
-                    val intent = Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
-                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    startActivity(intent)
-                    return
-                } catch (e2: Exception) {
-                    Log.w(TAG, "打开通用文件访问设置也失败: ${e2.message}")
-                }
             }
+            Log.w(TAG, "所有文件访问设置页打不开($r)，继续下一项并在报告里给手工步骤")
         }
 
         // 2. 悬浮窗权限（SYSTEM_ALERT_WINDOW）
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M && !android.provider.Settings.canDrawOverlays(ctx)) {
+        if (!cn.ppps.forwarder.permission.PermissionProbe.isOverlayGranted(ctx)) {
             pendingItems.add("悬浮窗权限")
-            try {
-                val intent = Intent(android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION)
-                intent.data = android.net.Uri.parse("package:" + requireContext().packageName)
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                startActivity(intent)
+            val r = cn.ppps.forwarder.permission.PermissionRequests.openOverlaySettings(ctx)
+            if (r == cn.ppps.forwarder.permission.OpenResult.OPENED) {
                 XToastUtils.toast("请开启「悬浮窗权限」后返回应用")
                 return
-            } catch (e: Exception) {
-                Log.w(TAG, "打开悬浮窗设置失败: ${e.message}")
             }
+            Log.w(TAG, "悬浮窗设置页打不开($r)，继续下一项")
         }
 
-        // 3. 无障碍服务（远程触摸）
-        if (cn.ppps.forwarder.relay.TouchControlService.instance == null) {
+        // 3. 无障碍服务（远程触摸）——系统禁止第三方程序化开启，只能跳设置页引导
+        if (!cn.ppps.forwarder.permission.PermissionProbe.isAccessibilityEnabled(ctx)) {
             pendingItems.add("无障碍服务（远程触摸）")
-            try {
-                val intent = Intent("android.settings.ACCESSIBILITY_SETTINGS")
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                startActivity(intent)
-                XToastUtils.toast("请开启「无障碍服务」后返回应用")
+            val r = cn.ppps.forwarder.permission.PermissionRequests.openAccessibilitySettings(ctx)
+            if (r == cn.ppps.forwarder.permission.OpenResult.OPENED) {
+                XToastUtils.toast("请开启「无障碍服务→SmsForwarder 远程触摸」后返回应用")
                 return
-            } catch (e: Exception) {
-                Log.w(TAG, "打开无障碍设置失败: ${e.message}")
             }
+            Log.w(TAG, "无障碍设置页打不开($r)，继续下一项")
         }
 
-        // 4. 电池优化白名单
-        // ★★★ 2026-08-15 防重复弹窗：已提示过（持久化batteryAuthGuided）或已授权则不再打开
+        // 4. 电池优化白名单（防重复弹窗：已提示过 batteryAuthGuided 或已授权则不再打开）
         if (!isBatteryOptimizationAuthorized(ctx) && !SettingUtils.batteryAuthGuided) {
             pendingItems.add("电池优化白名单")
             SettingUtils.batteryAuthGuided = true
-            // ★ 2026-08-15 修复：REQUEST弹窗失败时按手机型号打开对应设置页（不再只用通用电池优化列表）
             jumpBatterySetting()
             return
         }
 
-        // 5. ★★★ 2026-08-13 华为/荣耀后台管控引导（防止被控端进程被系统后台管控杀掉，
-        //    中继服务/屏幕预览授权随进程死亡失效）。仅电池优化白名单不够，
-        //    必须用户手动关闭"自动管理"并允许 自启动/关联启动/后台活动。
-        // ★★★ 2026-08-15 修复"已授权仍重复弹窗"：电池优化已授权 或 已引导过（持久化）→ 不再跳转
-        if (isHuaweiDevice() && !isBatteryOptimizationAuthorized(ctx) && !SettingUtils.huaweiKeepaliveGuided) {
-            pendingItems.add("华为后台管理（允许后台活动）")
-            SettingUtils.huaweiKeepaliveGuided = true
-            jumpHuaweiStartupSetting()
+        // 5. OEM 自启动 / 后台活动引导（★ 2026-08-28 由"仅华为"泛化到 MIUI/EMUI/ColorOS/OriginOS）
+        if (cn.ppps.forwarder.permission.RomType.needsOemGuide &&
+            cn.ppps.forwarder.permission.OemGuide.probeAutostartState(ctx) !=
+            cn.ppps.forwarder.permission.GrantState.GRANTED &&
+            !SettingUtils.oemAutostartGuided
+        ) {
+            pendingItems.add("${cn.ppps.forwarder.permission.RomType.describe()} 自启动/后台活动")
+            SettingUtils.oemAutostartGuided = true
+            if (isHuaweiDevice()) SettingUtils.huaweiKeepaliveGuided = true
+            openOemAutostartSetting()
             return
         }
 
-        // 汇总
-        if (pendingItems.isEmpty()) {
+        // 汇总：三类清单在 oneClickAuthorize 末尾由 KeepAliveGuardian.reportAndGuide 统一弹窗，
+        // 这里只给一条简短 toast，避免多窗口打扰。
+        val report = try {
+            cn.ppps.forwarder.permission.KeepAliveGuardian.diagnoseSync(ctx)
+        } catch (e: Exception) {
+            Log.w(TAG, "汇总自检失败: ${e.message}")
+            null
+        }
+        if (report == null) {
+            XToastUtils.error("权限检查异常，请重试")
+        } else if (report.allClear) {
             XToastUtils.toast("所有权限已授权！")
         } else {
-            // 所有需手动授权的已逐一打开过设置页，此处是回到应用后的最终状态检查
-            val stillPending = mutableListOf<String>()
-            if (!isScreenProjectionAuthorized())
-                stillPending.add("屏幕预览")
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R && !android.os.Environment.isExternalStorageManager())
-                stillPending.add("所有文件访问")
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M && !android.provider.Settings.canDrawOverlays(ctx))
-                stillPending.add("悬浮窗")
-            if (cn.ppps.forwarder.relay.TouchControlService.instance == null)
-                stillPending.add("无障碍服务")
-            if (!isBatteryOptimizationAuthorized(ctx))
-                stillPending.add("电池优化白名单")
-
-            if (stillPending.isEmpty()) {
-                XToastUtils.toast("所有权限已授权！")
-            } else {
-                XToastUtils.toast("以下权限仍需手动开启: ${stillPending.joinToString("、")}，请再次点击一键授权")
-            }
+            val names = report.needManual.joinToString("、") { it.label.substringBefore('（') }
+            XToastUtils.toast("仍需手工确认: $names（详情见刚弹出的三类清单，可复制步骤）")
+        }
+        if (pendingItems.isNotEmpty()) {
+            Log.i(TAG, "★ 本轮逐一打开过的系统页: $pendingItems")
         }
     }
 

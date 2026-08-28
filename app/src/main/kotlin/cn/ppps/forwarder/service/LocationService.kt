@@ -29,6 +29,14 @@ import java.util.Date
 class LocationService : Service() {
 
     private val TAG: String = LocationService::class.java.simpleName
+
+    /**
+     * ★ 2026-08-28 省电：触发一次地理编码反查的最小位移（度）。
+     *   0.0003° ≈ 30 米，远小于"街道级地址"会变化的尺度，所以复用上次地址不会带来任何可见差异；
+     *   目的只是把静止时每次定位（默认 10 秒一次）都发一次同步网络反查的浪费去掉。
+     */
+    private val GEOCODE_MOVE_DEG = 0.0003
+
     private val locationStatusReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == LocationManager.PROVIDERS_CHANGED_ACTION) {
@@ -96,13 +104,28 @@ class LocationService : Service() {
                             location.longitude, location.latitude, "", App.DateFormat.format(Date(location.time)), location.provider.toString()
                         )
 
-                        //根据坐标经纬度获取位置地址信息（WGS-84坐标系）
-                        val list = App.Geocoder.getFromLocation(location.latitude, location.longitude, 1)
-                        if (list?.isNotEmpty() == true) {
-                            locationInfoNew.address = list[0].getAddressLine(0)
+                        // ★★★ 2026-08-28 省电：坐标没动就不做【同步网络反查】。
+                        //   依据：本回调按 locationMinInterval（默认 10 秒）持续触发，而旧代码每次都无条件
+                        //   调 Geocoder.getFromLocation() —— 那是一次同步的地理编码网络往返（还跑在
+                        //   定位回调线程上，顺带是 ANR 风险）。手机静置在桌上时每次拿到的经纬度几乎相同，
+                        //   地址字符串也必然相同 → 每小时约 360 次毫无产出的网络请求 + 唤醒基带/Wi-Fi。
+                        //   现在只在位移超过 GEOCODE_MOVE_DEG（≈30 米，市/区级地址在这个量级内不会变化）
+                        //   或缓存里还没有地址时才反查；返回给控制端的字段、语义、精度完全不变。
+                        val prev = HttpServerUtils.apiLocationCache
+                        val moved = prev.address.isEmpty() ||
+                            Math.abs(prev.latitude - location.latitude) > GEOCODE_MOVE_DEG ||
+                            Math.abs(prev.longitude - location.longitude) > GEOCODE_MOVE_DEG
+                        if (moved) {
+                            //根据坐标经纬度获取位置地址信息（WGS-84坐标系）
+                            val list = App.Geocoder.getFromLocation(location.latitude, location.longitude, 1)
+                            if (list?.isNotEmpty() == true) {
+                                locationInfoNew.address = list[0].getAddressLine(0)
+                            }
+                            Log.d(TAG, "locationInfoNew = $locationInfoNew")
+                        } else {
+                            // 复用上次解析结果：地址与旧值一致，因此不再打日志（旧实现每 10 秒写 5 行日志文件）
+                            locationInfoNew.address = prev.address
                         }
-
-                        Log.d(TAG, "locationInfoNew = $locationInfoNew")
                         HttpServerUtils.apiLocationCache = locationInfoNew
                     }
                 })

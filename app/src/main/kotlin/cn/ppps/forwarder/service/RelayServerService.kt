@@ -105,6 +105,15 @@ class RelayServerService : Service() {
             startForeground(FRONT_NOTIFY_ID, buildNotification())
         }
         createNotificationChannel()
+        // ★ 2026-08-28 被控端服务启动入口的「权限+保活」静默自检：
+        //   只后台检测 + 写 logcat（tag=KeepAliveGuardian），不开任何窗口——
+        //   后台起 Activity 在 Android 10+ 会被系统拦截，且违背"启动防打扰"要求。
+        //   需要用户确认的授权一律由 App 内「一键授权」完成。
+        try {
+            cn.ppps.forwarder.permission.KeepAliveGuardian.onServiceStartup(this)
+        } catch (e: Throwable) {
+            Log.w(TAG, "权限保活静默自检失败: ${e.message}")
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -122,6 +131,10 @@ class RelayServerService : Service() {
         isRunning = true
         executor = Executors.newFixedThreadPool(2)
 
+        // ★ 2026-08-28 省电：把本服务的"有人在用"判据注入 Tailscale 侧，
+        //   供 VPN 看门狗在灭屏且无任何控制端连接/推流时降频巡检（详见 TailscaleManager.VPN_WATCHDOG_*）。
+        //   必须在 ensureStarted/ensureVpnUp 之前设置，保证看门狗第一轮就能拿到判据。
+        cn.ppps.forwarder.tailscale.TailscaleManager.busyProvider = { isBusyNow() }
         // ★ 提前初始化 Tailscale 后端，确保 VPN 授权弹窗能被 MainActivity 触发
         cn.ppps.forwarder.tailscale.TailscaleManager.ensureStarted(this)
         // ★ 2026-08-25 需求：被控端启动成功后，直连模式下 VPN 自动开启。
@@ -245,6 +258,9 @@ class RelayServerService : Service() {
             onConnected = onConnected,
             onDisconnected = onDisconnected,
             onCommand = onRelayCommand,
+            // ★ 2026-08-28 省电：中继不可达时的重连间隔按忙/闲自适应（灭屏无人 5s→20s 退避）。
+            //   只影响"连不上时的重试频率"，已建立连接的收发、命令响应、文件传输通路完全不变。
+            isBusy = { isBusyNow() },
         )
         c.start()
         client = c
@@ -274,7 +290,12 @@ class RelayServerService : Service() {
         tsScanner = TailscaleDirectScanner(
             isDirectActive = { tsDirectClients.values.any { it.isConnected() } },
             onDirectFound = { phoneIp, port -> startTailscaleDirect(phoneIp, port) },
-            connectedIps = { tsDirectClients.keys.toSet() },
+            // ★★★ 2026-08-28 修复直连"一断永断"：connectedIps 只返回【真正连通】的控制端IP。
+            //   原实现返回 map.keys——client 在发起连接前就 put 进 map，重试耗尽（停止重试）后
+            //   死 client 永远留在 map 里，扫描器把死IP当"已连接"永久跳过，不再探测/重连，
+            //   直到重启服务。改为 filterValues { isConnected } 后，失败的IP会被重新探测并
+            //   经 startTailscaleDirect 清理重建，自动恢复直连。
+            connectedIps = { tsDirectClients.filterValues { it.isConnected() }.keys.toSet() },
             // ★ 2026-08-27 省电：灭屏且无人连接时直连扫描自动降频（详见 TailscaleDirectScanner）
             isBusy = { isBusyNow() },
         ).also { it.start() }

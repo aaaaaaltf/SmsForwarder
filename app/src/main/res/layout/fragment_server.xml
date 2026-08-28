@@ -191,6 +191,19 @@
                 android:text="一键授权所有权限"
                 android:textSize="@dimen/text_size_medium" />
 
+            <!--★ 2026-08-28 权限与保活自检：只重跑检测并列出「已自动处理/需手工确认/不支持自动」三类清单，不弹授权窗-->
+            <com.xuexiang.xui.widget.button.ButtonView
+                android:id="@+id/btn_perm_report"
+                style="@style/ButtonView.Blue"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="5dp"
+                android:layout_marginEnd="5dp"
+                android:layout_marginBottom="5dp"
+                android:padding="6dp"
+                android:text="授权自检报告（查看还剩哪些要手工确认）"
+                android:textSize="@dimen/text_size_medium" />
+
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"

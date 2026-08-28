@@ -39,6 +39,14 @@ class MainActivity : BaseActivity<ActivityMainBinding?>() {
                 android.util.Log.w(TAG, "请求 VPN 授权异常: ${t.message}")
             }
         }
+        // ★ 2026-08-28 启动入口二（App 启动流程）：统一「权限 + 保活」自检。
+        //   静默检测在后台线程跑，本进程只会弹【至多一个】电池优化白名单确认框（已豁免或已引导过则不弹），
+        //   其余授权等用户点「一键授权」。与 ServerFragment 的调用点共用同一实现且幂等，不会重复弹窗。
+        try {
+            cn.ppps.forwarder.permission.KeepAliveGuardian.onStartup(this)
+        } catch (t: Throwable) {
+            android.util.Log.w(TAG, "启动权限自检异常: ${t.message}")
+        }
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
