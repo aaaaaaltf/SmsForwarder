@@ -109,6 +109,64 @@ class WebRtcSessionManager(
     @Volatile private var decodeEglBase: EglBase? = null
     @Volatile private var signalingCallback: SignalingCallback? = null
     @Volatile private var currentCameraIndex: Int = 0
+
+    // ★★★ 2026-08-29 前/后摄像头准确识别（与 CameraStreamManager 共用同一套语义）：
+    //   - 控制端传来的 0/1 不再当 deviceNames/cameraIdList 数组下标（多摄手机下标1常是超广角而非前置）
+    //   - 0 = 意图后置(LENS_FACING_BACK)；1 = 意图前置(LENS_FACING_FRONT)
+    //   - 越界值（<0 或 >=2）→ Legacy：仍按数组下标解释，兼容旧控制端与其它调用方
+    //   - 同一朝向有多个镜头时只取枚举列表第一个（通常是默认主摄）
+    //   - LENS_FACING_EXTERNAL 既不算前也不算后，不参与朝向匹配
+    /** 实际打开的朝向语义：0=后置 1=前置（与 CameraStreamManager.FACING_BACK/FRONT 一致） */
+    @Volatile private var currentFacing: Int = CameraStreamManager.FACING_BACK
+    /** 最近一次朝向匹配是否发生回退（回报追加 |fallback=1） */
+    @Volatile private var facingFellBack = false
+    /** 实际打开的摄像头名（WebRTC Camera2Enumerator 的 deviceName，即 cameraId 字符串） */
+    @Volatile private var currentCameraName: String? = null
+
+    /** ★★★ 契约字段：追加到 WebRTC 状态/错误消息体末尾，供控制端校准 UI 前后置文字 */
+    fun facingSuffix(): String =
+        if (facingFellBack) "|facing=$currentFacing|fallback=1" else "|facing=$currentFacing"
+
+    /**
+     * 按"意图朝向"解析出实际要打开的 WebRTC cameraName。
+     * @return Pair(cameraName, 实际朝向)；找不到目标朝向时回退枚举列表第一个并置 facingFellBack
+     */
+    private fun resolveCameraNameByFacing(enumerator: Camera2Enumerator, deviceNames: Array<String>, facingTarget: Int): Pair<String, Int> {
+        facingFellBack = false
+        val wantFront = facingTarget == CameraStreamManager.FACING_FRONT
+        val wantBack = facingTarget == CameraStreamManager.FACING_BACK
+        if (wantFront || wantBack) {
+            for (name in deviceNames) {
+                val front = try { enumerator.isFrontFacing(name) } catch (_: Throwable) { false }
+                val back = try { enumerator.isBackFacing(name) } catch (_: Throwable) { false }
+                // isFrontFacing/isBackFacing 内部读的正是 CameraCharacteristics.LENS_FACING；EXTERNAL 两者皆 false
+                if (wantFront && front) {
+                    Log.i(TAG, "★ resolveCameraNameByFacing: 意图=前置 → 匹配 cameraName=$name")
+                    return name to CameraStreamManager.FACING_FRONT
+                }
+                if (wantBack && back) {
+                    Log.i(TAG, "★ resolveCameraNameByFacing: 意图=后置 → 匹配 cameraName=$name")
+                    return name to CameraStreamManager.FACING_BACK
+                }
+            }
+            facingFellBack = true
+            val fb = deviceNames.first()
+            Log.w(TAG, "★ resolveCameraNameByFacing: 按朝向未找到${if (wantFront) "前置" else "后置"}镜头，回退第一个 cameraName=$fb（回报带 fallback=1）")
+            return fb to fallbackFacing(enumerator, fb)
+        }
+        // Legacy：数组下标解释（旧控制端/越界值）
+        val idx = facingTarget.coerceIn(deviceNames.indices)
+        val name = deviceNames[idx]
+        val isFront = try { enumerator.isFrontFacing(name) } catch (_: Throwable) { false }
+        Log.i(TAG, "★ resolveCameraNameByFacing: legacy下标=$facingTarget→$idx → cameraName=$name 朝向=${if (isFront) "前置" else "后置"}")
+        return name to (if (isFront) CameraStreamManager.FACING_FRONT else CameraStreamManager.FACING_BACK)
+    }
+
+    /** 回退时读取兜底镜头的真实朝向（读不到按后置处理） */
+    private fun fallbackFacing(enumerator: Camera2Enumerator, name: String): Int = try {
+        if (enumerator.isFrontFacing(name)) CameraStreamManager.FACING_FRONT else CameraStreamManager.FACING_BACK
+    } catch (_: Throwable) { CameraStreamManager.FACING_BACK }
+
     @Volatile private var running = false
     /** ★★★ 2026-08-12 中继优先模式：true=中继服务在线，媒体走TURN relay（中继转发）；false=TS/WiFi直连兜底 */
     @Volatile private var relayPreferred: Boolean = true
@@ -155,14 +213,14 @@ class WebRtcSessionManager(
 
     /**
      * 收到控制端 OFFER：启动摄像头+麦克风 → 设置远端SDP → 生成ANSWER → 通过callback发回
-     * @param cameraIndex 0=后, 1=前 (与原 CameraStreamManager 索引一致)
+     * @param cameraFacing ★ 2026-08-29 语义化为"朝向目标"：0=后置(LENS_FACING_BACK) 1=前置(LENS_FACING_FRONT)；越界值退化为 deviceNames 数组下标(旧行为)
      * @param offerSdpBase64 Base64(UTF-8(SDP)) — 控制端 encode 后的 SDP
      * @param cb 信令/状态/错误回调
      * @param relayPreferred ★ 2026-08-12 中继优先模式：true=中继服务在线，媒体走TURN relay（中继转发）；
      *   false=中继离线/直连模式，媒体走TS/WiFi host直连兜底。
      */
     @Synchronized
-    fun startWithOffer(cameraIndex: Int, offerSdpBase64: String, cb: SignalingCallback,
+    fun startWithOffer(cameraFacing: Int, offerSdpBase64: String, cb: SignalingCallback,
                        relayPreferred: Boolean = true) {
         val stepTag = "[WebRTC-INIT]"
         if (running) {
@@ -177,7 +235,11 @@ class WebRtcSessionManager(
         startLivenessWatchdog()
         Log.i(TAG, "$stepTag ★ 中继优先模式 relayPreferred=$relayPreferred（true=媒体走TURN中继转发 / false=TS直连兜底）")
         this.signalingCallback = cb
-        this.currentCameraIndex = cameraIndex
+        this.currentCameraIndex = cameraFacing
+        // ★ 2026-08-29 新会话开始先重置朝向状态，避免沿用上一会话的朝向/回退标记
+        this.currentFacing = if (cameraFacing == CameraStreamManager.FACING_FRONT) CameraStreamManager.FACING_FRONT else CameraStreamManager.FACING_BACK
+        this.facingFellBack = false
+        this.currentCameraName = null
         cb.onStatus("initializing", "初始化PeerConnectionFactory+音频设备")
 
         // —— 先检测类是否能被 JNI FindClass 找到（避免 JNI_OnLoad 抛出异常绕过 Java try-catch）
@@ -635,7 +697,7 @@ class WebRtcSessionManager(
         // —— ★ [7/8] 创建本地音视频轨道并加入 PeerConnection（audioOnly时仅麦克风）
         try {
             Log.i(TAG, "$stepTag [7/8] addTracks 开始（${if (audioOnly) "纯音频-麦克风" else "摄像头+麦克风"}）...")
-            addTracks(f, pc, cameraIndex, audioOnly)
+            addTracks(f, pc, cameraFacing, audioOnly)
             Log.i(TAG, "$stepTag [7/8] addTracks 成功 ✓ 轨道已加入（audioOnly=$audioOnly）")
         } catch (t: Throwable) {
             Log.e(TAG, "$stepTag [7/8] addTracks 失败 type=${t.javaClass.name} msg=${t.message}", t)
@@ -726,7 +788,7 @@ class WebRtcSessionManager(
                             )
                             Log.i(TAG, "$stepTag [8/8] setLocalDescription 成功 ✓，发送 ANSWER(len=${answerB64.length})")
                             cb.onSignalingMessage(RelayCommands.CMD_WEBRTC_ANSWER, answerB64)
-                            cb.onStatus("ready", "ANSWER已发送，等待ICE连通")
+                            cb.onStatus("ready", "ANSWER已发送，等待ICE连通" + facingSuffix())
                         }
                         pc.setLocalDescription(object : SdpObserverAdapter() {
                             override fun onSetSuccess() { onAnswerReady(useSdp) }
@@ -787,21 +849,48 @@ class WebRtcSessionManager(
         }
     }
 
-    /** 切换前后摄像头：切换后新帧立即由原轨道输出到PeerConnection，无需重建SDP */
+    /**
+     * 切换前后摄像头：切换后新帧立即由原轨道输出到PeerConnection，无需重建SDP
+     * ★ 2026-08-29 参数语义化：facingTarget = 朝向目标（0=后置 / 1=前置）；
+     *   越界值保持旧行为（按 deviceNames 数组下标是否有效决定是否切换）。
+     *   注意：WebRTC Camera2Capturer.switchCamera(null) 只能"切到下一个镜头"，无法指定具体 cameraId，
+     *   所以切换后重新判定实际生效的朝向并回传（不一致时带 |fallback=1），控制端据此校准 UI 文字。
+     */
     @Synchronized
-    fun switchCamera(newIndex: Int) {
+    fun switchCamera(facingTarget: Int) {
         val vc = videoCapturer as? Camera2Capturer ?: run {
             Log.w(TAG, "switchCamera: 当前不是Camera2Capturer")
             return
         }
         try {
-            val deviceNames = Camera2Enumerator(appContext).deviceNames
-            if (newIndex in deviceNames.indices) {
-                vc.switchCamera(null) // Camera2Capturer 会自动按 "front/back" 或相邻索引切换；
-                // 若 switchCamera(null) 不能按 index 切换，就用 enumerator 取 front/back：
-                currentCameraIndex = newIndex
-                signalingCallback?.onStatus("camera_switched", "已切换到摄像头#$newIndex")
+            val enumerator = Camera2Enumerator(appContext)
+            val deviceNames = enumerator.deviceNames
+            val legacyIndexMode = facingTarget != CameraStreamManager.FACING_BACK && facingTarget != CameraStreamManager.FACING_FRONT
+            if (legacyIndexMode) {
+                // 旧语义：数组下标（越界则不动）
+                if (facingTarget !in deviceNames.indices) {
+                    Log.w(TAG, "switchCamera: legacy下标=$facingTarget 超出枚举范围(${deviceNames.size})，忽略")
+                    return
+                }
+            } else if (facingTarget == currentFacing) {
+                Log.i(TAG, "★ switchCamera: 当前已是${if (currentFacing == CameraStreamManager.FACING_FRONT) "前置" else "后置"}摄像头($currentCameraName)，无需切换")
+                signalingCallback?.onStatus("camera_switched", "${if (currentFacing == CameraStreamManager.FACING_FRONT) "前置" else "后置"}摄像头已就绪 $currentCameraName" + facingSuffix())
+                return
             }
+            vc.switchCamera(null)
+            // 切换后重新判定"实际生效的朝向"
+            val name = currentCameraName ?: deviceNames.getOrNull(currentCameraIndex) ?: deviceNames.firstOrNull()
+            val nowFront = name != null && try { enumerator.isFrontFacing(name) } catch (_: Throwable) { false }
+            val actual = if (nowFront) CameraStreamManager.FACING_FRONT else CameraStreamManager.FACING_BACK
+            // 意图与实际不一致 → 说明"切不到目标朝向"，标记回退；legacy 模式不改回退标记
+            if (!legacyIndexMode) facingFellBack = actual != facingTarget
+            currentFacing = actual
+            if (name != null) currentCameraName = name
+            Log.i(TAG, "★ switchCamera: 意图朝向=$facingTarget → 实际=${if (actual == CameraStreamManager.FACING_FRONT) "前置" else "后置"} ($name) 回退=$facingFellBack")
+            signalingCallback?.onStatus(
+                "camera_switched",
+                "已切换到${if (actual == CameraStreamManager.FACING_FRONT) "前置" else "后置"}摄像头 $name" + facingSuffix()
+            )
         } catch (t: Throwable) {
             Log.w(TAG, "switchCamera failed: ${t.message}")
             signalingCallback?.onError("切换摄像头失败: ${t.message}")
@@ -927,7 +1016,7 @@ class WebRtcSessionManager(
 
     // ==================== 内部工具 ====================
 
-    private fun addTracks(f: PeerConnectionFactory, pc: PeerConnection, cameraIndex: Int, audioOnly: Boolean) {
+    private fun addTracks(f: PeerConnectionFactory, pc: PeerConnection, facingTarget: Int, audioOnly: Boolean) {
         val tag = "[addTracks]"
         Log.i(TAG, "$tag [a1] createAudioSource 开始...")
         val audioSource = try {
@@ -1057,10 +1146,19 @@ class WebRtcSessionManager(
         if (deviceNames.isEmpty()) {
             throw RuntimeException("无可用摄像头（Camera2枚举为空）")
         }
-        val idx = cameraIndex.coerceIn(deviceNames.indices)
-        val camName = deviceNames[idx]
-        currentCameraIndex = idx
-        Log.i(TAG, "$tag [v2] 选中摄像头 #$idx=$camName, isFront=${enumerator.isFrontFacing(camName)}")
+        // ★ 2026-08-29 按"朝向意图"选镜头（0=后置/1=前置；越界值退化为数组下标 = 旧行为）
+        val (camName, actualFacing) = resolveCameraNameByFacing(enumerator, deviceNames, facingTarget)
+        currentFacing = actualFacing
+        currentCameraName = camName
+        currentCameraIndex = deviceNames.indexOf(camName)
+        Log.i(TAG, "$tag [v2] 意图朝向=$facingTarget → 选中摄像头 #${currentCameraIndex}=$camName " +
+                "实际朝向=${if (actualFacing == CameraStreamManager.FACING_FRONT) "前置" else "后置"} 回退=$facingFellBack")
+        try {
+            signalingCallback?.onStatus(
+                "camera_opened",
+                "已打开${if (actualFacing == CameraStreamManager.FACING_FRONT) "前置" else "后置"}摄像头 $camName" + facingSuffix()
+            )
+        } catch (_: Throwable) {}
 
         Log.i(TAG, "$tag [v3] SurfaceTextureHelper.create 开始...")
         surfaceTextureHelper = try {

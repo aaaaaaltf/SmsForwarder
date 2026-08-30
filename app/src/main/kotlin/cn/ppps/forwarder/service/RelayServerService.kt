@@ -29,6 +29,7 @@ import cn.ppps.forwarder.utils.ACTION_STOP
 import cn.ppps.forwarder.utils.FRONT_CHANNEL_ID
 import cn.ppps.forwarder.utils.FRONT_CHANNEL_NAME
 import cn.ppps.forwarder.utils.FRONT_NOTIFY_ID
+import cn.ppps.forwarder.utils.DeviceIdentity
 import cn.ppps.forwarder.utils.RelaySettings
 import cn.ppps.forwarder.utils.SettingUtils
 import java.util.Timer
@@ -174,7 +175,7 @@ class RelayServerService : Service() {
             executor?.execute {
                 try {
                     // ★ 2026-08-06：传入中继client作为sender，文件下载等二进制推送经中继连接回传
-                    val result = RelayServerHandler.handle(cmd, payload, RelayServerHandler.CHANNEL_RELAY, client)
+                    val result = RelayServerHandler.handle(cmd, payload, RelayServerHandler.CHANNEL_RELAY, client, peerKey = client)
                     if (result != null) {
                         client?.send(result.first, result.second)
                     }
@@ -222,7 +223,7 @@ class RelayServerService : Service() {
                             return listener?.sendToSync(cid, cmd, payload, timeoutMs) ?: false
                         }
                     }
-                    val result = RelayServerHandler.handle(cmd, payload, RelayServerHandler.CHANNEL_DIRECT, directSender)
+                    val result = RelayServerHandler.handle(cmd, payload, RelayServerHandler.CHANNEL_DIRECT, directSender, peerKey = connId)
                     if (result != null) {
                         val (cid, _) = try {
                             val directListener = listener
@@ -269,12 +270,39 @@ class RelayServerService : Service() {
 
         // ★ 同时启动直连监听(56786)：接受控制端 TS/局域网直连（中继关闭时仍可被控制，恢复原直连能力）
         if (listener == null) {
+            // 回调里要用到"正在构造的这个监听器"，构造参数里自引用无法编译，
+            // 故先用一个在 start() 前就位、之后只读地指向它的槽位（回调只在 accept 线程触发）。
+            val listenerHolder = arrayOfNulls<RelayServerListener>(1)
             val l = RelayServerListener(
                 port = RelaySettings.relayServerPort,
                 onConnected = { Log.i(TAG, "直连监听端口 ${RelaySettings.relayServerPort} 已就绪") },
                 onDisconnected = { },
                 onCommand = onDirectCommand,
+                // ★★★ 2026-08-30 打通下发路径的关键一环：新控制端一连进来就主动朝它要一次
+                //   加密凭证下发（HELLO），不等"恰好抢到 60 秒节流窗口"的那条常规命令。
+                //   原实现只在 handle() 里顺手申请，同网多条连接并存时窗口被无关连接长期占住，
+                //   真正持有凭证的控制端一次 HELLO 都收不到 → 全新安装的手机永远拿不到凭证。
+                onNewConnection = { connId ->
+                    val listenerRef = listener ?: listenerHolder[0]
+                    if (listenerRef == null) {
+                        Log.w(TAG, "直连监听尚未就绪，跳过本次主动 HELLO#$connId")
+                    } else {
+                        val helloSender = object : RelaySender {
+                            override fun isConnected(): Boolean =
+                                listenerRef.connections[connId]?.isClosed == false
+                            override fun send(cmd: String, payload: ByteArray) =
+                                listenerRef.sendTo(connId, cmd, payload)
+                            override fun send(cmd: String, payload: String) =
+                                listenerRef.sendTo(connId, cmd, payload)
+                            override fun sendSync(cmd: String, payload: ByteArray, timeoutMs: Long): Boolean =
+                                listenerRef.sendToSync(connId, cmd, payload, timeoutMs)
+                        }
+                        // 本机已有凭证时 requestCredentialFrom 内部直接返回，不会多发任何帧
+                        RelayServerHandler.requestCredentialFrom(helloSender, connId, throttle = false)
+                    }
+                },
             )
+            listenerHolder[0] = l
             l.start()
             listener = l
             // ★ 注册直连监听为摄像头帧发送通道（直连模式下摄像头仍可用）
@@ -374,7 +402,7 @@ class RelayServerService : Service() {
                     try {
                         // ★ 2026-08-06：传入该控制端TS直连client作为sender（文件下载二进制推送回发该控制端）
                         Log.i(TAG, "★ TS直连 handle命令: cmd=$cmd payloadLen=${payload.size} phoneIp=$phoneIp")
-                        val result = RelayServerHandler.handle(cmd, payload, RelayServerHandler.CHANNEL_TS, tsDirectClients[phoneIp])
+                        val result = RelayServerHandler.handle(cmd, payload, RelayServerHandler.CHANNEL_TS, tsDirectClients[phoneIp], peerKey = phoneIp)
                         if (result != null) {
                             // ★ 响应经来源通道回传（查map取该控制端最新连接）
                             Log.i(TAG, "★ TS直连 响应发送: respCmd=${result.first} respLen=${result.second.length} phoneIp=$phoneIp")
@@ -508,7 +536,10 @@ class RelayServerService : Service() {
         } catch (e: Exception) {
             Log.w(TAG, "读取电量失败: ${e.message}")
         }
-        return "$name|${if (locked) 1 else 0}|${if (screenOn) 1 else 0}|$battery|$charging"
+        // ★★★ 2026-08-29 尾部追加第6字段【稳定唯一设备ID】。前面5个字段（名称|锁屏|屏幕|电量|充电）
+        //   的顺序与含义【完全不变】；旧控制端按索引只读前5段，多出的尾段被自然忽略 → 向后兼容。
+        //   用途：控制端判定"这个 100.x 是不是本机被控端的另一入口"时不再依赖无唯一性的状态指纹。
+        return "$name|${if (locked) 1 else 0}|${if (screenOn) 1 else 0}|$battery|$charging|${DeviceIdentity.uniqueDeviceId(this)}"
     }
 
     override fun onDestroy() {

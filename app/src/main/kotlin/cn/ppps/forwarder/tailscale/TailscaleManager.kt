@@ -27,14 +27,30 @@ import java.util.concurrent.CopyOnWriteArrayList
  */
 object TailscaleManager {
     private const val TAG = "TailscaleMgr"
-    private const val DEFAULT_AUTHKEY = "tskey-auth-kHFojQGTYV11CNTRL-EkjTQgBwRKWnTMyTHQ1EKWoCBbHeTp1h2"
+
+    /**
+     * ★ 2026-08-29：这里**故意留空**。原先硬编码的那把内置 authkey（kHFoj…）早已被判定失效
+     *   （日志 `invalid key: API key … not valid`），继续留在源码里既没用又是泄密面。
+     *   authkey 读取顺序见 getAuthkey()：构建期注入 → SP（含 OAuth 自动签发所得）→ 空则跳过登录并打日志。
+     */
+    private const val DEFAULT_AUTHKEY = ""
+
+    /** 历史遗留的失效 authkey 前缀：仅用于识别"SP 里存着的老垃圾值"，不是可用凭证 */
+    private const val LEGACY_BAD_AUTHKEY_PREFIX = "tskey-auth-kHFoj"
 
     // ★ 2026-08-24 修复被控端 authkey 失效（invalid key 导致 VPN 无法登录）：
     //   复用控制端(android_controller)的 OAuth 凭证，动态生成有效 AuthKey（reusable，90天有效期）
     private const val OAUTH_TOKEN_URL = "https://api.tailscale.com/api/v2/oauth/token"
     private const val OAUTH_KEYS_URL = "https://api.tailscale.com/api/v2/tailnet/-/keys"
-    private const val OAUTH_CLIENT_ID = "kFU76oNmro11CNTRL"
-    private const val OAUTH_CLIENT_SECRET = "tskey-client-kFU76oNmro11CNTRL-A4AUUnooLYPaR7JhH7cWYP2F1KepLAPZ"
+    // ★★★ 2026-08-29 删除此处曾硬编码的 OAuth 凭证（该 client 已在 tailnet 控制台被撤销，
+    //   拿它换 token 恒返回 HTTP 401 → 被控端自动签发 authkey 其实一直是坏的；继续留在源码里
+    //   既是个泄密面，又会让"签发失败"看起来像偶发网络问题）。
+    //   现在 OAuth 凭证只有两个来源，**绝不回落到源码常量**：
+    //     1) 构建期注入：./gradlew -PtsOAuthClientId=... -PtsOAuthClientSecret=...
+    //        （或环境变量 TS_OAUTH_CLIENT_ID / TS_OAUTH_CLIENT_SECRET）
+    //     2) 运行期由控制端经 CMD_TAILSCALE_CRED("tscred000000") 加密下发，
+    //        Keystore 包裹落盘，读取见 TailscaleCredGuard.loadOAuthClientId/Secret。
+    //   两者都没有时 oauthCreateAuthKey() 打日志后跳过（不再拿废弃凭证去撞 401）。
     private const val OAUTH_DEVICE_TAG = "tag:remote-device"
     private const val SP_KEY_AUTHKEY = "tailscale_authkey"
 
@@ -133,13 +149,24 @@ object TailscaleManager {
     }
 
     fun getAuthkey(ctx: Context): String {
+        val injected = try {
+            cn.ppps.forwarder.BuildConfig.TS_AUTHKEY
+        } catch (_: Throwable) { "" } ?: ""
+        if (injected.isNotBlank()) return injected.trim()
         val sp = ctx.getSharedPreferences("tailscale_settings", Context.MODE_PRIVATE)
-        return sp.getString(SP_KEY_AUTHKEY, DEFAULT_AUTHKEY) ?: DEFAULT_AUTHKEY
+        return (sp.getString(SP_KEY_AUTHKEY, DEFAULT_AUTHKEY) ?: DEFAULT_AUTHKEY).trim()
     }
 
-    /** ★ 2026-08-24：通过 OAuth 动态创建有效 AuthKey（修复内置默认key失效导致登录失败） */
-    fun oauthCreateAuthKey(): String? {
-        val token = oauthAccessToken() ?: run {
+    /** ★ 2026-08-24：通过 OAuth 动态创建有效 AuthKey（修复内置默认key失效导致登录失败）
+     *  ★ 2026-08-29：凭证不再硬编码；缺失时直接跳过，不再拿空凭证去撞 401。 */
+    fun oauthCreateAuthKey(ctx: Context): String? {
+        val cid = resolveOAuthClientId(ctx)
+        val secret = resolveOAuthClientSecret(ctx)
+        if (cid.isEmpty() || secret.isEmpty()) {
+            Log.i(TAG, "★ 本机无可用 OAuth 凭证（未构建期注入、控制端也尚未下发），跳过自动签发 AuthKey")
+            return null
+        }
+        val token = oauthAccessToken(ctx, cid, secret) ?: run {
             Log.w(TAG, "OAuth 获取 access_token 失败")
             return null
         }
@@ -161,7 +188,8 @@ object TailscaleManager {
                 Log.w(TAG, "OAuth 创建 AuthKey 响应字段缺失: " + resp)
                 return null
             }
-            Log.i(TAG, "★ OAuth 创建 AuthKey 成功: id=" + keyId)
+            Log.i(TAG, "★ OAuth 创建 AuthKey 成功: id=" + keyId +
+                    " (cred " + TailscaleCredGuard.describeForLog(cid, secret) + ")")
             return key
         } catch (t: Throwable) {
             Log.w(TAG, "OAuth 创建 AuthKey 异常: " + t.message)
@@ -169,13 +197,81 @@ object TailscaleManager {
         }
     }
 
-    private fun oauthAccessToken(): String? {
-        val form = "client_id=" + OAUTH_CLIENT_ID + "&client_secret=" + OAUTH_CLIENT_SECRET + "&grant_type=client_credentials"
+    /**
+     * OAuth client_id 读取顺序（★ 绝不回落到源码常量）：
+     *   1. 构建期注入 BuildConfig.TS_OAUTH_CLIENT_ID（-PtsOAuthClientId= / 环境变量）
+     *   2. 控制端加密下发所得（TailscaleCredGuard，Android Keystore 包裹后存 SP）
+     *   3. 空串 —— 调用方据此跳过并打日志
+     */
+    private fun resolveOAuthClientId(ctx: Context): String {
+        val injected = try {
+            cn.ppps.forwarder.BuildConfig.TS_OAUTH_CLIENT_ID
+        } catch (_: Throwable) { "" } ?: ""
+        if (injected.isNotBlank()) return injected.trim()
+        return TailscaleCredGuard.loadOAuthClientId(ctx).trim()
+    }
+
+    /** OAuth client_secret 读取顺序，同 resolveOAuthClientId */
+    private fun resolveOAuthClientSecret(ctx: Context): String {
+        val injected = try {
+            cn.ppps.forwarder.BuildConfig.TS_OAUTH_CLIENT_SECRET
+        } catch (_: Throwable) { "" } ?: ""
+        if (injected.isNotBlank()) return injected.trim()
+        return TailscaleCredGuard.loadOAuthClientSecret(ctx).trim()
+    }
+
+    /** 是否已持有可用于签发 AuthKey 的 OAuth 凭证 */
+    fun hasOAuthCred(ctx: Context): Boolean =
+        resolveOAuthClientId(ctx).isNotEmpty() && resolveOAuthClientSecret(ctx).isNotEmpty()
+
+    /** 刚拿到新凭证时置为 true，签发结束后清零：避免同一时刻多个下发帧并发签发 */
+    @Volatile
+    private var provisioning = false
+
+    /**
+     * ★ 2026-08-29 控制端刚下发了 OAuth 凭证 → 立刻尝试签发 AuthKey 并重登，
+     *   不必等下一次冷启动（本方法由 RelayServerHandler 在落盘成功后调用）。
+     *
+     * 只做"签发 + 重新发起登录"，**绝不在这里碰 VpnService.shutdown/establish**
+     * （见 onVpnEstablished 的教训：Go→JNI 回调线程上同步关 VPN 会触发
+     *  ipnlocal watchdog timeout SIGABRT）。
+     */
+    fun onCredentialStored(ctx: Context) {
+        val current = runCatching { getAuthkey(ctx) }.getOrNull() ?: ""
+        if (current.isNotEmpty() && !current.startsWith(LEGACY_BAD_AUTHKEY_PREFIX)) {
+            Log.i(TAG, "★ 已持有 authkey，新凭证将在下次签发/登录时生效（无需立即重登）")
+            return
+        }
+        if (provisioning) {
+            Log.i(TAG, "★ 已有签发任务在跑，忽略本次触发")
+            return
+        }
+        provisioning = true
+        Thread({
+            try {
+                val k = oauthCreateAuthKey(ctx)
+                if (k != null) {
+                    setAuthkey(ctx, k)
+                    Log.i(TAG, "★ 凭证下发后立即签发 AuthKey 成功，重新发起登录")
+                    startLogin(ctx)
+                } else {
+                    Log.w(TAG, "★ 凭证下发后签发 AuthKey 仍失败（换取 token 未成功）")
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "凭证下发后自动签发异常: " + t.message)
+            } finally {
+                provisioning = false
+            }
+        }, "TsCred-Provision").apply { isDaemon = true }.start()
+    }
+
+    private fun oauthAccessToken(ctx: Context, clientId: String, clientSecret: String): String? {
+        val form = "client_id=" + clientId + "&client_secret=" + clientSecret + "&grant_type=client_credentials"
         val resp = httpPost(OAUTH_TOKEN_URL, form, null, "application/x-www-form-urlencoded")
             ?: return null
         return try {
             val token = JSONObject(resp).optString("access_token", "")
-            if (token.isEmpty()) { Log.w(TAG, "OAuth 无 access_token: " + resp); null } else token
+            if (token.isEmpty()) { Log.w(TAG, "OAuth 无 access_token（响应见上一行日志）"); null } else token
         } catch (t: Throwable) {
             Log.w(TAG, "OAuth 解析 token 异常: " + t.message)
             null
@@ -248,19 +344,21 @@ object TailscaleManager {
         val a = app ?: return
         try {
             var authkey = getAuthkey(ctx)
-            // ★ 2026-08-24 修复：内置默认 authkey 已失效（日志 invalid key: API key kHFoj... not valid），
-            //   导致被控端 Tailscale 无法登录、VPN 无法建立、无法直连。
-            //   检测到使用默认key时，后台通过 OAuth 动态获取有效 AuthKey 并重新登录（OAuth完成前先用默认key走流程）
-            if (authkey == DEFAULT_AUTHKEY || authkey.startsWith("tskey-auth-kHFoj")) {
+            // ★ 2026-08-24 修复：内置默认 authkey 已失效（日志 invalid key），导致被控端 Tailscale
+            //   无法登录、VPN 无法建立、无法直连。
+            // ★ 2026-08-29 改造：凭证不再写死。authkey 为空（既没构建期注入也没下发过）或仍是
+            //   SP 里的历史垃圾值时，后台尝试用 OAuth 现签发一把新 AuthKey 并重新登录；
+            //   本机还没有 OAuth 凭证时 oauthCreateAuthKey 会自行跳过并打日志（等控制端下发）。
+            if (authkey.isEmpty() || authkey.startsWith(LEGACY_BAD_AUTHKEY_PREFIX)) {
                 Thread({
                     try {
-                        val k = oauthCreateAuthKey()
+                        val k = oauthCreateAuthKey(ctx)
                         if (k != null) {
                             setAuthkey(ctx, k)
                             Log.i(TAG, "★ OAuth 动态获取 AuthKey 成功，重新登录")
                             startLogin(ctx)
                         } else {
-                            Log.w(TAG, "★ OAuth 获取 AuthKey 失败，沿用默认key（后续登录可能失败）")
+                            Log.w(TAG, "★ 暂无法自动签发 AuthKey（无凭证或换取失败），等待控制端下发凭证后自动重试")
                         }
                     } catch (t: Throwable) {
                         Log.w(TAG, "OAuth authkey 处理异常: " + t.message)
@@ -301,7 +399,14 @@ object TailscaleManager {
             callLocal(a, "PATCH", "/localapi/v0/prefs", """{"LoggedOut": false}""")
             // 2) 用 authkey 启动（WantRunning=true + Hostname 识别被控端）
             //    ★ AuthKey 由 start 携带即可触发认证；此路径 regen=false，能复用磁盘上已有的 nodekey。
-            val body = """{"UpdatePrefs":{"WantRunning":true,"Hostname":"$host"},"AuthKey":"$authkey"}"""
+            //    ★ 2026-08-29：authkey 为空时不再把 "AuthKey":"" 塞进请求（以前靠内置垃圾默认值兜底），
+            //      只置 WantRunning，等控制端下发凭证 → 自动签发 AuthKey → onCredentialStored 重新登录。
+            val body = if (authkey.isEmpty()) {
+                Log.i(TAG, "★ 本机暂无 authkey，仅置 WantRunning（等待控制端下发 OAuth 凭证后自动签发登录）")
+                """{"UpdatePrefs":{"WantRunning":true,"Hostname":"$host"}}"""
+            } else {
+                """{"UpdatePrefs":{"WantRunning":true,"Hostname":"$host"},"AuthKey":"$authkey"}"""
+            }
             callLocal(a, "POST", "/localapi/v0/start", body)
             backendStarted = true
             Log.i(TAG, "★ Tailscale authkey 登录已发起（regen=false 复用路径）")
@@ -636,18 +741,27 @@ object TailscaleManager {
         }
     }
 
-    /** 获取在线成员 IP（100.64.x，排除本机） */
+    /**
+     * 获取尾网成员 IP（100.64.x，排除本机）。
+     *
+     * ★ 2026-08-29 修复"新装控制端永远发现不了"：原先只返回 Online=true 的成员，
+     *   但 Peer.Online 不可靠——刚登录/刚换 key 的控制端节点已在 netmap 里却可能长期不被标记在线，
+     *   于是它根本进不了候选，56789 实时探测永远不会打给它。
+     *   现在返回全部成员 IP（在线优先，其余按 LastSeen 新→旧），
+     *   可达性完全交给 TailscaleDirectScanner 的实际 TCP 探测判定。
+     */
     fun getOnlineMemberIps(): List<String> {
         val json = statusJson() ?: return emptyList()
         return try {
             val obj = JSONObject(json)
             val self = obj.optJSONObject("Self")
-            val selfIp = self?.optJSONArray("TailscaleIPs")?.let { arr ->
+            // ★ 2026-08-29：排除本机【全部】IPv4（原来只排除第一个，同机双节点时第二个入口会被当成外部成员）
+            val selfIps = mutableSetOf<String>()
+            self?.optJSONArray("TailscaleIPs")?.let { arr ->
                 for (i in 0 until arr.length()) {
                     val ip = arr.optString(i)
-                    if (ip.contains(".")) return@let ip
+                    if (ip.contains(".")) selfIps.add(ip)
                 }
-                null
             }
             val result = mutableListOf<String>()
             // ★ 2026-08-16 修复：localapi /status 的 Peer 是 map（{nodeKey:{…}}）而非数组，
@@ -670,16 +784,39 @@ object TailscaleManager {
                     list
                 } else emptyList()
             }
+            // 在线成员先加入；未标记在线的成员按 LastSeen 新→旧补在后面，
+            // 可达性由 TailscaleDirectScanner 的 probeControl(56789) 实时判定。
+            val offlinePeers = mutableListOf<org.json.JSONObject>()
             for (peer in peers) {
-                if (!peer.optBoolean("Online", false)) continue
+                if (!peer.optBoolean("Online", false)) {
+                    offlinePeers.add(peer)
+                    continue
+                }
                 val ips = peer.optJSONArray("TailscaleIPs") ?: continue
                 for (j in 0 until ips.length()) {
                     val ip = ips.optString(j)
-                    if (ip.contains(".") && ip != selfIp) {
+                    if (ip.contains(".") && ip !in selfIps && !result.contains(ip)) {
                         result.add(ip)
                         break
                     }
                 }
+            }
+            offlinePeers.sortByDescending { it.optLong("LastSeen", 0L) }
+            var appended = 0
+            for (peer in offlinePeers) {
+                val ips = peer.optJSONArray("TailscaleIPs") ?: continue
+                for (j in 0 until ips.length()) {
+                    val ip = ips.optString(j)
+                    if (ip.contains(".") && ip !in selfIps && !result.contains(ip)) {
+                        result.add(ip)
+                        appended++
+                        break
+                    }
+                }
+            }
+            if (appended > 0) {
+                Log.i("TailscaleMgr", "★ getOnlineMemberIps: 追加 $appended 个未标记Online的成员IP作为探测候选" +
+                        "（Online 标志不可靠，由实时 TCP 探测判定可达性）")
             }
             result
         } catch (t: Throwable) {

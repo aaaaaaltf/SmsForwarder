@@ -305,6 +305,46 @@ object PermissionProbe {
         return TouchControlService.instance != null
     }
 
+    /**
+     * 无障碍服务是否在 manifest 里声明过（决定"未启用"是"从没开过"还是"被清掉"）。
+     * 只读 PackageManager，不需要任何授权。
+     */
+    fun isAccessibilityDeclared(ctx: Context): Boolean = try {
+        val info = ctx.packageManager.getPackageInfo(
+            ctx.packageName, android.content.pm.PackageManager.GET_SERVICES
+        )
+        val want = ComponentName(ctx, TouchControlService::class.java).className
+        (info.services ?: emptyArray()).any { it.name == want }
+    } catch (t: Throwable) {
+        Log.w(TAG, "读无障碍服务声明失败: ${t.message}")
+        false
+    }
+
+    /** 记一次"无障碍确实启用过"（进程内缓存 + 持久化，跨 force-stop 存活）。 */
+    fun markAccessibilityEverEnabled(ctx: Context) {
+        if (accEverEnabledCache) return
+        accEverEnabledCache = true
+        try {
+            ctx.applicationContext.getSharedPreferences(ACC_SP_FILE, Context.MODE_PRIVATE)
+                .edit().putBoolean(ACC_SP_KEY, true).apply()
+        } catch (t: Throwable) {
+            Log.w(TAG, "登记无障碍曾启用失败: ${t.message}")
+        }
+    }
+
+    /** 本 App 是否曾检测到无障碍处于启用状态。 */
+    fun hasAccessibilityEverEnabled(ctx: Context): Boolean {
+        if (accEverEnabledCache) return true
+        return try {
+            val v = ctx.applicationContext.getSharedPreferences(ACC_SP_FILE, Context.MODE_PRIVATE)
+                .getBoolean(ACC_SP_KEY, false)
+            if (v) accEverEnabledCache = true
+            v
+        } catch (t: Throwable) {
+            false
+        }
+    }
+
     /** VPN（Tailscale）授权是否仍有效：VpnService.prepare 返回 null 即已授权。含 binder 调用，勿在主线程轮询。 */
     fun isVpnAuthorized(ctx: Context): Boolean = try {
         TailscaleManager.isVpnAuthorized(ctx)
@@ -365,13 +405,59 @@ object PermissionProbe {
     }
 
     /**
+     * ★★ 2026-08-29 红米K40 实测：`pm revoke` 之后 MIUI(LBE) 的
+     * shouldShowRequestPermissionRationale 同样返回 false，因此"未授予 + 不需要解释"
+     * 【不能】直接等于"永久拒绝"。曾导致启动自检把 7 项只是未授予的权限
+     * 全部标成「已被永久拒绝（系统不再弹框，只能去设置里改）」，误导用户与排查。
+     * 这里补上本方法自己文档要求的前提：只有本 App 真正发起过 requestPermissions
+     * 的权限，才允许被判为永久拒绝。登记表持久化，避免进程重启后忘掉。
+     */
+    private const val ASKED_SP_FILE = "perm_runtime_asked"
+    private const val ACC_SP_FILE = "perm_accessibility_state"
+    private const val ACC_SP_KEY = "acc_ever_enabled"
+    @Volatile private var accEverEnabledCache: Boolean = false
+    private const val ASKED_SP_KEY = "asked_perms"
+    private val askedCache = java.util.Collections.newSetFromMap(
+        java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+    )
+
+    /** 登记"已向系统发起过申请"的权限（由 PermissionRequests 在真正 requestPermissions 前调用）。 */
+    fun markRuntimeRequested(ctx: Context, perms: Collection<String>) {
+        if (perms.isEmpty()) return
+        askedCache.addAll(perms)
+        try {
+            val sp = ctx.applicationContext.getSharedPreferences(ASKED_SP_FILE, Context.MODE_PRIVATE)
+            val cur = sp.getString(ASKED_SP_KEY, "") ?: ""
+            val merged = (cur.split(';').filter { it.isNotBlank() } + perms).distinct()
+            sp.edit().putString(ASKED_SP_KEY, merged.joinToString(";")).apply()
+        } catch (t: Throwable) {
+            Log.w(TAG, "登记已申请权限失败: ${t.message}")
+        }
+    }
+
+    /** 该权限是否已被本 App 真正申请过（进程内缓存 + 持久化）。 */
+    fun hasRuntimeRequested(ctx: Context, permission: String): Boolean {
+        if (askedCache.contains(permission)) return true
+        return try {
+            val sp = ctx.applicationContext.getSharedPreferences(ASKED_SP_FILE, Context.MODE_PRIVATE)
+            val cur = sp.getString(ASKED_SP_KEY, "") ?: ""
+            if (cur.split(';').any { it == permission }) {
+                askedCache.add(permission); true
+            } else false
+        } catch (t: Throwable) {
+            false
+        }
+    }
+
+    /**
      * 是否"永久拒绝"（勾选不再询问 / MIUI 直接置为 USER_FIXED）：
-     * 未授予 + shouldShowRequestPermissionRationale=false → 系统不会再弹框，只能跳设置页。
-     * 注意：从未询问过的权限同样返回 false，所以调用方必须保证这是"申请过一次之后"的检测。
+     * 未授予 + 本 App 已真正申请过 + shouldShowRequestPermissionRationale=false → 系统不会再弹框。
+     * 缺少"已申请过"这一前提时会大量误判（见上方说明），故此处三重条件缺一不可。
      */
     fun isRuntimePermanentlyDenied(activity: android.app.Activity, permission: String): Boolean {
         return try {
             if (checkRuntime(activity, permission) == GrantState.GRANTED) return false
+            if (!hasRuntimeRequested(activity, permission)) return false
             val shouldExplain = androidx.core.app.ActivityCompat.shouldShowRequestPermissionRationale(activity, permission)
             // Android 11+(API 30) 起：连续两次拒绝后系统自动等同"不再询问"，用 appops 兜底更准
             if (!shouldExplain) return true
@@ -480,17 +566,36 @@ object PermissionProbe {
                 detector = "Settings.canDrawOverlays",
             )
         )
-        out.add(
-            PermStatus(
-                key = "accessibility",
-                label = "无障碍服务（远程触摸/远程桌面点击）",
-                kind = PermissionKind.SPECIAL,
-                state = if (isAccessibilityEnabled(ctx)) GrantState.GRANTED else GrantState.DENIED,
-                autoFixable = false,
-                manualSteps = if (!isAccessibilityEnabled(ctx)) accessibilityManualSteps() else "",
-                detector = "Settings.Secure.enabled_accessibility_services + AccessibilityManager 已启用服务列表 + 服务实例",
+        run {
+            val accEnabled = isAccessibilityEnabled(ctx)
+            // ★★ 2026-08-29 遗留项落实：MIUI 上 `am force-stop` / 一键清理会清空
+            // Settings.Secure.enabled_accessibility_services（实测复现 2 次，App 无法自愈），
+            // 旧清单只会笼统说"未授予"，看不出是"从没开过"还是"被系统偷偷清掉"。
+            // 这里把"曾经启用过"持久化，下次声明了却未启用 → 显式提示"曾被系统清除，需重新勾选"。
+            // 不做自动回写 Settings.Secure：那需要 WRITE_SECURE_SETTINGS，普通应用无权也不该绕过。
+            if (accEnabled) markAccessibilityEverEnabled(ctx)
+            val cleared = !accEnabled && isAccessibilityDeclared(ctx) && hasAccessibilityEverEnabled(ctx)
+            out.add(
+                PermStatus(
+                    key = "accessibility",
+                    label = if (cleared) "无障碍服务（远程触摸/远程桌面点击）【曾被系统清除】"
+                            else "无障碍服务（远程触摸/远程桌面点击）",
+                    kind = PermissionKind.SPECIAL,
+                    state = if (accEnabled) GrantState.GRANTED else GrantState.DENIED,
+                    autoFixable = false,
+                    manualSteps = when {
+                        accEnabled -> ""
+                        cleared -> "⚠ 该服务此前开启过，现已被系统清除（MIUI 强制停止/一键清理会清空无障碍" +
+                                "开关，App 无权自行恢复），必须重新手工勾选一次：\\n" + accessibilityManualSteps()
+                        else -> accessibilityManualSteps()
+                    },
+                    detector = if (cleared)
+                        "本组件在 manifest 声明为无障碍服务，但 Settings.Secure.enabled_accessibility_services" +
+                                " 已不含它，且本 App 曾检测到它启用过 → 判定为被系统清除"
+                    else "Settings.Secure.enabled_accessibility_services + AccessibilityManager 已启用服务列表 + 服务实例",
+                )
             )
-        )
+        }
         run {
             val st = if (isScreenCaptureAuthorized(ctx)) GrantState.GRANTED else GrantState.DENIED
             out.add(

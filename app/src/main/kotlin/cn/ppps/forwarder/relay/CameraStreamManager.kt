@@ -45,6 +45,62 @@ object CameraStreamManager {
     private var cameraThread: HandlerThread? = null
     private var cameraHandler: Handler? = null
 
+    // ★★★ 2026-08-29 前/后摄像头准确识别：
+    //   - 不再把控制端传来的 0/1 当 cameraIdList 数组下标（多摄手机下下标1可能是超广角而非前置）
+    //   - 改为：0 = 意图打开后置(LENS_FACING_BACK)；1 = 意图打开前置(LENS_FACING_FRONT)
+    //   - 在 tryOpenCamera 中遍历 cameraIdList，按 CameraCharacteristics.LENS_FACING 精确匹配
+    //   - 负数/2+ 保留 legacy：作为 cameraIdList 数组下标直接使用（兼容旧控制端）
+    // ★★ 重要区分（2026-08-29 真机实测修出的反向BUG）：
+    //   线上协议语义固定为 0=后置 / 1=前置（与旧版控制端一致），
+    //   但 CameraCharacteristics.LENS_FACING_BACK == 1、LENS_FACING_FRONT == 0 —— 数值正好相反！
+    //   绝不能把平台枚举值直接当协议值用，必须经 lensFacingToWire()/wireToLensFacing() 转换。
+    /** 协议/帧头/回报使用的朝向语义：0 = 后置 */
+    const val FACING_BACK = 0
+    /** 协议/帧头/回报使用的朝向语义：1 = 前置 */
+    const val FACING_FRONT = 1
+    /** 平台枚举：后置镜头（值=1） */
+    private const val LENS_BACK = CameraCharacteristics.LENS_FACING_BACK
+    /** 平台枚举：前置镜头（值=0） */
+    private const val LENS_FRONT = CameraCharacteristics.LENS_FACING_FRONT
+    /** 平台枚举：外接镜头（值=2）——既不算前也不算后，不参与朝向匹配 */
+    private const val LENS_EXTERNAL = CameraCharacteristics.LENS_FACING_EXTERNAL
+    /** 平台枚举 → 协议朝向；EXTERNAL/未知不参与前后置匹配，按后置处理 */
+    private fun lensFacingToWire(lens: Int): Int = when (lens) {
+        LENS_BACK -> FACING_BACK
+        LENS_FRONT -> FACING_FRONT
+        else -> FACING_BACK
+    }
+    /** 协议朝向 → 平台枚举 */
+    private fun wireToLensFacing(wire: Int): Int = if (wire == FACING_FRONT) LENS_FRONT else LENS_BACK
+    /** 当前使用的 cameraId（字符串，避免 cameraId="0"/"1"/"2"... 与 facing 语义混淆） */
+    @Volatile
+    private var currentCameraId: String? = null
+    /** 当前实际匹配到的朝向（LENS_FACING_BACK/FRONT/EXTERNAL）；用于帧头/状态回传/镜像翻转 */
+    @Volatile
+    private var currentFacing = FACING_BACK
+
+    /** ★ 2026-08-29 最近一次 start() 是否发生"按朝向没匹配到 → 回退"（回退时状态回报追加 |fallback=1） */
+    @Volatile
+    private var lastStartFallback = false
+
+    /** 供 RelayServerHandler 等调用方回报"实际朝向"（0=后置 / 1=前置 / 2=外接） */
+    fun currentFacingValue(): Int = currentFacing
+
+    /** 供调用方回报实际打开的 cameraId（可能为 null，表示尚未成功打开） */
+    fun currentCameraName(): String? = currentCameraId
+
+    /** 最近一次启动是否回退（控制端据此判断"UI 显示应与实际朝向一致"） */
+    fun lastStartHadFallback(): Boolean = lastStartFallback
+
+    /**
+     * ★★★ 2026-08-29 契约：追加到"现有摄像头状态/错误消息体"末尾的朝向段。
+     *   正常：|facing=<0|1>        0=后置(BACK) 1=前置(FRONT)
+     *   回退：|facing=<实际打开朝向>|fallback=1
+     *   控制端解析必须容忍不含该段的旧格式（缺失 → 不改 UI、不报错）。
+     */
+    fun facingSuffix(): String =
+        if (lastStartFallback) "|facing=$currentFacing|fallback=1" else "|facing=$currentFacing"
+
     @Volatile
     private var cameraIndex = 0
 
@@ -187,11 +243,15 @@ object CameraStreamManager {
 
     /**
      * 启动摄像头推流
-     * @param index 摄像头索引（0=后置，1=前置）
+     * ★ 2026-08-29 参数语义化（facingTarget = 朝向目标，不再是 cameraIdList 数组下标）：
+     *   - facingTarget=0 → 打开"第一个后置摄像头"（CameraCharacteristics.LENS_FACING_BACK 匹配）
+     *   - facingTarget=1 → 打开"第一个前置摄像头"（LENS_FACING_FRONT 匹配）
+     *   - facingTarget<0 或 >=2 → Legacy：按 cameraIdList 数组下标使用（兼容旧版控制端/其它调用方）
+     *   LENS_FACING_EXTERNAL 既不算前也不算后，不参与朝向匹配。
      * @return 是否成功启动
      */
     @Synchronized
-    fun start(index: Int): Boolean {
+    fun start(facingTarget: Int): Boolean {
         // ★ 2026-08-05修复：直连模式下中继client未连接（云服务关闭/中继不可达）时，
         //   只要存在任一已连接的发送通道（直连监听56786 / TS直连56789），摄像头仍可推流。
         //   原逻辑只检查中继client，导致直连模式摄像头永远启动失败。
@@ -201,42 +261,52 @@ object CameraStreamManager {
             Log.w(TAG, lastError!!)
             return false
         }
+        // ★★★ 2026-08-29 先把意图 facing 算出来，供后面 running 判断"同一个 facing 无需切换"
+        val intendedFacing = when (facingTarget) {
+            0 -> FACING_BACK
+            1 -> FACING_FRONT
+            else -> null // legacy：按数组下标，不做 facing 等价判断
+        }
         if (running) {
-            if (index == cameraIndex) {
-                // ★ 同一摄像头继续推流：推进流ID，让控制端识别为新会话（过滤中继缓冲的旧流帧）
+            if (intendedFacing != null && intendedFacing == currentFacing) {
+                // ★ 同一 facing 继续推流：推进流ID，让控制端识别为新会话（过滤中继缓冲的旧流帧）
                 streamId = maxOf(System.currentTimeMillis(), streamId + 1)
-                // ★ 省电：控制端重新打开同一路摄像头 = 明确"有人在收流"，重置空闲计时
                 touchConsumer()
-                Log.i(TAG, "摄像头流已在运行(camera=$cameraIndex)，推进流ID继续推流")
+                Log.i(TAG, "摄像头流已在运行(facing=${facingName(currentFacing)} id=$currentCameraId)，推进流ID继续推流")
+                reportCameraReadyToControl()
                 return true
             }
-            // ★ 不同索引：先停止旧流再启动新索引（应对STOP丢失后控制器直接发新索引START的情况）
-            // ★ 2026-08-10 修复：设置 inSwitchingStop，stop期间触发的onDisconnected/onError会忽略
-            //   不打断新流启动；同时start返回后额外sleep确保相机服务完全释放
-            Log.i(TAG, "摄像头正在运行(camera=$cameraIndex)，收到新索引START($index)，自动切换")
+            if (intendedFacing == null && facingTarget == cameraIndex) {
+                // Legacy 分支：同一下标 → 不变
+                streamId = maxOf(System.currentTimeMillis(), streamId + 1)
+                touchConsumer()
+                Log.i(TAG, "摄像头流已在运行(legacy index=$cameraIndex id=$currentCameraId)，推进流ID继续推流")
+                reportCameraReadyToControl()
+                return true
+            }
+            Log.i(TAG, "摄像头正在运行(facing=${facingName(currentFacing)} id=$currentCameraId)，收到新意图START(facingTarget=$facingTarget)，自动切换")
             inSwitchingStop = true
             try {
                 stop()
             } finally {
                 inSwitchingStop = false
             }
-            // ★ 切换stop后额外等待：某些机型（如小米/红米）CameraDevice.close释放后需200ms才能被openCamera拿到
             try { Thread.sleep(200) } catch (_: InterruptedException) {}
         }
-        cameraIndex = index
-        // ★ 每次启动生成严格递增的流ID：时间戳与上一流ID取较大者+1，保证单调递增
+        cameraIndex = facingTarget
+        lastStartFallback = false
+        currentFacing = intendedFacing ?: FACING_BACK // 打开前设置默认值；tryOpenCamera 中会再次用实际匹配覆盖
         streamId = maxOf(System.currentTimeMillis(), streamId + 1)
         lastError = null
 
         var opened = false
         try {
-            opened = tryOpenCamera(index)
+            opened = tryOpenCamera(facingTarget)
         } catch (e: Exception) {
             lastError = e.message
             Log.e(TAG, "启动摄像头流失败: ${e.message}")
         }
         if (!opened) {
-            // ★ 2026-08-26 优化重试策略：第1次500ms（瞬时占用），第2次3s（Android 14 FGS后台camera权限冻结窗口）
             for (retry in 1..2) {
                 val waitMs = if (retry == 1) 500L else 3000L
                 Log.w(TAG, "摄像头打开失败(${lastError})，第${retry}次等待${waitMs}ms后重试")
@@ -245,7 +315,7 @@ object CameraStreamManager {
                 } catch (_: InterruptedException) {
                 }
                 try {
-                    opened = tryOpenCamera(index)
+                    opened = tryOpenCamera(facingTarget)
                     if (opened) break
                 } catch (e: Exception) {
                     lastError = e.message
@@ -259,28 +329,115 @@ object CameraStreamManager {
         }
         running = true
         acquireWakeLock()
-        // ★ 2026-08-27 省电：启动"无人收流"看门狗（控制端掉线导致 STOP 丢失时自动释放摄像头与WakeLock）
         startIdleWatchdog()
+        // ★★★ 2026-08-29 启动成功 → 回传"实际打开的 facing"给控制端，让控制端 UI 显示文字与真实摄像头匹配
+        reportCameraReadyToControl()
         return true
     }
 
-    /** 打开摄像头并启动采集会话；openCamera 同步抛异常时返回 false */
-    private fun tryOpenCamera(index: Int): Boolean {
-        val cm = App.context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+    /** 把"协议朝向语义"翻译为中文名称（供日志/状态回传使用；只区分后置/前置） */
+    private fun facingName(facing: Int): String = when (facing) {
+        FACING_BACK -> "后置"
+        FACING_FRONT -> "前置"
+        else -> "未知$facing"
+    }
+
+    /** ★★★ 摄像头启动成功 → 向控制端回传"实际打开的摄像头（facing语义 + cameraId）"，
+     *  控制端据此校准 UI 显示，避免"UI写前置实际打开超广角"。
+     *  负载格式："<实际facing(0/1)>|success|摄像头流已启动 cameraId=xxx facing=后置/前置|facing=<0|1>[|fallback=1]" */
+    private fun reportCameraReadyToControl() {
+        try {
+            val line = "$currentFacing|success|摄像头流已启动 cameraId=$currentCameraId facing=${facingName(currentFacing)}" + facingSuffix()
+            val data = line.toByteArray(Charsets.UTF_8)
+            synchronized(senders) {
+                var sent = false
+                for (s in senders) {
+                    if (s.isConnected()) {
+                        try { s.send(RelayCommands.CMD_CAMERA_STATUS_REPORT, data); sent = true } catch (_: Exception) {}
+                    }
+                }
+                if (!sent) {
+                    try { client?.send(RelayCommands.CMD_CAMERA_STATUS_REPORT, data) } catch (_: Exception) {}
+                }
+            }
+            Log.i(TAG, "★ 回传摄像头就绪状态: $line")
+        } catch (_: Throwable) {}
+    }
+
+    /** ★★★ 2026-08-29 根据"控制端意图朝向"解析出实际 cameraId：
+     *   - facingTarget=0 → 枚举 cameraIdList 中第一个 LENS_FACING_BACK 镜头
+     *   - facingTarget=1 → 枚举 cameraIdList 中第一个 LENS_FACING_FRONT 镜头
+     *   - 其它值（越界）→ Legacy：cameraIdList[facingTarget]
+     *   返回：Pair(cameraId, 协议朝向0后置/1前置)。匹配失败自动回退到 cameraIdList[0] 并置 lastStartFallback。
+     *   同一朝向有多个镜头（超广角/微距/长焦）时只取列表第一个（通常是默认主摄），不做复杂分摄切换。 */
+    private fun resolveCameraId(cm: CameraManager, facingTarget: Int): Pair<String, Int> {
         val cameraIdList = cm.cameraIdList
-        if (cameraIdList.isEmpty()) {
+        if (cameraIdList.isEmpty()) throw RuntimeException("没有可用摄像头")
+        // 目标 facing：0=BACK，1=FRONT；其它 → legacy 下标模式（向后兼容）
+        val targetFacing: Int? = when (facingTarget) {
+            0 -> FACING_BACK
+            1 -> FACING_FRONT
+            else -> null
+        }
+        if (targetFacing != null) {
+            for (cid in cameraIdList) {
+                try {
+                    val chars = cm.getCameraCharacteristics(cid)
+                    val lens = chars.get(CameraCharacteristics.LENS_FACING) ?: continue
+                    // EXTERNAL(2) 既不算前也不算后：lensFacingToWire 不会把它匹配成任一目标
+                    if (lens == LENS_EXTERNAL || lens != wireToLensFacing(targetFacing)) continue
+                    if (lensFacingToWire(lens) == targetFacing) {
+                        Log.i(TAG, "★ resolveCameraId: 意图=${facingName(targetFacing)} → 匹配 cameraId=$cid (LENS_FACING=$lens)")
+                        return cid to targetFacing
+                    }
+                } catch (_: Exception) {}
+            }
+            Log.w(TAG, "★ resolveCameraId: 按朝向没有匹配到目标=${facingName(targetFacing)}，自动回退第一个可用摄像头（回报带 fallback=1）")
+        } else {
+            // Legacy：数组下标模式（越界值 / 旧控制端行为）
+            val idx = facingTarget.coerceIn(cameraIdList.indices)
+            val cid = cameraIdList[idx]
+            val wire = try {
+                lensFacingToWire(cm.getCameraCharacteristics(cid).get(CameraCharacteristics.LENS_FACING) ?: LENS_BACK)
+            } catch (_: Exception) { FACING_BACK }
+            Log.i(TAG, "★ resolveCameraId: legacy数组下标=$facingTarget→$idx → cameraId=$cid facing=${facingName(wire)}")
+            return cid to wire
+        }
+        // 兜底：取列表第一个（通常是后置主摄），并标记为"回退"
+        lastStartFallback = true
+        val fallback = cameraIdList.first()
+        val fbWire = try {
+            lensFacingToWire(cm.getCameraCharacteristics(fallback).get(CameraCharacteristics.LENS_FACING) ?: LENS_BACK)
+        } catch (_: Exception) { FACING_BACK }
+        Log.w(TAG, "★ resolveCameraId: 兜底 cameraId=$fallback facing=${facingName(fbWire)}")
+        return fallback to fbWire
+    }
+
+    /** 打开摄像头并启动采集会话；openCamera 同步抛异常时返回 false */
+    private fun tryOpenCamera(facingTarget: Int): Boolean {
+        val cm = App.context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        if (cm.cameraIdList.isEmpty()) {
             lastError = "没有可用摄像头"
             Log.w(TAG, "没有可用摄像头")
             return false
         }
-        val cameraId = if (index < cameraIdList.size) cameraIdList[index] else cameraIdList[0]
+        val (cameraId, matchedFacing) = resolveCameraId(cm, facingTarget)
+        currentCameraId = cameraId
+        currentFacing = matchedFacing
 
         // ★ 获取传感器方向和摄像头朝向，用于正确旋转图像
         try {
             val chars = cm.getCameraCharacteristics(cameraId)
             sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
-            lensFacing = chars.get(CameraCharacteristics.LENS_FACING) ?: CameraCharacteristics.LENS_FACING_BACK
-            Log.i(TAG, "摄像头$index(id=$cameraId) 传感器方向=$sensorOrientation 朝向=$lensFacing")
+            // 以枚举匹配的 matchedFacing（协议语义）为主；chars 能读到时二次确认（同样先转成协议语义）
+            val charsWire = lensFacingToWire(chars.get(CameraCharacteristics.LENS_FACING) ?: wireToLensFacing(matchedFacing))
+            if (charsWire != matchedFacing) {
+                Log.w(TAG, "resolveCameraId 与chars不一致(matched=$matchedFacing chars=$charsWire)，以chars为准")
+                currentFacing = charsWire
+            }
+            // lensFacing 供旋转/镜像判断使用，保持平台枚举语义
+            lensFacing = wireToLensFacing(currentFacing)
+            Log.i(TAG, "摄像头(意图朝向=$facingTarget) 最终id=$cameraId 传感器方向=$sensorOrientation 朝向=${facingName(currentFacing)}")
         } catch (e: Exception) {
             Log.w(TAG, "获取摄像头特征失败: ${e.message}")
             sensorOrientation = 0
@@ -301,8 +458,9 @@ object CameraStreamManager {
                 try {
                     val jpeg = convertYuvToJpeg(image)
                     if (jpeg != null && running) {
-                        // 帧负载: "摄像头索引|流ID|" + JPEG（流ID用于控制端过滤旧流残留帧）
-                        val header = "$cameraIndex|$streamId|".toByteArray(Charsets.UTF_8)
+                        // ★ 2026-08-29 帧负载格式: "实际facing语义|流ID|" + JPEG
+                        //   之前写 cameraIndex（数组下标），多摄手机上下标1可能等于超广角，控制端无法按帧头还原前后置
+                        val header = "$currentFacing|$streamId|".toByteArray(Charsets.UTF_8)
                         val data = header + jpeg
                         try {
                             // ★ 2026-08-05：逐通道发送——中继/直连监听/TS直连，只要有连接就推（直连模式下摄像头仍可用）
@@ -483,8 +641,7 @@ object CameraStreamManager {
     }
 
     /** YUV_420_888 转 JPEG（NV21 交错后 compressToJpeg）
-     *  ★ 前置摄像头(cameraIndex=1)垂直翻转，解决图像上下颠倒问题
-     */
+     *  ★ 镜像/旋转判断基于实际 currentFacing(LENS_FACING_FRONT)，而非 cameraIndex==1 */
     private fun convertYuvToJpeg(image: android.media.Image): ByteArray? {
         return try {
             val width = image.width

@@ -46,6 +46,10 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
 
     /** ★ 2026-08-28 用户是否已点击「一键授权」：只有为 true 时 onResume 才继续逐个打开系统页 */
     @Volatile
+    // ★ 2026-08-29 本次一键授权是否真的发起了批量运行时权限申请（决定报告时机）
+    private var batchRuntimeIssued = false
+    private var batchReportShown = false
+
     private var manualAuthFlowActive = false
 
     /** ★ 一键授权流程开始时间戳（用户从设置页返回后据此自动继续下一个授权界面） */
@@ -665,6 +669,22 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             cn.ppps.forwarder.permission.PermissionRequests.REQ_BATCH_RUNTIME -> {
                 val grantedCount = grantResults.count { it == android.content.pm.PackageManager.PERMISSION_GRANTED }
                 Log.i(TAG, "★ 批量运行时权限结果: 申请 ${grantResults.size} 项，授予 $grantedCount 项")
+                // ★ 走到这里说明系统确实就这些权限征询过用户 —— 此后"未授予 + 不再询问"才是
+                //   真正的永久拒绝（登记见 PermissionProbe.markRuntimeRequested）
+                cn.ppps.forwarder.permission.PermissionProbe.markRuntimeRequested(
+                    requireContext(), permissions.toList())
+                if (!batchReportShown) {
+                    // 用户点完授权队列后重新检测一遍再出清单，避免报告停留在过期结论
+                    batchReportShown = true
+                    batchRuntimeIssued = false
+                    handler.postDelayed({
+                        try {
+                            activity?.let { cn.ppps.forwarder.permission.KeepAliveGuardian.reportAndGuide(it) }
+                        } catch (e: Exception) {
+                            Log.e(TAG, "批量结果后生成授权报告异常: ${e.message}")
+                        }
+                    }, 800)
+                }
                 if (ok && grantResults.isNotEmpty()) {
                     XToastUtils.success("批量运行时权限已全部授予（$grantedCount 项）")
                 } else if (grantResults.isNotEmpty()) {
@@ -857,10 +877,16 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         manualAuthFlowStartTime = System.currentTimeMillis()
 
         try {
-            // ★ 2026-08-28 第 0 步（统一模块）：对"项目实际用到的"仍未授予的运行时权限做一次批量申请，
-            //   永久拒绝项由模块剔除（系统不会再弹框），后台定位单独走第二步。
+            // ★ 2026-08-28 第 0 步（统一模块）：对"项目实际用到的"仍未授予的运行时权限做一次批量申请。
+            // ★ 2026-08-29 红米K40 实测修正：
+            //   - 必须走 Fragment 通道发起（requestMissingRuntimeBatch(this)），
+            //     否则结果回不到下面 REQ_BATCH_RUNTIME 的收口分支（实测旧写法从不回调）；
+            //   - 批量不会被"永久拒绝"预判剔除（MIUI 上 pm revoke 后 shouldShowRationale 也是 false，
+            //     据此剔除会导致一项都不申请）；
+            //   - 后台定位单独发起（混在批量里会被系统直接拒绝）。
             try {
-                val batched = cn.ppps.forwarder.permission.PermissionRequests.requestMissingRuntimeBatch(requireActivity())
+                val batched = cn.ppps.forwarder.permission.PermissionRequests.requestMissingRuntimeBatch(this@ServerFragment)
+                batchRuntimeIssued = batched.isNotEmpty()
                 if (batched.isNotEmpty()) {
                     Log.i(TAG, "★ 一键授权：批量申请 ${batched.size} 项运行时权限")
                     cn.ppps.forwarder.permission.PermissionRequests.requestBackgroundLocation(requireActivity())
@@ -944,7 +970,27 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             //   让用户一眼看到还剩什么；同时写 logcat（tag=KeepAliveGuardian）便于 adb 无人化核对。
             handler.postDelayed({
                 try {
-                    activity?.let { cn.ppps.forwarder.permission.KeepAliveGuardian.reportAndGuide(it) }
+                    // ★ 2026-08-29 实测：MIUI 会把批量申请拆成一页一权限串行确认，7.5 秒时用户
+                    //   往往还在授权队列里，此时出的报告必然把"刚撤销/还没点完"的项全算成未授予
+                    //   （旧版还会标成"已被永久拒绝"），完全失真。改为等批量结果回调后再出报告；
+                    //   25 秒兜底：万一 ROM 不给回调，也至少出一份报告，不吞掉。
+                    if (batchRuntimeIssued) {
+                        Log.i(TAG, "★ 一键授权：已发起批量运行时权限申请，报告延后到结果回调（25s 兜底）")
+                        handler.postDelayed({
+                            if (!batchReportShown) {
+                                batchReportShown = true
+                                batchRuntimeIssued = false
+                                try {
+                                    activity?.let { cn.ppps.forwarder.permission.KeepAliveGuardian.reportAndGuide(it) }
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "兜底生成授权报告异常: ${e.message}")
+                                }
+                            }
+                        }, 25000)
+                    } else {
+                        batchReportShown = true
+                        activity?.let { cn.ppps.forwarder.permission.KeepAliveGuardian.reportAndGuide(it) }
+                    }
                 } catch (e: Exception) {
                     Log.e(TAG, "生成授权报告异常: ${e.message}")
                 }

@@ -25,6 +25,9 @@ class RelayServerListener(
     private val onConnected: () -> Unit,
     private val onDisconnected: () -> Unit,
     private val onCommand: (connId: Long, cmd: String, payload: ByteArray) -> Unit,
+    /** ★ 新控制端连接接入即回调（connId）：用于主动向这条新连接发一次凭证 HELLO，
+     *  否则它会被其它连接占着的节流窗口永久抢不到发送机会。 */
+    private val onNewConnection: ((connId: Long) -> Unit)? = null,
 ) : RelaySender {
     private val TAG = "RelayServerListener"
     private val sendLock = Any()
@@ -114,6 +117,9 @@ class RelayServerListener(
                     isDaemon = true
                     start()
                 }
+                // ★ 新对端接入 → 立刻给它一次主动申请凭证下发的机会（异常绝不打断接受循环）
+                runCatching { onNewConnection?.invoke(id) }
+                    .onFailure { Log.w(TAG, "新连接回调异常#$id: ${it.javaClass.simpleName}") }
             }
         } catch (e: Exception) {
             if (running) Log.e(TAG, "监听异常: ${e.message}")

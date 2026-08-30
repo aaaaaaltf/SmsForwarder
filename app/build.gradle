@@ -86,6 +86,21 @@ android {
 
         buildConfigField "String", "APP_MODE", "\"${appMode}\""
 
+        // ★★★ 2026-08-29 凭证注入位（★ 源码里没有任何真实凭证，默认全部为空串）：
+        //   优先级低于"控制端运行期经 tscred000000 加密下发所得"，
+        //   读取顺序见 tailscale/TailscaleManager.resolveOAuthClientId()。
+        //   正常构建（含 CI）都应保持为空，只有离线自测/首次预置才显式传值：
+        //     ./gradlew assembleDebug -PappMode=server -PtsOAuthClientId=... -PtsOAuthClientSecret=...
+        //     或设环境变量 TS_OAUTH_CLIENT_ID / TS_OAUTH_CLIENT_SECRET / TS_AUTHKEY
+        def tsPropOrEnv = { String propName, String envName ->
+            def v = project.findProperty(propName)
+            if (v == null || v.toString().trim().isEmpty()) { v = System.getenv(envName) }
+            (v == null ? "" : v.toString().trim()).replace('"', '')
+        }
+        buildConfigField "String", "TS_OAUTH_CLIENT_ID", "\"${tsPropOrEnv('tsOAuthClientId', 'TS_OAUTH_CLIENT_ID')}\""
+        buildConfigField "String", "TS_OAUTH_CLIENT_SECRET", "\"${tsPropOrEnv('tsOAuthClientSecret', 'TS_OAUTH_CLIENT_SECRET')}\""
+        buildConfigField "String", "TS_AUTHKEY", "\"${tsPropOrEnv('tsAuthKey', 'TS_AUTHKEY')}\""
+
         multiDexEnabled true
         //vectorDrawables.useSupportLibrary = true
 

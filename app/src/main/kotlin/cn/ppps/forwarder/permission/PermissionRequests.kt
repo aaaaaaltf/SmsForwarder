@@ -189,13 +189,20 @@ object PermissionRequests {
      */
     fun requestBatteryWhitelist(ctx: Context): OpenResult {
         if (PermissionProbe.isBatteryWhitelisted(ctx)) return OpenResult.NOT_NEEDED
-        // 1) 首选：直接弹系统确认框
+        // 1) 首选：发起系统级"忽略电池优化"请求
+        //    ★ 2026-08-29 实测措辞修正：原生 ROM 上是"忽略电池优化？"确认框；
+        //      MIUI(V816) 会把该 Intent 重定向到 com.miui.powerkeeper 的后台应用配置页
+        //      （HiddenAppsConfigActivity，即"省电策略"列表），需要用户再点一次"无限制"，
+        //      并不会出现确认框。日志只描述"已发起跳转"，落到哪种界面由 ROM 决定，
+        //      免得排查时误以为确认框被吞了。
         try {
             val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
             intent.data = Uri.parse("package:" + ctx.packageName)
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             ctx.startActivity(intent)
-            Log.i(TAG, "★ 已弹出「忽略电池优化」系统确认框")
+            Log.i(TAG, "★ 已发起「忽略电池优化」请求：原生 ROM 为系统确认框；" +
+                    "MIUI 实测会重定向到 com.miui.powerkeeper 后台配置页（需再选手动限制→无限制），" +
+                    "并非弹确认框")
             return OpenResult.OPENED
         } catch (e: ActivityNotFoundException) {
             Log.w(TAG, "ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS 不可用，走兜底: ${e.message}")
@@ -225,22 +232,29 @@ object PermissionRequests {
 
     /**
      * ★ 一次性批量申请"项目实际用到的"未授予运行时权限。
-     * 后台定位（Android 10+）与已"永久拒绝"的权限会被剔除：前者必须单独申请，
-     * 后者系统不会再弹框，只能跳应用详情页。
+     *
+     * ★★ 2026-08-29 红米K40(MIUI V816 / API33) 端到端实测结论：
+     *  1) 一次 requestPermissions 传 7 项【是有效的】，系统侧只拉起一个
+     *     com.lbe.security.miui/...GrantPermissionsActivity（整个流程 START 计数=1），
+     *     由 ROM 自己串行翻页逐项确认（实测 7 项全部走到、全部授予）。
+     *     即"一次覆盖多个权限"＝一个入口队列，而不是一个界面里放 7 个勾。
+     *  2) 【不剔除】可疑的"永久拒绝"项：实测 `pm revoke` 之后
+     *     shouldShowRequestPermissionRationale 同样返回 false，若据此把权限从批量里剔掉，
+     *     MIUI 上会变成"一项都不申请"，用户只能去设置页手点。是否真为永久拒绝，
+     *     改由申请结果回调（onRequestPermissionsResult）配合"已申请过"登记来判定，
+     *     见 PermissionProbe.isRuntimePermanentlyDenied。
+     *  3) 后台定位 ACCESS_BACKGROUND_LOCATION 不进批量（混在批量里会被系统直接拒绝），
+     *     仍由 requestBackgroundLocation 单独发起。
+     *
      * @return 实际发起申请的权限列表（空表示无需申请）
      */
     fun requestMissingRuntimeBatch(activity: Activity, requestCode: Int = REQ_BATCH_RUNTIME): List<String> {
-        val missing = mutableListOf<String>()
-        for (e in PermissionInventory.runtimeEntries) {
-            if (PermissionProbe.checkRuntime(activity, e.permission) != GrantState.GRANTED) {
-                if (PermissionProbe.isDeclared(activity, e.permission).not()) continue
-                missing.add(e.permission)
-            }
-        }
+        val missing = missingRuntimePermissions(activity)
         if (missing.isEmpty()) {
             Log.i(TAG, "★ 批量运行时权限：全部已授予，无需申请")
             return emptyList()
         }
+        PermissionProbe.markRuntimeRequested(activity, missing)
         try {
             androidx.core.app.ActivityCompat.requestPermissions(
                 activity, missing.toTypedArray(), requestCode
@@ -248,6 +262,44 @@ object PermissionRequests {
             Log.i(TAG, "★ 批量申请 ${missing.size} 项运行时权限: $missing")
         } catch (t: Throwable) {
             Log.e(TAG, "批量申请运行时权限异常: ${t.message}")
+        }
+        return missing
+    }
+
+    /**
+     * ★★ 2026-08-29 修复"批量申请没有结果收口"：必须用 Fragment.requestPermissions 发起，
+     * 结果才会带 Fragment 的 pending 标记回到 Fragment.onRequestPermissionsResult。
+     * 旧写法 ActivityCompat.requestPermissions(requireActivity(), …) 的 requestCode 不属于任何
+     * Fragment，androidx FragmentActivity.onRequestPermissionsResult 里 findRequestPending 命中不了，
+     * ServerFragment 中 REQ_BATCH_RUNTIME 分支（统计授予数 / 引导永久拒绝项）实测从未执行过。
+     */
+    fun requestMissingRuntimeBatch(fragment: androidx.fragment.app.Fragment, requestCode: Int = REQ_BATCH_RUNTIME): List<String> {
+        val activity = fragment.activity ?: return emptyList()
+        val missing = missingRuntimePermissions(activity)
+        if (missing.isEmpty()) {
+            Log.i(TAG, "★ 批量运行时权限：全部已授予，无需申请")
+            return emptyList()
+        }
+        PermissionProbe.markRuntimeRequested(activity, missing)
+        return try {
+            fragment.requestPermissions(missing.toTypedArray(), requestCode)
+            Log.i(TAG, "★ 批量申请 ${missing.size} 项运行时权限(Fragment 通道，有结果回调): $missing")
+            missing
+        } catch (t: Throwable) {
+            Log.e(TAG, "批量申请运行时权限异常(Fragment 通道): ${t.message}")
+            // 兜底退回 Activity 通道：至少把框弹出来，只是没有结果回调
+            requestMissingRuntimeBatch(activity, requestCode)
+        }
+    }
+
+    /** 批量清单：项目用到、manifest 已声明、当前未授予的运行时权限（后台定位除外）。 */
+    fun missingRuntimePermissions(ctx: Context): List<String> {
+        val missing = mutableListOf<String>()
+        for (e in PermissionInventory.runtimeEntries) {
+            if (PermissionProbe.checkRuntime(ctx, e.permission) != GrantState.GRANTED) {
+                if (PermissionProbe.isDeclared(ctx, e.permission).not()) continue
+                missing.add(e.permission)
+            }
         }
         return missing
     }

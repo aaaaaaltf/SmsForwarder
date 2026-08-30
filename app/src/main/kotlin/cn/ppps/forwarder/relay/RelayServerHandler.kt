@@ -14,6 +14,7 @@ import android.provider.ContactsContract
 import androidx.core.content.ContextCompat
 import cn.ppps.forwarder.utils.Log
 import cn.ppps.forwarder.App
+import cn.ppps.forwarder.tailscale.TailscaleCredGuard
 import cn.ppps.forwarder.entity.BatteryInfo
 import cn.ppps.forwarder.entity.CallInfo
 import cn.ppps.forwarder.entity.CloneInfo
@@ -26,6 +27,7 @@ import cn.ppps.forwarder.server.model.ContactQueryData
 import cn.ppps.forwarder.server.model.SmsQueryData
 import cn.ppps.forwarder.utils.AppUtils
 import cn.ppps.forwarder.utils.BatteryUtils
+import cn.ppps.forwarder.utils.DeviceIdentity
 import cn.ppps.forwarder.utils.HttpServerUtils
 import cn.ppps.forwarder.utils.PhoneUtils
 import cn.ppps.forwarder.utils.RelaySettings
@@ -133,8 +135,8 @@ object RelayServerHandler {
                             try {
                                 fallbackSender.send(
                                     RelayCommands.CMD_CAMERA_STATUS_REPORT,
-                                    if (okCam) "$fallbackCamera|success|摄像头流已启动(webrtc回退模式)"
-                                    else "$fallbackCamera|failed|${CameraStreamManager.lastError()}(webrtc回退失败)"
+                                    if (okCam) "${CameraStreamManager.currentFacingValue()}|success|摄像头流已启动(webrtc回退模式) cameraId=${CameraStreamManager.currentCameraName()}${CameraStreamManager.facingSuffix()}"
+                                else "$fallbackCamera|failed|${CameraStreamManager.lastError()}(webrtc回退失败)"
                                 )
                             } catch (_: Throwable) {}
                         }
@@ -246,14 +248,76 @@ object RelayServerHandler {
     }
 
     /**
+     * ★ 2026-08-29 凭证"申请"侧：本机还没有 OAuth 凭证时，借控制通道上任意一条常规命令
+     *   （探活/取状态/取配置等）向**同一个对端**发一帧 HELLO，请它回一次 v2 加密凭证下发。
+     *
+     * 为什么挂在命令处理里而不是"连接建立回调"里：
+     *   被控端同时有 中继(56786 出站) / 直连监听(56786 入站) / TS直连(56789) 三条控制通道，
+     *   只有 handle() 是所有通道唯一的收口点，且这里天然拿得到"该连接的 sender"，
+     *   能保证 HELLO 与随后的 tscred000000 应答走同一条链路，不会被发到另一个对端上。
+     *
+     * 失败/无凭证时绝不影响命令处理本身（全部 runCatching 包裹）。
+     */
+    private fun maybeRequestCredential(cmd: String, sender: RelaySender?, peerKey: Any?) {
+        if (sender == null) return
+        if (cmd == RelayCommands.CMD_TAILSCALE_CRED || cmd == RelayCommands.CMD_TAILSCALE_CRED_HELLO) return
+        requestCredentialFrom(sender, peerKey, throttle = true)
+    }
+
+    /**
+     * ★ 向指定对端发起一次"加密凭证下发"申请（HELLO）。
+     *
+     * @param peerKey   节流键 —— 必须用"这条连接"的稳定标识（直连用 connId、TS 直连用对端 IP、
+     *                  中继用 client 对象）。★ 不能用 sender 对象身份：直连监听的 directSender
+     *                  每条命令都新建一个对象，用它当键等于"永远不节流"。
+     * @param throttle  true = 遵守 60 秒窗口（命令路径的常规申请）；
+     *                  false = 新连接刚建立时的主动申请（绕过窗口，成功后再记时），
+     *                  否则新接入的对端会被别的连接占着的窗口永久抢不到机会。
+     * @return 是否真的把 HELLO 发了出去
+     */
+    fun requestCredentialFrom(
+        sender: RelaySender?,
+        peerKey: Any? = null,
+        throttle: Boolean = true,
+    ): Boolean {
+        if (sender == null) return false
+        try {
+            if (cn.ppps.forwarder.tailscale.TailscaleManager.hasOAuthCred(App.context)) return false
+            if (throttle && TailscaleCredGuard.helloThrottled(peerKey)) return false
+            val payload = TailscaleCredGuard.buildHelloPayload() ?: return false
+            val helloNonce = try {
+                org.json.JSONObject(payload).optString("n", "")
+            } catch (_: Throwable) { "" }
+            runCatching { sender.send(RelayCommands.CMD_TAILSCALE_CRED_HELLO, payload.toByteArray(Charsets.UTF_8)) }
+                .onFailure {
+                    // 发不出去就立刻作废这个会话，别把私钥多留在内存里
+                    TailscaleCredGuard.abandonHello(helloNonce)
+                    Log.w(TAG, "★ HELLO 发送失败: ${it.javaClass.simpleName}")
+                }
+                .onSuccess {
+                    // 主动申请路径不经过 helloThrottled()，这里补记时，避免下一条命令又立刻重发
+                    if (!throttle) TailscaleCredGuard.markHelloSent(peerKey)
+                    Log.i(TAG, "★ 已向控制端申请一次加密凭证下发 (session=${helloNonce.take(8)}, peer=${TailscaleCredGuard.describeThrottleKey(peerKey)}, 主动=${!throttle})")
+                }
+            return true
+        } catch (t: Throwable) {
+            Log.w(TAG, "★ 申请凭证下发异常: ${t.javaClass.simpleName}")
+            return false
+        }
+    }
+
+    /**
      * 处理收到的命令
      * @param channel 命令来源通道：CHANNEL_RELAY / CHANNEL_DIRECT / CHANNEL_TS（供屏幕推流模式选择）
      * @param sender 命令来源通道的发送器（★ 2026-08-06新增：文件下载等二进制推送用，由RelayServerService传入）
      * @return (响应命令, 响应负载JSON)，未知命令返回 null
      */
     fun handle(cmd: String, payload: ByteArray, channel: Int = CHANNEL_RELAY,
-               sender: RelaySender? = null): Pair<String, String>? {
+               sender: RelaySender? = null, peerKey: Any? = null): Pair<String, String>? {
         val payloadText = String(payload, Charsets.UTF_8)
+        // ★ 2026-08-29：顺手向该对端申请凭证下发（仅在本机尚无 OAuth 凭证时真正发出）
+        //   ★ 2026-08-30：节流改为"按对端连接"，键由调用方给出（connId / 对端 IP / 中继 client）
+        maybeRequestCredential(cmd, sender, peerKey)
         return try {
             when (cmd) {
                 RelayCommands.CMD_GET_CONFIG -> RelayCommands.RSP_CONFIG to success(handleConfig())
@@ -502,11 +566,58 @@ object RelayServerHandler {
                     RelayCommands.CMD_DEV_STATE to state
                 }
 
+                // ★★★ 2026-08-29 新增：控制端下发的 Tailscale OAuth 凭证（v2 加密信封）
+                //   openCredFrame 只认 v=2 的 X25519+AES-256-GCM 密文，且必须匹配本进程
+                //   先前发出的那一次 HELLO 会话（一次性、60 秒 TTL、防重放、绑 AAD）。
+                //   ★ 任何一步失败都只记日志并 return null —— 绝不写盘、绝不"当明文再试一次"。
+                RelayCommands.CMD_TAILSCALE_CRED -> {
+                    val cred = TailscaleCredGuard.openCredFrame(payload)
+                    if (cred == null) {
+                        Log.w(TAG, "★ 收到 tscred000000 但未通过 v2 解密校验，已拒绝（未改动本机凭证）")
+                        null
+                    } else {
+                        val (cid, secret) = cred
+                        val saved = TailscaleCredGuard.saveOAuthCred(App.context, cid, secret)
+                        Log.i(TAG, "★ 已收到控制端加密下发的 OAuth 凭证 " +
+                                TailscaleCredGuard.describeForLog(cid, secret) +
+                                " 落盘(Keystore包裹)=" + saved)
+                        if (saved) {
+                            // 立即用新凭证换取 AuthKey，不必等下次冷启动（不在本线程做 VPN 操作）
+                            try {
+                                cn.ppps.forwarder.tailscale.TailscaleManager.onCredentialStored(App.context)
+                            } catch (t: Throwable) {
+                                Log.w(TAG, "凭证下发后触发签发异常: ${t.javaClass.simpleName}")
+                            }
+                        }
+                        null
+                    }
+                }
+
+                // ★★★ 2026-08-29 修复#1：同机控制端没有自己的 localapi（SKIP_OWN_BACKEND），
+                //   由本进程（持有 libtailscale 后端）代答一份实时 tailnet 成员 IP 列表。
+                RelayCommands.CMD_GET_TS_MEMBERS -> {
+                    val members = try {
+                        cn.ppps.forwarder.tailscale.TailscaleManager.getOnlineMemberIps()
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "★ CMD_GET_TS_MEMBERS 取成员失败(返回空列表): ${t.message}")
+                        emptyList()
+                    }
+                    Log.i(TAG, "★ 收到 CMD_GET_TS_MEMBERS → 回吐 tailnet 成员 ${members.size} 个")
+                    RelayCommands.RSP_TS_MEMBERS to members.joinToString(",")
+                }
+
                 RelayCommands.CMD_CAMERA_STREAM_START -> {
                     if (!HttpServerUtils.enableApiCamera) return RelayCommands.CMD_CAMERA_STATUS_REPORT to error("0|failed|服务端已禁用摄像头")
-                    val index = payloadText.toIntOrNull() ?: 0
-                    val ok = CameraStreamManager.start(index)
-                    RelayCommands.CMD_CAMERA_STATUS_REPORT to if (ok) "$index|success|摄像头流已启动" else "$index|failed|${CameraStreamManager.lastError()}"
+                    // ★ 2026-08-29 payload 语义 = 朝向目标：0=后置(BACK) / 1=前置(FRONT)；
+                    //   越界值（如2/3）由 CameraStreamManager 退化为 cameraIdList 数组下标解释（旧行为，向后兼容）
+                    val facingTarget = payloadText.toIntOrNull() ?: CameraStreamManager.FACING_BACK
+                    val ok = CameraStreamManager.start(facingTarget)
+                    // 回报：首字段=实际打开的朝向（与帧头一致）；成功时末尾追加契约字段 |facing=<0|1>[|fallback=1]
+                    // 失败分支保持旧格式 "<target>|failed|原因"，旧控制端无需改动即可解析
+                    RelayCommands.CMD_CAMERA_STATUS_REPORT to if (ok)
+                        "${CameraStreamManager.currentFacingValue()}|success|摄像头流已启动 cameraId=${CameraStreamManager.currentCameraName()}${CameraStreamManager.facingSuffix()}"
+                    else
+                        "$facingTarget|failed|${CameraStreamManager.lastError()}"
                 }
 
                 RelayCommands.CMD_CAMERA_STREAM_STOP -> {
@@ -732,7 +843,9 @@ object RelayServerHandler {
         } catch (e: Exception) {
             Log.w(TAG, "读取电量失败: ${e.message}")
         }
-        return "$name|${if (locked) 1 else 0}|${if (screenOn) 1 else 0}|$battery|$charging"
+        // ★★★ 2026-08-29 与 RelayServerService.buildDeviceState 保持完全一致的尾部第6字段【唯一设备ID】。
+        //   前5字段（名称|锁屏|屏幕|电量|充电）顺序含义不变，只做尾追加 → 旧控制端忽略尾段即可。
+        return "$name|${if (locked) 1 else 0}|${if (screenOn) 1 else 0}|$battery|$charging|${DeviceIdentity.uniqueDeviceId(ctx)}"
     }
 
     private fun <T> parseData(json: String, clazz: Class<T>): T? {

@@ -232,6 +232,37 @@ object RelayCommands {
     const val CMD_GET_DEV_STATE = "sfgetst00000"
 
     /**
+     * ★★★ 2026-08-29 修复#1 新增（纯新增命令字，未改动任何既有命令字面值）：
+     *   查询【本机被控端的实时 tailnet 成员 IP 列表】。
+     *   存在理由：同机双 App 场景下控制端会 SKIP_OWN_BACKEND（复用被控端节点、避免双节点），
+     *   于是控制端进程里 app==null、自己没有任何 localapi 可用 → getOnlineMemberIps() 恒空，
+     *   华为控制端只能发现"历史名单里的设备"。被控端进程持有 libtailscale 后端，
+     *   控制端经 127.0.0.1:56786 向它要一份成员列表即可（两个 App 的 SP 相互隔离，
+     *   所以既有的 tailscale_status_cache 跨 App 读不到）。
+     *   请求：CMD_GET_TS_MEMBERS（空负载）
+     *   响应：RSP_TS_MEMBERS，负载 = 逗号分隔的成员 IPv4（已排除本机 Self）
+     *   PC 被控端不认识该命令 → 返回错误/无响应，控制端自动回落原有探测源（向后兼容）。
+     */
+    const val CMD_GET_TS_MEMBERS = "tsmemget0000"
+    const val RSP_TS_MEMBERS = "tsmemrsp0000"
+
+    /**
+     * ★★★ 2026-08-29 新增：Tailscale OAuth 凭证加密下发（与 PC 端 protocol/commands.py 同名命令字）
+     *
+     *  CMD_TAILSCALE_CRED_HELLO  被控端→控制端：申请"一次加密凭证下发"。
+     *      负载 = {"v":2,"pk":<本次临时X25519公钥b64>,"n":<helloNonce>,"ts":<秒>}
+     *      ★ 负载里不含任何凭证，只有公钥与随机 salt。
+     *  CMD_TAILSCALE_CRED        控制端→被控端：回一帧 v2 密文（X25519 ECDH + AES-256-GCM）。
+     *      负载 = {"v":2,"h":<回带的helloNonce>,"pk":<对端公钥>,"n":<IV>,"ts":<秒>,"ct":<密文>}
+     *      被控端解密后用 Android Keystore 包裹落盘（见 tailscale/TailscaleCredGuard.kt）。
+     *
+     *  这两个值是 PC(Python) / 手机被控端(Kotlin) / 手机控制端(Java) 三端共用的线上协议命令字，
+     *  ★ 字面值不可修改。协议只认 v=2：解不开一律拒绝，**绝不回落成"按明文 v1 解析"**。
+     */
+    const val CMD_TAILSCALE_CRED = "tscred000000"
+    const val CMD_TAILSCALE_CRED_HELLO = "tsckey000000"
+
+    /**
      * 解析帧命令前缀
      * @return (命令前缀, 负载字节)
      */
