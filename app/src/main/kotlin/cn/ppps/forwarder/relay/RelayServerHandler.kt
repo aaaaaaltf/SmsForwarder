@@ -52,20 +52,56 @@ object RelayServerHandler {
     /** ★ 2026-08-10 替换已删除控制端gson：使用本地Gson单例 */
     private val gson: Gson = GsonBuilder().serializeNulls().create()
 
+    // ============ ★ 2026-08-30：每控制端连接一份会话（修"两个控制端互踩"） ============
+    //
+    // 下面这些状态原本是 object RelayServerHandler 的**单例字段**：webrtc /
+    // webrtcCameraIndex / webrtcAudioOnly / fsDownloadCancelled / fsDownloadThread /
+    // fsAckBlock。而本端可同时被多个控制端连着（手机控制端 / TS直连 / 中继）：
+    //   · B 一连 WebRTC，`webrtc?.close(); webrtc = mgr` 就把 A 正在看的摄像头/麦克风顶掉，
+    //     A 从此黑屏且不会自动恢复；
+    //   · 任一连接发"取消下载"会把**另一个**控制端正在跑的下载一起取消；
+    //   · fsAckBlock 被两条下载共用，ACK 游标互相跳。
+    //
+    // ★ 键用 peerKey 而不是 sender：CHANNEL_DIRECT 的 directSender 是"每条命令新建一个
+    //   object : RelaySender"（RelayServerService.kt:196），按 sender 分桶等于每条命令
+    //   一个新会话，WebRTC 状态在 OFFER 之后的信令里就丢了。peerKey 按连接稳定：
+    //   中继=client 对象、直连=connId、TS直连=phoneIp。
+    //
+    // 回收：本 object 没有断开钩子可挂（链路实测每 15 秒还会重连），普通 Map 会无限
+    // 堆积 → WeakHashMap，连接对象被 GC 时条目自动消失（connId/phoneIp 是值类型，
+    // 装箱后同样随连接结束而回收）。
+    private class PeerSession {
+        @Volatile var webrtc: WebRtcSessionManager? = null
+        /** WebRTC 启动时请求的摄像头索引，用于失败回退到老 JPEG+PCM 模式 */
+        @Volatile var webrtcCameraIndex: Int = 0
+        /** 当前 WebRTC 会话是否纯音频模式（麦克风）：回退时只启老麦克风，不启摄像头 */
+        @Volatile var webrtcAudioOnly: Boolean = false
+        /** 本连接的文件下载取消标志（发 CMD_FS_CANCEL 后置 true，下载线程每块前检查） */
+        @Volatile var fsDownloadCancelled: Boolean = false
+        /** 本连接当前下载线程（互斥：防旧下载残留线程与新下载并发写同一 socket） */
+        @Volatile var fsDownloadThread: Thread? = null
+        /** 本连接的分块确认游标：控制端每收一块回 CMD_FS_ACK，未确认不继续发 */
+        @Volatile var fsAckBlock: Long = -1L
+    }
+
+    private val peerSessions: MutableMap<Any, PeerSession> =
+        java.util.Collections.synchronizedMap(java.util.WeakHashMap())
+    /** peerKey 为 null 的旧调用路径退到共享会话——行为与改动前完全一致 */
+    private val noKeySession = PeerSession()
+
+    private fun sessionOf(peerKey: Any?): PeerSession {
+        if (peerKey == null) return noKeySession
+        synchronized(peerSessions) {
+            peerSessions[peerKey]?.let { return it }
+            return PeerSession().also { peerSessions[peerKey] = it }
+        }
+    }
+
     // ==================== ★ WebRTC 会话：被控端作为 ANSWERER（控制端发 OFFER） ====================
-    /** 当前活跃的 WebRTC 会话；WebRTC模式下 摄像头+麦克风 都由 WebRtcSessionManager 统一管理 */
-    @Volatile
-    private var webrtc: WebRtcSessionManager? = null
-    /** WebRTC 启动时请求的摄像头索引，用于失败回退到老 JPEG+PCM 模式 */
-    @Volatile
-    private var webrtcCameraIndex: Int = 0
-    /** ★ 2026-08-11 当前WebRTC会话是否纯音频模式（麦克风WebRTC）：回退时只启老麦克风，不启摄像头 */
-    @Volatile
-    private var webrtcAudioOnly: Boolean = false
 
     /** 给 WebRtcSessionManager 发信令/状态：复用 sender(RelaySender) 的 sendText()/sendBin()，
      *  因 RelayServerHandler.handle 返回 String→String，所以直接用 sender 回发包 */
-    private fun makeWebrtcSignalingCallback(sender: RelaySender): WebRtcSessionManager.SignalingCallback {
+    private fun makeWebrtcSignalingCallback(sender: RelaySender, peerKey: Any?): WebRtcSessionManager.SignalingCallback {
         return object : WebRtcSessionManager.SignalingCallback {
             override fun onSignalingMessage(cmd: String, payloadText: String) {
                 Log.i(TAG, "★ WebRTC→Ctrl 发信令 cmd=$cmd payloadLen=${payloadText.length} senderType=${sender.javaClass.simpleName} connected=${sender.isConnected()}")
@@ -101,10 +137,10 @@ object RelayServerHandler {
             }
             override fun onError(reason: String) {
                 Log.e(TAG, "★ WebRTC 出错，尝试回退到老模式：$reason")
-                val fallbackCamera = webrtcCameraIndex
+                val fallbackCamera = sessionOf(peerKey).webrtcCameraIndex
                 val fallbackSender = sender
                 // ★ 2026-08-11 判断当前会话是否纯音频模式（麦克风WebRTC）：回退时只启动老麦克风，不启动摄像头
-                val webrtcIsAudioOnly = webrtcAudioOnly
+                val webrtcIsAudioOnly = sessionOf(peerKey).webrtcAudioOnly
                 // ★★★ 2026-08-14 修复"摄像头被占用后回退失败/后续全部无图像"：
                 //   根因：onError 在 WebRTC 捕获线程被回调 → close()(@Synchronized) 内 videoCapturer.stopCapture()
                 //   会等待【捕获线程自身】退出 → 死锁 → 回退Thread永不启动 → 摄像头不推流；
@@ -112,8 +148,8 @@ object RelayServerHandler {
                 //   修复：回退Thread提前启动(不依赖close完成)，close()移入回退线程异步执行(非捕获线程→不阻塞)。
                 Thread {
                     try {
-                        try { webrtc?.close() } catch (_: Throwable) {}
-                        webrtc = null
+                        try { sessionOf(peerKey).webrtc?.close() } catch (_: Throwable) {}
+                        sessionOf(peerKey).webrtc = null
                         // ★★★ 2026-08-28 省电：控制端已经不在了，就不要"回退到老模式"。
                         //   回退的语义是"WebRTC 通道打不开，但控制端还在看"——此时才需要改用 JPEG+PCM 继续服务。
                         //   实际线上最常见的 onError 是【控制端进程被杀/网络掉线】：ICE 在 45 秒宽容期后判 FAILED →
@@ -182,19 +218,6 @@ object RelayServerHandler {
     /** ★ TS直连启动器（由RelayServerService设置，触发后主动连接控制端56789） */
     var tsDirectLauncher: ((phoneIp: String, port: Int) -> Unit)? = null
 
-    /** ★ 文件下载取消标志（控制端发送CMD_FS_CANCEL后置为true，下载线程每块发送前检查） */
-    @Volatile
-    var fsDownloadCancelled = false
-
-    /** ★ 当前运行的文件下载线程（互斥：同一时间只允许一个下载线程，
-     *  防止旧下载残留线程与新下载并发写同一socket导致帧交错、ACK丢失） */
-    @Volatile
-    private var fsDownloadThread: Thread? = null
-
-    /** ★ 文件下载分块确认（参照PC微信分块传输）：控制端每收到一块回CMD_FS_ACK+块序号，
-     *  被控端发送后等待此序号确认，未确认不继续发送，防止中继→控制端链路拥塞丢数据 */
-    @Volatile
-    private var fsAckBlock = -1L
 
     /** ★ 本机虚拟网IP缓存（60秒）：Tailscale 100.64-100.127.x */
     private var ownTsIpsCache: Set<String>? = null
@@ -363,7 +386,7 @@ object RelayServerHandler {
 
                 RelayCommands.CMD_FS_GET -> {
                     // ★ 下载：启动后台线程推送（RSP_FS_GET → CMD_FS_DATA分块 → CMD_FS_DONE），此处不返回
-                    startFsDownload(payloadText, sender)
+                    startFsDownload(payloadText, sender, peerKey)
                     null
                 }
 
@@ -371,7 +394,7 @@ object RelayServerHandler {
                     // ★ 取消下载：设置取消标志，下载线程在下一块发送前检测到后立即退出
                     //   通过专用命令通道（非数据通道）发送，响应RSP_FS_CANCEL确认已停止
                     Log.i(TAG, "★ 收到取消下载命令，设置取消标志")
-                    fsDownloadCancelled = true
+                    sessionOf(peerKey).fsDownloadCancelled = true
                     RelayCommands.RSP_FS_CANCEL to "1|stopped|已停止发送"
                 }
 
@@ -379,7 +402,7 @@ object RelayServerHandler {
                     // ★ 分块确认：控制端收到数据块后回ACK，负载=块序号（被控端据此继续下一块）
                     val ack = payloadText.trim().toLongOrNull() ?: -1L
                     Log.i(TAG, "[FS调试] 收到ACK cmd=${RelayCommands.CMD_FS_ACK} 原始负载=[${payloadText}] 解析=$ack time=${System.currentTimeMillis()}")
-                    if (ack >= 0) fsAckBlock = ack
+                    if (ack >= 0) sessionOf(peerKey).fsAckBlock = ack
                     null  // ACK无需响应
                 }
 
@@ -709,14 +732,14 @@ object RelayServerHandler {
                         if (!permAudio) missing += "麦克风(RECORD_AUDIO)"
                         Log.w(TAG, "★ WebRTC OFFER 到达但缺权限: ${missing.joinToString()}，按回退模式启动老JPEG+PCM")
                         // 解析 cameraIndex，直接触发 onError → 回退代码
-                        webrtcCameraIndex = idx
-                        makeWebrtcSignalingCallback(s).onError("被控端缺权限: ${missing.joinToString()}")
+                        sessionOf(peerKey).webrtcCameraIndex = idx
+                        makeWebrtcSignalingCallback(s, peerKey).onError("被控端缺权限: ${missing.joinToString()}")
                         return null
                     }
                     if (needCamera && !HttpServerUtils.enableApiCamera) {
                         // 禁用摄像头也回退老模式
-                        webrtcCameraIndex = idx
-                        makeWebrtcSignalingCallback(s).onError("服务端已禁用摄像头")
+                        sessionOf(peerKey).webrtcCameraIndex = idx
+                        makeWebrtcSignalingCallback(s, peerKey).onError("服务端已禁用摄像头")
                         return null
                     }
                     // 解析 payload = cameraIndex|offerSdpBase64
@@ -725,17 +748,17 @@ object RelayServerHandler {
                         return RelayCommands.RSP_ERROR to error("OFFER格式非法: 应为 \"摄像头索引|SDP_BASE64\"")
                     }
                     Log.i(TAG, "★ [WebRTC OFFER IN] 解析成功: cameraIndex=$idx, offerB64Len=${offerB64.length}")
-                    webrtcCameraIndex = idx
-                    webrtcAudioOnly = audioOnly
+                    sessionOf(peerKey).webrtcCameraIndex = idx
+                    sessionOf(peerKey).webrtcAudioOnly = audioOnly
                     // —— 先关闭旧 WebRTC / 旧 JPEG+PCM 会话（避免冲突）
-                    try { webrtc?.close() } catch (_: Throwable) {}
+                    try { sessionOf(peerKey).webrtc?.close() } catch (_: Throwable) {}
                     try { CameraStreamManager.stop() } catch (_: Throwable) {}
                     try { MicrophoneStreamManager.stop() } catch (_: Throwable) {}
-                    webrtc = null
+                    sessionOf(peerKey).webrtc = null
                     // —— 初始化新 WebRTC 会话
                     val mgr = WebRtcSessionManager(App.context)
-                    webrtc = mgr
-                    val cb = makeWebrtcSignalingCallback(s)
+                    sessionOf(peerKey).webrtc = mgr
+                    val cb = makeWebrtcSignalingCallback(s, peerKey)
                     // ★★★ 2026-08-12 中继优先模式：OFFER经中继到达(CHANNEL_RELAY)→relayPreferred=true
                     //   （媒体走TURN中继转发）；经TS直连/直连监听到达(CHANNEL_TS/DIRECT)→relayPreferred=false
                     //   （媒体走TS/WiFi host直连兜底）。符合"中继优先，中继不可用时才TS直连"。
@@ -766,7 +789,7 @@ object RelayServerHandler {
                     val sdpMid = parts[1]
                     val lineIdx = parts[2].toIntOrNull() ?: 0
                     val candB64 = parts[3]
-                    webrtc?.addRemoteIceCandidate(sdpMid, lineIdx, candB64)
+                    sessionOf(peerKey).webrtc?.addRemoteIceCandidate(sdpMid, lineIdx, candB64)
                     null
                 }
 
@@ -778,9 +801,9 @@ object RelayServerHandler {
 
                 RelayCommands.CMD_WEBRTC_HANGUP -> {
                     Log.i(TAG, "★ WebRTC 挂断")
-                    try { webrtc?.close() } catch (_: Throwable) {}
-                    webrtc = null
-                    webrtcAudioOnly = false
+                    try { sessionOf(peerKey).webrtc?.close() } catch (_: Throwable) {}
+                    sessionOf(peerKey).webrtc = null
+                    sessionOf(peerKey).webrtcAudioOnly = false
                     // 控制端挂断时，老模式也可能残留（如回退过），一并清理
                     try { CameraStreamManager.stop() } catch (_: Throwable) {}
                     try { MicrophoneStreamManager.stop() } catch (_: Throwable) {}
@@ -1183,7 +1206,7 @@ object RelayServerHandler {
      *   4) 进度日志：每10块/每10%/最后一块打印进度，便于调试定位卡顿点
      *   5) CMD_FS_DONE也用同步发送，确保"完成"标记一定到达控制端
      */
-    private fun startFsDownload(path: String, sender: RelaySender?) {
+    private fun startFsDownload(path: String, sender: RelaySender?, peerKey: Any?) {
         if (sender == null) {
             Log.w(TAG, "文件下载失败: sender为空，无法推送数据")
             return
@@ -1204,18 +1227,18 @@ object RelayServerHandler {
         //   方案：新下载先取消旧线程并等待其退出，再启动新线程。
         //   ★ 互斥等待放在下载线程内执行，避免阻塞命令处理线程（否则ACK无法送达旧线程）
         // ★ 重置取消标志（每次新下载前清除上次的取消状态）
-        fsDownloadCancelled = false
+        sessionOf(peerKey).fsDownloadCancelled = false
         // ★ 每个下载会话独立的ACK序号（互斥后不会互相覆盖）
-        fsAckBlock = -1
+        sessionOf(peerKey).fsAckBlock = -1
         // ★ 连续ACK超时重发计数：超过上限自动放弃（防止控制端离线后线程永久重发占用连接）
         val maxConsecutiveRetries = 5
         val t = Thread({
             try {
                 // ★ 下载线程内部互斥：取消旧下载线程并等待其退出（不阻塞命令处理线程）
-                val oldThread = fsDownloadThread
+                val oldThread = sessionOf(peerKey).fsDownloadThread
                 if (oldThread != null && oldThread.isAlive) {
                     Log.w(TAG, "★ 检测到旧下载线程仍在运行，先取消旧下载 (新文件=$p)")
-                    fsDownloadCancelled = true
+                    sessionOf(peerKey).fsDownloadCancelled = true
                     try {
                         oldThread.join(3000)
                     } catch (e: InterruptedException) {
@@ -1227,7 +1250,7 @@ object RelayServerHandler {
                         Log.i(TAG, "★ 旧下载线程已退出，开始新下载")
                     }
                 }
-                fsDownloadCancelled = false
+                sessionOf(peerKey).fsDownloadCancelled = false
                 var consecutiveRetries = 0
                 val total = f.length()
                 // ★ 等待连接就绪后再发送元信息（连接断开时等待重连，最多30秒）
@@ -1251,7 +1274,7 @@ object RelayServerHandler {
                 f.inputStream().use { ins ->
                     while (true) {
                         // ★ 检查取消标志：控制端发送CMD_FS_CANCEL后，立即停止读取和发送
-                        if (fsDownloadCancelled) {
+                        if (sessionOf(peerKey).fsDownloadCancelled) {
                             Log.i(TAG, "文件下载被取消: $p (已发送 $sentBytes/$total bytes, 块$blockIdx)")
                             return@Thread
                         }
@@ -1295,11 +1318,11 @@ object RelayServerHandler {
                         val ackDeadline = System.currentTimeMillis() + 15000
                         var ackGot = false
                         while (System.currentTimeMillis() < ackDeadline) {
-                            if (fsDownloadCancelled) {
+                            if (sessionOf(peerKey).fsDownloadCancelled) {
                                 Log.i(TAG, "文件下载被取消(等ACK): $p (块$blockIdx)")
                                 return@Thread
                             }
-                            if (fsAckBlock >= blockIdx) {
+                            if (sessionOf(peerKey).fsAckBlock >= blockIdx) {
                                 ackGot = true
                                 break
                             }
@@ -1319,11 +1342,11 @@ object RelayServerHandler {
                             val ack2Deadline = System.currentTimeMillis() + 15000
                             var ack2Got = false
                             while (System.currentTimeMillis() < ack2Deadline) {
-                                if (fsDownloadCancelled) {
+                                if (sessionOf(peerKey).fsDownloadCancelled) {
                                     Log.i(TAG, "文件下载被取消(等延迟ACK): $p (块$blockIdx)")
                                     return@Thread
                                 }
-                                if (fsAckBlock >= blockIdx) {
+                                if (sessionOf(peerKey).fsAckBlock >= blockIdx) {
                                     ack2Got = true
                                     break
                                 }
@@ -1381,13 +1404,13 @@ object RelayServerHandler {
                 }
             } finally {
                 // ★ 清除当前下载线程引用（互斥锁释放，允许下一次下载）
-                if (fsDownloadThread === Thread.currentThread()) {
-                    fsDownloadThread = null
+                if (sessionOf(peerKey).fsDownloadThread === Thread.currentThread()) {
+                    sessionOf(peerKey).fsDownloadThread = null
                 }
             }
         }, "FsDownload").apply {
             isDaemon = true
-            fsDownloadThread = this
+            sessionOf(peerKey).fsDownloadThread = this
         }.start()
     }
 
