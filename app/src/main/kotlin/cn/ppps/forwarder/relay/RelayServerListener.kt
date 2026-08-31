@@ -98,12 +98,25 @@ class RelayServerListener(
             val ss = ServerSocket()
             ss.reuseAddress = true
             ss.bind(InetSocketAddress("0.0.0.0", port))
+            // ★ 1 秒读超时：让接受循环能周期性回看 running/isClosed，停止时不必等下一个连接
+            ss.soTimeout = 1000
             serverSocket = ss
             Log.i(TAG, "被控端已监听端口 $port（Tailscale直连模式），等待控制端接入...")
             while (running && !ss.isClosed) {
                 val s = try {
                     ss.accept()
+                } catch (e: java.net.SocketTimeoutException) {
+                    // 只是这一轮没接人，绝不能退出接受循环
+                    continue
                 } catch (e: IOException) {
+                    // ★ 以前任何 IOException 都 break + running=false → 监听器永久死亡，而
+                    //   startRelay() 因 isRunning 仍为 true 不会重启：控制端 connect() 成功但
+                    //   永远无人 accept（与控制端 DirectHostServer 修过的事故同源）。
+                    //   现在：socket 已关或主动停止才退出；瞬时错误记日志后继续接受。
+                    if (running && !ss.isClosed) {
+                        Log.w(TAG, "accept 瞬时异常，继续接受: ${e.message}")
+                        continue
+                    }
                     if (running) Log.w(TAG, "accept 中断: ${e.message}")
                     break
                 }
