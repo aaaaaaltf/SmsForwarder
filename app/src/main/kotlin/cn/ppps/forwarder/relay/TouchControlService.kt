@@ -27,16 +27,19 @@ class TouchControlService : AccessibilityService() {
         var instance: TouchControlService? = null
     }
 
-    private var screenWidth = 1080
-    private var screenHeight = 2400
+    // ★ 2026-09-04 volatile：被控端可同时被多条控制通道连着（中继接收线程 / TS直连接收线程 /
+    //   直连监听每连接线程），它们写的是同一个服务实例；命令分发已改为按连接内联串行，
+    //   但跨通道并发读写这些字段仍会读到旧值，导致一次手势的 down/move/up 落到不同坐标。
+    @Volatile private var screenWidth = 1080
+    @Volatile private var screenHeight = 2400
     private val handler = Handler(Looper.getMainLooper())
 
     // 触摸状态（供远程桌面使用）
-    private var pressX = -1f
-    private var pressY = -1f
-    private var lastX = -1f
-    private var lastY = -1f
-    private var dragging = false
+    @Volatile private var pressX = -1f
+    @Volatile private var pressY = -1f
+    @Volatile private var lastX = -1f
+    @Volatile private var lastY = -1f
+    @Volatile private var dragging = false
     private val swipeThresholdPx = 20f
 
     fun isEnabled(): Boolean = instance != null
@@ -136,6 +139,26 @@ class TouchControlService : AccessibilityService() {
         path.moveTo(x1, y1)
         path.lineTo(x2, y2)
         dispatchGestureInternal(path, duration)
+    }
+
+    /**
+     * 归一化坐标单击（0..1）。
+     * ★ 2026-09-04：双击/滚轮等命令原先在调用方用 displayMetrics.widthPixels 自行换算像素，
+     *   而单击走 touchDown/touchUp 用的是 getRealSize 的尺寸——有导航栏、挖屏的机型上两者
+     *   并不相等，同一个坐标"单击能点中、双击点不中"。统一收到本服务内换算。
+     */
+    fun tapNormalized(nx: Float, ny: Float) = tap(nx * screenWidth, ny * screenHeight)
+
+    /** 归一化坐标滑动（0..1），尺寸口径同 [tapNormalized] */
+    fun swipeNormalized(x1: Float, y1: Float, x2: Float, y2: Float, duration: Long) =
+        swipe(x1 * screenWidth, y1 * screenHeight, x2 * screenWidth, y2 * screenHeight, duration)
+
+    /** 滚轮滚动：以屏幕中心为起点按档滑动（每档 200 像素，尺寸口径同 [tapNormalized]） */
+    fun scroll(delta: Int) {
+        val cx = screenWidth / 2f
+        val cy = screenHeight / 2f
+        val dy = delta * 200f
+        swipe(cx, cy, cx, cy - dy, 300)
     }
 
     private fun dispatchGestureInternal(path: Path, duration: Long) {

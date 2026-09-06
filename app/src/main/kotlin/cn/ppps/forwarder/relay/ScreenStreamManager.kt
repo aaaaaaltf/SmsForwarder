@@ -62,6 +62,19 @@ object ScreenStreamManager {
 
     @Volatile
     private var running = false
+
+    /**
+     * ★ 2026-09-04 本次推流的归属线程（与 MicrophoneStreamManager 同一套做法）。
+     * 建流线程体里有几条失败路径（中继连不上 + 回退监听也失败）会直接退出，退出时必须把
+     * running 归位，否则此后每次 rdstrt 都命中"已在运行"分支返回 true，而实际没人在推流
+     * ——即"预览黑屏且再也起不来"。但"谁有权收尾"必须绑定身份：旧线程晚到的收尾会把
+     * 刚建好的新会话一起置停，所以用 AtomicReference 做 check-and-clear（CAS 一次完成，
+     * 不留"检查通过后所有权刚好被换掉"的窗口）。
+     */
+    private val ownerRef = java.util.concurrent.atomic.AtomicReference<Thread?>(null)
+
+    private fun ownsSession(): Boolean = ownerRef.get() === Thread.currentThread()
+
     private var serverSocket: ServerSocket? = null
     private var socket: Socket? = null
     private var virtualDisplay: VirtualDisplay? = null
@@ -114,10 +127,39 @@ object ScreenStreamManager {
         //   命令经直连监听(56786)/TS直连(56789)到达 → 监听56788等待控制端直连收流。
         //   原逻辑用 RelayServerService.isConnected 判断，被控端"始终连接中继"后恒为中继推流，
         //   控制端直连模式（云服务不可达）下连被控端56788无人监听 → 预览失败。
-        val direct = channel != cn.ppps.forwarder.relay.RelayServerHandler.CHANNEL_RELAY
+        // ★ 2026-09-04：入参 channel **不**决定推流模式（原因见下方 2026-08-15 智能模式注释）。
+        //   原来的 `val direct = ...` 算出来从未被使用（编译器长期告警），删掉它，改为把命令来源
+        //   打进日志——线上排查时仍需一眼看出"这次预览是哪条通道发起的、最终走了中继还是本机监听"。
+        Log.i(TAG, "★ 收到屏幕推流请求：命令来源=${if (channel == cn.ppps.forwarder.relay.RelayServerHandler.CHANNEL_RELAY) "中继" else "直连"} clientId=$safeClientId fps=$safeFps 质量=$safeQuality")
 
         running = true
-        streamThread = Thread({
+        val t = Thread({
+            try {
+                runStreamSession(relayHost, safeClientId, safeFps, safeQuality)
+            } finally {
+                // ★ 走到这里说明本线程的建流+采集已彻底结束（正常断开，或所有失败路径都走完）。
+                //   CAS 成功 = 所有权仍在本线程 → 归位 running 并释放 VirtualDisplay/ImageReader，
+                //   控制端下一次 rdstrt 才可能真正重建（原实现这几条失败路径直接退出，running 永真，
+                //   之后每次请求都命中"已在运行"返回 true → 黑屏且再也起不来）。
+                //   CAS 失败 = 已被 stop()/新会话接管 → 什么都不做，避免晚到的收尾误杀新会话。
+                if (ownerRef.compareAndSet(Thread.currentThread(), null)) {
+                    running = false
+                    cleanup()
+                    Log.i(TAG, "屏幕推流线程已退出，运行标志已归位（可重新发起预览）")
+                }
+            }
+        }, "ScreenStreamThread").apply { isDaemon = true }
+        streamThread = t
+        ownerRef.set(t)
+        t.start()
+        return true
+    }
+
+    /**
+     * 建流线程体：中继 PUSHER 优先，连不上再回退本机监听等待控制端直连收流。
+     * 由 [startStream] 创建的 ScreenStreamThread 调用，返回后由该线程的 finally 统一收尾。
+     */
+    private fun runStreamSession(relayHost: String, safeClientId: Int, safeFps: Int, safeQuality: Int) {
             // ★★★ 2026-08-15 屏幕预览"无图像"修复（v2 智能模式）：
             //   【根因】控制端(华为)请求走TS直连通道 → 本端按channel监听56888等直连；但控制端实际
             //     连的是中继服务器56888（getVideoHostForDevice对TS设备取被控端Tailscale IP）→ 两端通道不匹配 → 控制端永远收不到帧（无图像）。
@@ -130,7 +172,7 @@ object ScreenStreamManager {
                 cs.connect(InetSocketAddress(relayHost, RelayCommands.RELAY_VIDEO_PORT), 8000)
                 if (!running) {
                     try { cs.close() } catch (_: Exception) {}
-                    return@Thread
+                    return
                 }
                 usedRelay = true
                 socket = cs
@@ -165,13 +207,14 @@ object ScreenStreamManager {
                     }
                 }
             }
-        }, "ScreenStreamThread").apply { isDaemon = true }.also { it.start() }
-        return true
     }
 
     /** 停止屏幕推流 */
     @Synchronized
     fun stop() {
+        // ★ 先交还所有权：本方法自己负责全部清理。采集线程随后退出时 CAS 会失败，
+        //   就不会在"stop() 之后紧跟着新 startStream"的场景里把新会话的资源一起清掉。
+        ownerRef.set(null)
         running = false
         try {
             serverSocket?.close()
@@ -260,6 +303,7 @@ object ScreenStreamManager {
         // ★ 2026-08-06新增写阻塞看门狗：TCP写无超时，弱网下write可能永久阻塞，
         //   导致线程卡死+ running恒true，控制端重试永远走"已在运行"分支→永久黑屏。
         //   超过 WRITE_WATCHDOG_MS 未成功发出帧则强制断开清理，让下一次重试能重建推流。
+        val sessionThread = Thread.currentThread()
         val watchdog = Thread({
             while (running) {
                 try {
@@ -267,6 +311,9 @@ object ScreenStreamManager {
                 } catch (_: InterruptedException) {
                     break
                 }
+                // ★ 2026-09-04 只盯"本次会话"：sleep(3000) 期间可能已 stop() 或换了新会话，
+                //   而 running / lastSendTime 都是全局字段，旧看门狗一旦醒来就会把新会话置停。
+                if (ownerRef.get() !== sessionThread) break
                 if (running && System.currentTimeMillis() - lastSendTime > WRITE_WATCHDOG_MS) {
                     Log.w(TAG, "屏幕推流写阻塞超时（${WRITE_WATCHDOG_MS / 1000}s无帧发出），强制断开等待重试")
                     running = false
@@ -333,10 +380,18 @@ object ScreenStreamManager {
             //    2) running 仍为 true → 控制端下一次 rdstrt 会命中"已在运行"分支直接返回 true，
             //       但实际上没有任何线程在推流（表现为"预览黑屏且再也起不来"）。
             //   这里同时中断看门狗线程，避免它在 running 已false 后继续空转 3 秒轮询。
-            running = false
             try { watchdog.interrupt() } catch (_: Exception) {}
-            cleanup()
-            Log.i(TAG, "屏幕推流已结束，VirtualDisplay/ImageReader 已释放")
+            // ★ 2026-09-04 必须按"是否仍拥有本次会话"收尾：running=false 与 cleanup() 之间
+            //   存在窗口——本线程刚置停，控制端的下一次 rdstrt 就能通过 startStream 的
+            //   `if (running)` 检查并建立起新会话（socket/imageReader 字段已被新会话重新赋值），
+            //   此时再执行这里的 cleanup() 就会把新会话的推流拆掉。所有权已交出去就什么都不做。
+            if (ownerRef.get() === Thread.currentThread()) {
+                running = false
+                cleanup()
+                Log.i(TAG, "屏幕推流已结束，VirtualDisplay/ImageReader 已释放")
+            } else {
+                Log.i(TAG, "采集循环结束时本会话已被接管，跳过清理（不误杀新推流）")
+            }
         }
     }
 

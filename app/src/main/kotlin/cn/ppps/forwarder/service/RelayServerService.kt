@@ -65,6 +65,35 @@ class RelayServerService : Service() {
         /** ★ 省电：灭屏且无控制端连接时的状态上报间隔 */
         private const val STATE_REPORT_IDLE_MS = 30000L
 
+        /**
+         * ★ 2026-09-04 修复"下载卡在 0%/取消无效"：这些命令一律在**接收线程内联**执行，不进命令池。
+         *
+         * 三条通道（中继 / 直连监听56786 / TS直连）的全部命令原本共用一个
+         * `Executors.newFixedThreadPool(2)`，而池里跑的既有毫秒级命令，也有能阻塞几十秒的：
+         * CMD_FS_LIST 用 sendSync(15s)+waitForConnection(15s)+重试 sendSync(15s)，
+         * CMD_WAKEUP_SCREEN 要等主线程加悬浮窗（最多 2 秒）。两条线程一旦被慢命令占住，
+         * 排在后面的 CMD_FS_ACK 就到不了——下载线程每发一块都要等这个 ACK，于是整条传输停摆；
+         * 控制端点"取消"发来的 CMD_FS_CANCEL 同样进不了池，取消彻底无效。
+         *
+         * 另一个问题是同一连接的命令会被两条线程**并发**执行：手势 down/move/up 可能乱序注入，
+         * CMD_FS_GET 与其后的 CMD_FS_CANCEL 谁先改会话标志不确定。
+         *
+         * 这些命令的处理体只做内存读写或极快的调用（响应也全部经 sendExecutor 异步投递，
+         * 不会回头阻塞socket写入），放在各自的接收线程上顺序执行，既消除排队饿死，
+         * 又天然获得"与线路顺序一致"的每连接串行语义。慢命令仍进池，不影响接收循环。
+         */
+        private val FAST_COMMANDS: Set<String> = setOf(
+            RelayCommands.CMD_PING,
+            RelayCommands.CMD_FS_ACK,
+            RelayCommands.CMD_FS_CANCEL,
+            RelayCommands.CMD_FS_GET,
+            RelayCommands.CMD_RD_MOUSE_DOWN,
+            RelayCommands.CMD_RD_MOUSE_MOVE,
+            RelayCommands.CMD_RD_MOUSE_UP,
+            RelayCommands.CMD_RD_MOUSE_DBL,
+            RelayCommands.CMD_RD_MOUSE_WHEEL,
+        )
+
         @Volatile
         var isRunning = false
 
@@ -93,6 +122,107 @@ class RelayServerService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    /**
+     * 命令分发：快命令在接收线程内联执行，其余进线程池（判据见 [FAST_COMMANDS]）。
+     * 命令池只有两条线程且被三条通道共用，慢命令占满后连 CMD_FS_ACK 都要排队，
+     * 下载必然停摆、取消必然无效——所以不能把所有命令一视同仁地排队。
+     */
+    private fun submitCommand(cmd: String, body: () -> Unit) {
+        if (FAST_COMMANDS.contains(cmd)) {
+            try {
+                body()
+            } catch (e: Exception) {
+                Log.e(TAG, "命令处理异常(内联 $cmd): ${e.message}")
+            }
+            return
+        }
+        val pool = executor
+        if (pool == null) {
+            Log.w(TAG, "命令池已停止，丢弃 $cmd")
+            return
+        }
+        try {
+            pool.execute {
+                try {
+                    body()
+                } catch (e: Exception) {
+                    Log.e(TAG, "命令处理异常($cmd): ${e.message}")
+                }
+            }
+        } catch (e: Exception) {
+            // shutdown 后提交会抛 RejectedExecutionException：此时链路正在收尾，丢弃即可
+            Log.w(TAG, "提交命令失败 $cmd: ${e.message}")
+        }
+    }
+
+    /**
+     * 解析"这条直连命令该回发到哪条连接"。
+     *
+     * · connId 仍存活 → 原样返回（多控制端并存时绝不串台）。
+     * · connId 已失效（控制端重连后换了 id）→ 只有**全场只剩这一条活连接**时才认定它就是
+     *   同一台控制端的新连接、可以续用（这是 2026-08-06 加降级的原始场景：单控制端重连后
+     *   数据静默丢弃）。并存多条活连接时返回 null：旧实现取"最大 connId"会把 A 正在下载的
+     *   文件字节/命令响应写进 B 的 socket，B 收到它从未请求过的 SF_DATA 帧；而 A 的 ACK 带着
+     *   新 connId 落到新会话上，旧线程等不到确认，照样失败——失败快一点反而让控制端
+     *   按 2026-08-29 的"接入稳定后带偏移续传"立刻在新连接上重下。
+     */
+    private fun resolveDirectConn(connId: Long): Pair<Long, java.net.Socket>? {
+        val directListener = listener ?: return null
+        try {
+            val cur = directListener.connections[connId]
+            if (cur != null && !cur.isClosed && cur.isConnected) return connId to cur
+            var bestId = Long.MIN_VALUE
+            var best: java.net.Socket? = null
+            var live = 0
+            for ((id, sock) in directListener.connections) {
+                if (sock.isConnected && !sock.isClosed) {
+                    live++
+                    if (id > bestId) {
+                        bestId = id
+                        best = sock
+                    }
+                }
+            }
+            if (best == null) return null
+            if (live > 1) {
+                Log.w(TAG, "★ 直连连接#$connId 已失效，当前有${live}条活连接，拒绝降级到最新连接（避免把本端数据串到别人的socket）")
+                return null
+            }
+            return bestId to best
+        } catch (e: Exception) {
+            Log.w(TAG, "解析直连回发连接异常#$connId: ${e.message}")
+            return null
+        }
+    }
+
+    /**
+     * ★ 2026-09-04 按 phoneIp「现取现用」的 TS 直连发送器。
+     *
+     * 原来直接把 `tsDirectClients[phoneIp]` 这个具体对象交给 handle()，而文件下载线程会**全程
+     * 持有**这个 sender。可 startTailscaleDirect 重连时是 `existing.stop()` + 换新对象：
+     * 旧 client 的 sendExecutor/heartBeatExecutor 已 shutdownNow，旧下载线程此后每发一块都只
+     * 落到一句"提交TS直连发送任务失败"里静默丢弃，isConnected() 又恒为 false，
+     * 只能等 5×20 秒重发超时才放弃——控制端看到的就是"进度条停住不动"。
+     * 换成解析型包装后，重连对进行中的下载透明（peerKey 本就是 phoneIp，会话与 ACK 游标不丢）。
+     */
+    private inner class TsDirectSender(private val phoneIp: String) : RelaySender {
+        private fun current(): TailscaleDirectClient? =
+            tsDirectClients[phoneIp]?.takeIf { it.isConnected() }
+
+        override fun isConnected(): Boolean = current()?.isConnected() == true
+
+        override fun send(cmd: String, payload: ByteArray) {
+            current()?.send(cmd, payload)
+        }
+
+        override fun send(cmd: String, payload: String) {
+            current()?.send(cmd, payload)
+        }
+
+        override fun sendSync(cmd: String, payload: ByteArray, timeoutMs: Long): Boolean =
+            current()?.sendSync(cmd, payload, timeoutMs) ?: false
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -171,8 +301,8 @@ class RelayServerService : Service() {
         }
         // ★ 中继连接的命令处理：响应经中继回传（控制端经中继56782/56787接收）
         val onRelayCommand: (String, ByteArray) -> Unit = { cmd: String, payload: ByteArray ->
-            // 命令处理放到线程池，避免阻塞接收循环
-            executor?.execute {
+            // 慢命令进线程池避免阻塞接收循环；快命令（ACK/CANCEL/下载/手势/心跳）内联执行
+            submitCommand(cmd) {
                 try {
                     // ★ 2026-08-06：传入中继client作为sender，文件下载等二进制推送经中继连接回传
                     val result = RelayServerHandler.handle(cmd, payload, RelayServerHandler.CHANNEL_RELAY, client, peerKey = client)
@@ -187,28 +317,13 @@ class RelayServerService : Service() {
         }
         // ★ 直连监听(56786)的命令处理：响应经来源连接回传（控制端TS/局域网直连被控端时，多控制端按来源回发）
         val onDirectCommand: (Long, String, ByteArray) -> Unit = { connId: Long, cmd: String, payload: ByteArray ->
-            executor?.execute {
+            submitCommand(cmd) {
                 try {
-                    // ★ 2026-08-06：修复重连后connId失效问题：
-                    //   每次发送前动态从listener中查找"该connId是否仍存在"，
-                    //   不存在则降级用"最新接入连接"发送，避免数据静默丢弃。
+                    // ★ 2026-08-06：修复重连后connId失效问题——每次发送前动态解析该连接；
+                    //   ★ 2026-09-04 降级规则收紧为"仅剩一条活连接才续用"，见 [resolveDirectConn]。
                     //   同时实现sendSync同步发送，供文件下载可靠传输。
                     val directSender = object : RelaySender {
-                        private fun resolveConn(): Pair<Long, java.net.Socket?>? {
-                            val directListener = listener ?: return null
-                            val s = directListener.connections[connId]
-                            if (s != null && !s.isClosed && s.isConnected) return connId to s
-                            // 原connId失效（重连后connId变了），降级使用最新连接
-                            var bestId = Long.MIN_VALUE
-                            var best: java.net.Socket? = null
-                            for ((id, sock) in directListener.connections) {
-                                if (id > bestId && sock.isConnected && !sock.isClosed) {
-                                    bestId = id
-                                    best = sock
-                                }
-                            }
-                            return if (best != null) bestId to best else null
-                        }
+                        private fun resolveConn(): Pair<Long, java.net.Socket?>? = resolveDirectConn(connId)
                         override fun isConnected(): Boolean = resolveConn() != null
                         override fun send(cmd: String, payload: ByteArray) {
                             val (cid, _) = resolveConn() ?: return
@@ -225,24 +340,8 @@ class RelayServerService : Service() {
                     }
                     val result = RelayServerHandler.handle(cmd, payload, RelayServerHandler.CHANNEL_DIRECT, directSender, peerKey = connId)
                     if (result != null) {
-                        val (cid, _) = try {
-                            val directListener = listener
-                            val s = directListener?.connections?.get(connId)
-                            if (s != null && !s.isClosed && s.isConnected) connId to s
-                            else {
-                                var bestId = Long.MIN_VALUE
-                                var best: java.net.Socket? = null
-                                if (directListener != null) {
-                                    for ((id, sock) in directListener.connections) {
-                                        if (id > bestId && sock.isConnected && !sock.isClosed) {
-                                            bestId = id; best = sock
-                                        }
-                                    }
-                                }
-                                if (best != null) bestId to best else null
-                            }
-                        } catch (_: Exception) { null } ?: return@execute
-                        listener?.sendTo(cid, result.first, result.second)
+                        val resolved = resolveDirectConn(connId) ?: return@submitCommand
+                        listener?.sendTo(resolved.first, result.first, result.second)
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "直连命令处理异常: ${e.message}")
@@ -397,16 +496,19 @@ class RelayServerService : Service() {
                 Log.i(TAG, "TS直连已断开 $phoneIp:$port")
             },
             onCommand = { cmd, payload ->
-                // 命令处理放到线程池，避免阻塞接收循环（与中继一致）
-                executor?.execute {
+                // 慢命令进线程池避免阻塞接收循环（与中继一致）；快命令内联执行
+                submitCommand(cmd) {
                     try {
                         // ★ 2026-08-06：传入该控制端TS直连client作为sender（文件下载二进制推送回发该控制端）
+                        // ★ 2026-09-04：改传解析型 TsDirectSender——下载线程全程持有 sender，而重连会换
+                        //   client 对象，绑死旧对象会让进行中的下载静默停摆（见 TsDirectSender 注释）。
                         Log.i(TAG, "★ TS直连 handle命令: cmd=$cmd payloadLen=${payload.size} phoneIp=$phoneIp")
-                        val result = RelayServerHandler.handle(cmd, payload, RelayServerHandler.CHANNEL_TS, tsDirectClients[phoneIp], peerKey = phoneIp)
+                        val tsSender = TsDirectSender(phoneIp)
+                        val result = RelayServerHandler.handle(cmd, payload, RelayServerHandler.CHANNEL_TS, tsSender, peerKey = phoneIp)
                         if (result != null) {
                             // ★ 响应经来源通道回传（查map取该控制端最新连接）
                             Log.i(TAG, "★ TS直连 响应发送: respCmd=${result.first} respLen=${result.second.length} phoneIp=$phoneIp")
-                            tsDirectClients[phoneIp]?.send(result.first, result.second)
+                            tsSender.send(result.first, result.second)
                         } else {
                             Log.w(TAG, "TS直连 handle 无响应: cmd=$cmd phoneIp=$phoneIp")
                         }
@@ -554,9 +656,16 @@ class RelayServerService : Service() {
         client?.stop()
         client = null
         listener?.stop()
+        // ★ 2026-09-04：CameraStreamManager 是进程级单例，服务销毁后它仍会留着这些通道
+        //   （且通道闭包捕获了本服务实例）→ 只 add 不 remove 会让 senders 随重启单调增长。
+        //   中继 client 由下面的 setClient(null) 负责摘除，这里补齐另外两类。
+        listener?.let { cn.ppps.forwarder.relay.CameraStreamManager.removeSender(it) }
         listener = null
         // ★ 停止全部TS直连（多控制端）
-        tsDirectClients.values.forEach { it.stop() }
+        tsDirectClients.values.forEach {
+            cn.ppps.forwarder.relay.CameraStreamManager.removeSender(it)
+            it.stop()
+        }
         tsDirectClients.clear()
         // ★ 停止TS直连扫描器
         tsScanner?.stop()

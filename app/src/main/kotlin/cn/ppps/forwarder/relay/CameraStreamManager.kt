@@ -220,7 +220,14 @@ object CameraStreamManager {
 
     /** 由 RelayServerService 在创建连接后设置，用于推流（同时加入发送通道列表） */
     fun setClient(c: RelaySender?) {
+        // ★ 2026-09-04：本对象是进程级单例，而服务会重建（设置变更/被系统回收后重启）。
+        //   原先只 add 不 remove，senders 只增不减：每轮重启都留下一只已 stop 的中继通道，
+        //   而它捕获的 onConnected/onCommand 闭包又把那个已销毁的 RelayServerService 钉在内存里。
+        //   （不会造成串台：三种通道 stop() 后 isConnected() 恒为 false，帧永远发不出去，
+        //    所以这里修的是泄漏与每帧的无效遍历，不是正确性。）
+        val old = client
         client = c
+        if (old != null && old !== c) removeSender(old)
         if (c != null) addSender(c)
         if (c == null) stop()
     }
@@ -413,8 +420,32 @@ object CameraStreamManager {
         return fallback to fbWire
     }
 
+    /**
+     * 释放采集线程与 ImageReader（不含 cameraDevice——那由 stop() 带 latch 负责）。
+     * ★ 2026-09-04：本函数存在的原因是 start() 里的重试循环会多次调用 tryOpenCamera，
+     *   而 tryOpenCamera 每次都直接覆盖 cameraThread/imageReader 字段。
+     */
+    private fun releaseReaderAndThread() {
+        try {
+            imageReader?.close()
+        } catch (_: Exception) {
+        }
+        imageReader = null
+        try {
+            cameraThread?.quitSafely()
+        } catch (_: Exception) {
+        }
+        cameraThread = null
+        cameraHandler = null
+    }
+
     /** 打开摄像头并启动采集会话；openCamera 同步抛异常时返回 false */
     private fun tryOpenCamera(facingTarget: Int): Boolean {
+        // ★ 2026-09-04 修复重试泄漏：openCamera 同步抛异常后 start() 会重试最多 2 次，
+        //   每次都新建 HandlerThread + ImageReader 并直接覆盖字段 —— 旧线程没人 quit（常驻
+        //   空转）、旧 ImageReader 没人 close（各占 2 块 YUV 缓冲，且它挂着的 Surface 会让
+        //   相机服务认为仍有消费者）。先释放上一轮遗留，再分配。
+        releaseReaderAndThread()
         val cm = App.context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
         if (cm.cameraIdList.isEmpty()) {
             lastError = "没有可用摄像头"

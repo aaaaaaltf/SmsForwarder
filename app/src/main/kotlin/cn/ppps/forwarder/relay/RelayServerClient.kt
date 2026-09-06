@@ -271,7 +271,16 @@ class RelayServerClient(
             r
         } catch (e: Exception) {
             Log.w(TAG, "同步发送超时/中断: ${e.javaClass.simpleName}: ${e.message}")
-            try { future.cancel(true) } catch (_: Exception) {}
+            // ★ 2026-09-04 修复下载长时间停滞：超时绝不能 cancel(true)。
+            //   中断打在"此刻正在 out.write 的那个任务"上，而 Android 的 socket 写不保证被中断唤醒：
+            //   叫不醒 → 单线程 sendExecutor 的工作线程永久卡在 write 里并持有 sendLock，之后每一条
+            //   发送都排在它后面；socket 仍是 isConnected()==true，connectLoop 也不会触发重连，
+            //   连接就此假活——上层只会看到每块 20 秒超时。
+            //   正确做法（与 RelayServerListener 一致）：cancel(false) 只放弃尚未开跑的任务，
+            //   然后关掉本 socket，让阻塞中的 write 立即抛错释放工作线程，并由 connectLoop 自动重连。
+            //   调用方拿到 false 会 waitForConnection 后重发同一块（控制端按块号去重），不丢数据。
+            try { future.cancel(false) } catch (_: Exception) {}
+            try { s.close() } catch (_: Exception) {}
             false
         }
     }

@@ -198,7 +198,12 @@ class TailscaleDirectClient(
             future.get(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
         } catch (e: Exception) {
             Log.w(TAG, "TS直连同步发送超时/中断: ${e.javaClass.simpleName}: ${e.message}")
-            try { future.cancel(true) } catch (_: Exception) {}
+            // ★ 2026-09-04 与 RelayServerClient 同步修复：超时不 cancel(true)。中断打在正在
+            //   out.write 的任务上而 Android socket 写不保证响应中断，工作线程会一直卡在写里
+            //   并持有 sendLock，后续发送全部排队饿死，而 socket 仍显示已连接、不会触发重连。
+            //   cancel(false) 放弃未开跑的任务 + 关闭本 socket 迫使阻塞写报错，交给 connectLoop 重连。
+            try { future.cancel(false) } catch (_: Exception) {}
+            try { s.close() } catch (_: Exception) {}
             false
         }
     }

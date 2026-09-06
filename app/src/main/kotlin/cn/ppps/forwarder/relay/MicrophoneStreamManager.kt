@@ -41,12 +41,28 @@ object MicrophoneStreamManager {
 
     @Volatile
     private var running = false
+    @Volatile
     private var audioRecord: AudioRecord? = null
     private var captureThread: Thread? = null
+    /**
+     * ★ 当前会话的"属主线程"：只有它可以清理公共字段。
+     *   采集线程的 finally 会调 cleanup()（停 AudioRecord、关数据通道、running=false）。
+     *   而 start() 在 running 时会先 stopInternal()，即"停止+立刻重开"很常见：
+     *   旧线程还在退出路上，新会话已经把 audioRecord/running 建好，
+     *   旧线程一视 cleanup() 就把**新**会话的麦克风关掉并把 running 置回 false
+     *   → 控制端以为在听，实际永远无声。用线程身份判定归属，被顶替的旧线程只回收自己。
+     */
+    @Volatile
+    private var ownerThread: Thread? = null
+    @Volatile
     private var sender: RelaySender? = null
 
-    /** 数据通道socket（PUSHER或服务端） */
+    /** 数据通道socket（PUSHER或服务端）
+     *  ★ 必须 volatile：赋值发生在采集线程，而 STOP 在另一条线程上负责关流解阻塞，
+     *    看不见就等于没关——调用方会一直卡在 accept/write 里直到对端超时。 */
+    @Volatile
     private var dataSocket: Socket? = null
+    @Volatile
     private var serverSocket: ServerSocket? = null
 
     /** 最近一次打开失败原因 */
@@ -289,7 +305,7 @@ object MicrophoneStreamManager {
             val sessionId = "mic_${clientId}_${System.currentTimeMillis()}"
             val isDirect = channel != RelayServerHandler.CHANNEL_RELAY
 
-            captureThread = Thread({
+            val capture = Thread({
                 try {
                     val out: java.io.OutputStream
                     var useDataChannel = true
@@ -323,14 +339,23 @@ object MicrophoneStreamManager {
                         if (!useDataChannel || accepted == null) {
                             // ★ 回退命令通道：关闭数据通道socket，但保留audioRecord继续采集
                             try { ss.close() } catch (_: Exception) {}
-                            serverSocket = null
-                            if (running) {
+                            // ★ 只有还持有属主身份时才清公共句柄：
+                            //   被顶替后 field 里已是新会话的 ServerSocket，清空会让下次 STOP 关不掉它
+                            if (ownsSession()) serverSocket = null
+                            if (running && ownsSession()) {
                                 Log.i(TAG, "★ 回退到命令通道模式（直连超时无人接入）")
                                 captureLoopCommandChannel()
                             }
                             return@Thread
                         }
                         accepted.tcpNoDelay = true
+                        // ★ 等待接入期间已被 STOP/新会话顶替：绝不把 socket 挂到新会话的公共字段上
+                        if (!ownsSession()) {
+                            Log.i(TAG, "★ 等待接入期间会话已被顶替，关闭本次接入并退出")
+                            try { accepted.close() } catch (_: Exception) {}
+                            try { ss.close() } catch (_: Exception) {}
+                            return@Thread
+                        }
                         dataSocket = accepted
                         out = accepted.getOutputStream()
                         Log.i(TAG, "控制端已接入麦克风数据通道")
@@ -347,13 +372,20 @@ object MicrophoneStreamManager {
                             useDataChannel = false
                         }
                         if (!useDataChannel) {
-                            if (running) {
+                            if (running && ownsSession()) {
                                 Log.i(TAG, "★ 回退到命令通道模式（中继数据通道连接失败）")
                                 captureLoopCommandChannel()
                             }
                             return@Thread
                         }
                         if (!running) {
+                            try { cs.close() } catch (_: Exception) {}
+                            return@Thread
+                        }
+                        // ★ connect 最长 8 秒，期间可能已被 STOP/新会话顶替：
+                        //   此时公共字段已属于新会话，挂上来会让下次 STOP 关错 socket
+                        if (!ownsSession()) {
+                            Log.i(TAG, "★ 连接期间会话已被顶替，关闭本次数据通道并退出")
                             try { cs.close() } catch (_: Exception) {}
                             return@Thread
                         }
@@ -379,7 +411,7 @@ object MicrophoneStreamManager {
                         val success = captureLoop(out)
                         // ★ 2026-08-10 修复：如果captureLoop因写入失败退出（LISTENER未连接/relay未配对），
                         // 且running仍为true，回退到命令通道模式继续推流，避免完全无数据发送
-                        if (!success && running && audioRecord != null) {
+                        if (!success && running && ownsSession() && audioRecord != null) {
                             Log.i(TAG, "★ 数据通道写入失败（LISTENER未连接?），回退命令通道模式继续推流")
                             captureLoopCommandChannel()
                         }
@@ -388,7 +420,7 @@ object MicrophoneStreamManager {
                     Log.e(TAG, "麦克风数据通道启动失败: ${e.message}")
                     lastErrMsg = e.message ?: "数据通道启动异常"
                     // ★ 修复：如果异常时还在running状态，尝试回退命令通道（最后的兜底）
-                    if (running && audioRecord != null) {
+                    if (running && ownsSession() && audioRecord != null) {
                         try {
                             Log.i(TAG, "★ 异常兜底：回退命令通道模式继续采集")
                             captureLoopCommandChannel()
@@ -397,7 +429,12 @@ object MicrophoneStreamManager {
                 } finally {
                     cleanup()
                 }
-            }, "MicCapture").apply { start() }
+            }, "MicCapture")
+            // ★ 属主必须在 start() 之前登记：Thread.start() 建立 happens-before，
+            //   新线程一进 cleanup() 就能认出"这一轮是我的"，被顶替的旧线程则认不出。
+            captureThread = capture
+            ownerThread = capture
+            capture.start()
 
             return sessionId
         } catch (e: SecurityException) {
@@ -453,7 +490,20 @@ object MicrophoneStreamManager {
             // ★ 2026-08-28 省电：挂上"无人收流"看门狗（控制端掉线导致 STOP 丢失时自动释放麦克风与WakeLock）
             startIdleWatchdog()
 
-            captureThread = Thread({ captureLoopCommandChannel() }, "MicCapture-CmdCh").apply { start() }
+            // ★ 原来这个重载起完线程就再没人收尾：captureLoopCommandChannel 因
+            //   sender.send 抛异常 / AudioRecord 读取异常而 break 时，running 仍是 true、
+            //   AudioRecord 仍在录音、WakeLock 仍持有 → 控制端显示"麦克风开着"却永久无声，
+            //   只能等 60 秒空闲看门狗碰运气。这里显式登记属主并在退出时收尾。
+            val capture = Thread({
+                try {
+                    captureLoopCommandChannel()
+                } finally {
+                    cleanup()
+                }
+            }, "MicCapture-CmdCh")
+            captureThread = capture
+            ownerThread = capture
+            capture.start()
             return true
         } catch (e: SecurityException) {
             lastErrMsg = "缺少麦克风权限：${e.message}"
@@ -472,6 +522,10 @@ object MicrophoneStreamManager {
 
     private fun stopInternal() {
         running = false
+        // ★ 先收掉属主身份：本方法在调用线程上把资源全部释放干净了，
+        //   采集线程随后退出的 finally 绝不能再清一遍——那时 audioRecord/running
+        //   可能已经属于紧随其后的新会话（start() 里就是 stopInternal() + 重建）。
+        ownerThread = null
         // ★ 省电看门狗随会话一起收掉（无论正常停止还是空闲自停）
         stopIdleWatchdog()
         try { captureThread?.interrupt() } catch (_: Exception) {}
@@ -491,7 +545,17 @@ object MicrophoneStreamManager {
         releaseWakeLock()
     }
 
+    /** ★ 当前线程是否仍是本会话属主（被 STOP 或新会话顶替后返回 false） */
+    private fun ownsSession(): Boolean = Thread.currentThread() === ownerThread
+
     private fun cleanup() {
+        // ★ 被顶替的旧采集线程不能清理公共字段：它一视会把**新**会话的
+        //   AudioRecord 停掉、running 置回 false，控制端从此只听不到声音。
+        if (!ownsSession()) {
+            Log.i(TAG, "★ 本线程已非会话属主（已被停止或被新会话顶替），跳过公共资源清理")
+            return
+        }
+        ownerThread = null
         running = false
         try { serverSocket?.close() } catch (_: Exception) {}
         serverSocket = null

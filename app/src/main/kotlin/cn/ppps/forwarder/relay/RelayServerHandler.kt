@@ -49,6 +49,10 @@ import java.util.Locale
 object RelayServerHandler {
     private const val TAG = "RelayServerHandler"
 
+    /** ★ 2026-09-04 文件下载分块大小（控制端 PhoneFileManagerActivity.CHUNK_SIZE 必须一致，
+     *    断点续传的块序号/字节偏移换算依赖此常量，两侧不一致会导致续传错位）。 */
+    private const val FS_BLOCK_BYTES = 128 * 1024
+
     /** ★ 2026-08-10 替换已删除控制端gson：使用本地Gson单例 */
     private val gson: Gson = GsonBuilder().serializeNulls().create()
 
@@ -82,6 +86,12 @@ object RelayServerHandler {
         @Volatile var fsDownloadThread: Thread? = null
         /** 本连接的分块确认游标：控制端每收一块回 CMD_FS_ACK，未确认不继续发 */
         @Volatile var fsAckBlock: Long = -1L
+        /**
+         * 下载代号：每次 startFsDownload 自增。下载线程持有自己启动时的代号，
+         * 一旦会话里的代号变了就说明本线程已被新下载取代，必须在任何检查点退出。
+         * 不能用 fsDownloadCancelled 做这件事——新下载会把它清回 false。
+         */
+        @Volatile var fsDownloadGeneration: Long = 0L
     }
 
     private val peerSessions: MutableMap<Any, PeerSession> =
@@ -515,10 +525,10 @@ object RelayServerHandler {
                         val (nx, ny) = parseCoords(payloadText)
                         val svc = TouchControlService.instance
                         if (svc != null) {
-                            val metrics = App.context.resources.displayMetrics
-                            svc.tap(nx * metrics.widthPixels, ny * metrics.heightPixels)
+                            // ★ 尺寸口径统一由 TouchControlService 负责（与单击一致），见 tapNormalized
+                            svc.tapNormalized(nx, ny)
                             Thread.sleep(50)
-                            svc.tap(nx * metrics.widthPixels, ny * metrics.heightPixels)
+                            svc.tapNormalized(nx, ny)
                         }
                         null
                     }
@@ -527,14 +537,7 @@ object RelayServerHandler {
                 RelayCommands.CMD_RD_MOUSE_WHEEL -> {
                     touchUnavailable() ?: run {
                         val delta = payloadText.trim().toIntOrNull() ?: 0
-                        val svc = TouchControlService.instance
-                        if (svc != null) {
-                            val metrics = App.context.resources.displayMetrics
-                            val cx = metrics.widthPixels / 2f
-                            val cy = metrics.heightPixels / 2f
-                            val dy = delta * 200
-                            svc.swipe(cx, cy, cx, cy - dy, 300)
-                        }
+                        TouchControlService.instance?.scroll(delta)
                         null
                     }
                 }
@@ -1206,12 +1209,24 @@ object RelayServerHandler {
      *   4) 进度日志：每10块/每10%/最后一块打印进度，便于调试定位卡顿点
      *   5) CMD_FS_DONE也用同步发送，确保"完成"标记一定到达控制端
      */
-    private fun startFsDownload(path: String, sender: RelaySender?, peerKey: Any?) {
+    private fun startFsDownload(raw: String, sender: RelaySender?, peerKey: Any?) {
         if (sender == null) {
             Log.w(TAG, "文件下载失败: sender为空，无法推送数据")
             return
         }
-        val p = path.trim()
+        // ★ 2026-09-04 断点续传：负载允许 "<路径>|<已收字节>"。
+        //   只有竖线后全是数字才当作续传偏移，路径本身含'|'时不会被误解析。
+        val trimmed = raw.trim()
+        var p = trimmed
+        var reqOffset = 0L
+        run {
+            val idx = trimmed.lastIndexOf('|')
+            if (idx <= 0) return@run
+            val tail = trimmed.substring(idx + 1)
+            if (tail.isEmpty() || !tail.all { it.isDigit() }) return@run
+            reqOffset = tail.toLongOrNull() ?: 0L
+            if (reqOffset > 0L) p = trimmed.substring(0, idx)
+        }
         val f = File(p)
         if (!f.exists()) {
             sender.send(RelayCommands.RSP_FS_GET, "0||not_found")
@@ -1221,36 +1236,58 @@ object RelayServerHandler {
             sender.send(RelayCommands.RSP_FS_GET, "0||error")
             return
         }
+        // ★ 2026-09-04 修复①：续传偏移只有在 0 < reqOffset < 文件大小 时才可用，否则整份重传。
+        //   原来写的是 minOf(reqOffset, 文件大小)/块大小：当本地 .part 比远端文件更长时
+        //   （同名文件被换成了更小的版本），仍然返回一个**非零**起始块 → 控制端据此把半截
+        //   .part 截断到该处再追加，拼出"总长度等于 total、开头却是另一份文件的前缀"的坏文件，
+        //   并且能通过 onDownloadDone 的长度校验被改名成交付文件。
+        //   PC 被控端 gui/client_gui.py::_cmd_download_file 对同一规则已是
+        //   "_req_offset >= file_size → 整份重传"，这里补齐双端契约一致。
+        // ★ 续传偏移向下取整到块边界：块序号与字节偏移必须一一对应，否则控制端去重会错位
+        val _fileLen = f.length()
+        val startBlock = if (reqOffset in 1L until _fileLen) (reqOffset / FS_BLOCK_BYTES).toInt() else 0
+        val startBytes = startBlock.toLong() * FS_BLOCK_BYTES
         // ★★★ 下载互斥：同一时间只允许一个下载线程（2026-08-07致命修复）
         //   根因：旧下载（控制端超时但未发CANCEL）线程仍在等ACK重发死循环，
         //   新下载启动后两个线程并发写同一socket → 数据帧交错 → ACK全部丢失 → 下载卡死
-        //   方案：新下载先取消旧线程并等待其退出，再启动新线程。
-        //   ★ 互斥等待放在下载线程内执行，避免阻塞命令处理线程（否则ACK无法送达旧线程）
-        // ★ 重置取消标志（每次新下载前清除上次的取消状态）
-        sessionOf(peerKey).fsDownloadCancelled = false
-        // ★ 每个下载会话独立的ACK序号（互斥后不会互相覆盖）
-        sessionOf(peerKey).fsAckBlock = -1
+        // ★ 2026-09-04 修复②：旧线程的引用必须在**命令线程**上取。原来取在线程体内，而
+        //   `.apply { fsDownloadThread = this }.start()` 中 apply 先于 start 执行，线程体再读
+        //   该字段读到的就是它自己，于是：
+        //     ① 互斥完全失效（上一个下载线程的引用已被覆盖，再没人能取消它）；
+        //     ② oldThread.join(3000) 变成自己 join 自己 → 每次下载必然白等满 3 秒；
+        //     ③ 这 3 秒内控制端发来的 CMD_FS_CANCEL 被体内紧随的 cancelled=false 清掉。
+        //   现在作废旧线程改由 fsDownloadGeneration 承担（代号一变，旧线程在下一个检查点自行
+        //   退出），不再依赖会被新下载清回的 cancelled 标志；join 只用于缩小并发窗口。
+        val sess = sessionOf(peerKey)
+        val previousThread = sess.fsDownloadThread
+        val myGeneration = sess.fsDownloadGeneration + 1L
+        sess.fsDownloadGeneration = myGeneration
+        sess.fsDownloadCancelled = false
+        // ★ 每个下载会话独立的ACK序号
+        //   续传时基线为 startBlock-1，等待第一块（startBlock）的ACK即可，无需重发已收块
+        sess.fsAckBlock = startBlock.toLong() - 1L
         // ★ 连续ACK超时重发计数：超过上限自动放弃（防止控制端离线后线程永久重发占用连接）
         val maxConsecutiveRetries = 5
         val t = Thread({
             try {
-                // ★ 下载线程内部互斥：取消旧下载线程并等待其退出（不阻塞命令处理线程）
-                val oldThread = sessionOf(peerKey).fsDownloadThread
-                if (oldThread != null && oldThread.isAlive) {
-                    Log.w(TAG, "★ 检测到旧下载线程仍在运行，先取消旧下载 (新文件=$p)")
-                    sessionOf(peerKey).fsDownloadCancelled = true
+                if (previousThread != null && previousThread !== Thread.currentThread()
+                    && previousThread.isAlive) {
+                    Log.w(TAG, "★ 检测到旧下载线程仍在运行，等待其退出 (新文件=$p)")
                     try {
-                        oldThread.join(3000)
+                        previousThread.join(5000)
                     } catch (e: InterruptedException) {
                         // ignore
                     }
-                    if (oldThread.isAlive) {
-                        Log.w(TAG, "★ 旧下载线程3秒内未退出（可能阻塞在sendSync），继续启动新下载")
+                    if (previousThread.isAlive) {
+                        Log.w(TAG, "★ 旧下载线程5秒内未退出（可能阻塞在sendSync），已由下载代号作废")
                     } else {
                         Log.i(TAG, "★ 旧下载线程已退出，开始新下载")
                     }
                 }
-                sessionOf(peerKey).fsDownloadCancelled = false
+                // ★ 本线程的停止判据：被 CMD_FS_CANCEL 取消，或已被新下载取代（代号已变）
+                val stopped: () -> Boolean = {
+                    sess.fsDownloadCancelled || sess.fsDownloadGeneration != myGeneration
+                }
                 var consecutiveRetries = 0
                 val total = f.length()
                 // ★ 等待连接就绪后再发送元信息（连接断开时等待重连，最多30秒）
@@ -1259,26 +1296,42 @@ object RelayServerHandler {
                     return@Thread
                 }
                 // ★ 元信息(RSP_FS_GET)也同步发送，确保控制端一定收到才能显示进度条
-                Log.i(TAG, "[FS调试] 发送元信息 $total|${f.name}|ok time=${System.currentTimeMillis()}")
-                if (!sender.sendSync(RelayCommands.RSP_FS_GET, "$total|${f.name}|ok".toByteArray(Charsets.UTF_8), 15000)) {
+                //   续传时追加第4/5字段（起始块号、起始字节），普通下载保持三字段兼容旧控制端
+                val meta = if (startBlock > 0) {
+                    "$total|${f.name}|ok|$startBlock|$startBytes"
+                } else {
+                    "$total|${f.name}|ok"
+                }
+                Log.i(TAG, "[FS调试] 发送元信息 $meta time=${System.currentTimeMillis()}")
+                if (!sender.sendSync(RelayCommands.RSP_FS_GET, meta.toByteArray(Charsets.UTF_8), 15000)) {
                     Log.w(TAG, "文件下载: 发送元信息失败 $p")
                     return@Thread
                 }
-                val buf = ByteArray(128 * 1024)
-                var sentBytes = 0L
-                var blockIdx = 0
+                val buf = ByteArray(FS_BLOCK_BYTES)
+                var sentBytes = startBytes
+                var blockIdx = startBlock
                 var lastLogProgress = -1
                 // ★ 分块确认：控制端每收到一块回ACK(块序号)，被控端等待确认后才发送下一块
                 //   参照PC端微信_download_send_file_blocked：发送→等待ACK→确认后继续
                 //   防止中继→控制端链路拥塞时盲目高速发送导致数据堆积丢失
-                f.inputStream().use { ins ->
+                java.io.RandomAccessFile(f, "r").use { ins ->
+                    if (startBytes > 0L) ins.seek(startBytes)
                     while (true) {
-                        // ★ 检查取消标志：控制端发送CMD_FS_CANCEL后，立即停止读取和发送
-                        if (sessionOf(peerKey).fsDownloadCancelled) {
-                            Log.i(TAG, "文件下载被取消: $p (已发送 $sentBytes/$total bytes, 块$blockIdx)")
+                        // ★ 检查停止：控制端发 CMD_FS_CANCEL，或本线程已被新下载取代（代号已变）
+                        if (stopped()) {
+                            Log.i(TAG, "文件下载已停止: $p (已发送 $sentBytes/$total bytes, 块$blockIdx)")
                             return@Thread
                         }
-                        val n = ins.read(buf)
+                        // ★ 2026-09-04 修复③：必须"读满一块或到文件尾"。RandomAccessFile.read(byte[])
+                        //   不保证一次读满（并发写入的文件/短读都可能），一旦短读，blockIdx 与实际
+                        //   文件位置从此永久错位——块号不再等于 偏移/块大小，而续传正是按
+                        //   startBlock*FS_BLOCK_BYTES 去 seek 的，中间就会漏字节。
+                        var n = 0
+                        while (n < buf.size) {
+                            val r = ins.read(buf, n, buf.size - n)
+                            if (r <= 0) break
+                            n += r
+                        }
                         if (n <= 0) break
                         val chunk = if (n == buf.size) buf else buf.copyOf(n)
                         // ★ 数据块负载加4字节大端块序号前缀（供控制端去重，防止ACK丢失重发导致重复写盘）
@@ -1318,8 +1371,8 @@ object RelayServerHandler {
                         val ackDeadline = System.currentTimeMillis() + 15000
                         var ackGot = false
                         while (System.currentTimeMillis() < ackDeadline) {
-                            if (sessionOf(peerKey).fsDownloadCancelled) {
-                                Log.i(TAG, "文件下载被取消(等ACK): $p (块$blockIdx)")
+                            if (stopped()) {
+                                Log.i(TAG, "文件下载已停止(等ACK): $p (块$blockIdx)")
                                 return@Thread
                             }
                             if (sessionOf(peerKey).fsAckBlock >= blockIdx) {
@@ -1342,8 +1395,8 @@ object RelayServerHandler {
                             val ack2Deadline = System.currentTimeMillis() + 15000
                             var ack2Got = false
                             while (System.currentTimeMillis() < ack2Deadline) {
-                                if (sessionOf(peerKey).fsDownloadCancelled) {
-                                    Log.i(TAG, "文件下载被取消(等延迟ACK): $p (块$blockIdx)")
+                                if (stopped()) {
+                                    Log.i(TAG, "文件下载已停止(等延迟ACK): $p (块$blockIdx)")
                                     return@Thread
                                 }
                                 if (sessionOf(peerKey).fsAckBlock >= blockIdx) {
@@ -1385,6 +1438,15 @@ object RelayServerHandler {
                         //   让出CPU+避免TCP发送缓冲区积压过多数据导致ACK超时
                         Thread.sleep(50)
                     }
+                }
+                // ★ 2026-09-04 修复④：发 DONE 前必须核对实际发出的字节数。控制端 onDownloadDone
+                //   只比 "磁盘长度 == total"，所以残缺内容一旦收到 DONE 就会被改名成交付文件并
+                //   提示"下载完成"。这里既不发 DONE（会让控制端把坏文件转正），也不回
+                //   "0||error"（error 分支会删掉 .part、把断点一起毁掉）——只记日志并退出，
+                //   交给控制端的停滞/中断处理保留断点，用户再点一次即可续传。
+                if (sentBytes != total) {
+                    Log.w(TAG, "★ 下载不完整，不发 CMD_FS_DONE: $p 已发 $sentBytes/$total (块$blockIdx) — 保留控制端断点")
+                    return@Thread
                 }
                 // ★ 等待连接就绪后再同步发送完成标记（确保控制端收到后关闭进度条）
                 if (!waitForConnection(sender, 30000)) {
