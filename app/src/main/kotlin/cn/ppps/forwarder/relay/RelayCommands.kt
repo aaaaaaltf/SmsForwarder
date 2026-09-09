@@ -178,6 +178,32 @@ object RelayCommands {
     /** ★ 数据块接收确认（控制端→被控端，负载: 空；被控端每块发送后等待此ACK，参照PC微信分块确认） */
     const val CMD_FS_ACK = "sfack0000000"
 
+    // ==================== ★ 文件上传（2026-09-07新增，控制端→被控端） ====================
+    /** 上传请求（负载: "目标目录|文件名|文件大小"），被控端回 RSP_FS_UPREADY 确认后开始分块上传 */
+    const val CMD_FS_UPLOAD = "sfupload0000"
+
+    /** 上传就绪响应（负载: "ok|起始偏移" 续传，或 "ok|0" 全新上传） */
+    const val RSP_FS_UPREADY = "sfupready000"
+
+    /** 上传数据分块（二进制负载: 4字节大端块序号 + 128KB文件数据，控制端→被控端） */
+    const val CMD_FS_UPDATA = "sfupdata0000"
+
+    /** 上传数据块确认（负载: 块序号，被控端→控制端，控制端等待此ACK后才发下一块） */
+    const val RSP_FS_UPACK = "sfupack00000"
+
+    /** 上传完成（控制端→被控端，通知所有数据已发送完毕） */
+    const val CMD_FS_UPDONE = "sfupdone0000"
+
+    /** 上传结果（被控端→控制端，负载: "1|success|信息" 或 "0|failed|原因"） */
+    const val RSP_FS_UPRST = "sfuprst00000"
+
+    // ==================== ★ 文件属性（2026-09-07新增，控制端→被控端） ====================
+    /** 获取文件/目录属性（负载: 路径），被控端回 RSP_FS_STAT 返回Windows风格属性JSON */
+    const val CMD_FS_STAT = "sfstat000000"
+
+    /** 文件属性响应（负载: JSON {name,type,path,size,mtime,hidden,readonly,dirCount,fileCount,...}） */
+    const val RSP_FS_STAT = "sfstatrsp000"
+
     // ==================== ★ WebRTC 信令命令（2026-08-10新增，复用现有命令通道传SDP/ICE） ★ ====================
     // ★ 摄像头预览 + 麦克风同步的WebRTC模式：控制端发送CMD_WEBRTC_OFFER(而非分开的vcdstr/sfmicstr)，
     //   被控端回ANSWER+ICE+CANDIDATES，两端建立PeerConnection后音视频由WebRTC传输（VP8/H264+Opus+AEC/NS/AGC+抗抖动）

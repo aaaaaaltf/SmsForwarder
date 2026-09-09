@@ -92,6 +92,13 @@ object RelayServerHandler {
          * 不能用 fsDownloadCancelled 做这件事——新下载会把它清回 false。
          */
         @Volatile var fsDownloadGeneration: Long = 0L
+
+        // ★ 2026-09-07 文件上传状态（每控制端连接一份）
+        @Volatile var fsUploadRaf: java.io.RandomAccessFile? = null
+        @Volatile var fsUploadPath: String = ""
+        @Volatile var fsUploadExpected: Long = 0L
+        @Volatile var fsUploadReceived: Long = 0L
+        @Volatile var fsUploadCancelled: Boolean = false
     }
 
     private val peerSessions: MutableMap<Any, PeerSession> =
@@ -414,6 +421,28 @@ object RelayServerHandler {
                     Log.i(TAG, "[FS调试] 收到ACK cmd=${RelayCommands.CMD_FS_ACK} 原始负载=[${payloadText}] 解析=$ack time=${System.currentTimeMillis()}")
                     if (ack >= 0) sessionOf(peerKey).fsAckBlock = ack
                     null  // ACK无需响应
+                }
+
+                // ==================== ★ 文件上传（2026-09-07新增） ====================
+                RelayCommands.CMD_FS_UPLOAD -> {
+                    // 上传请求：负载 "目标目录|文件名|文件大小"
+                    startFsUpload(payloadText, sender, peerKey)
+                    null
+                }
+
+                RelayCommands.CMD_FS_UPDATA -> {
+                    // 上传数据块：二进制负载 = 4字节大端块序号 + 文件数据
+                    handleFsUpData(payload, sender, peerKey)
+                }
+
+                RelayCommands.CMD_FS_UPDONE -> {
+                    // 上传完成：关闭文件并校验，回 RSP_FS_UPRST
+                    finishFsUpload(sender, peerKey)
+                }
+
+                // ==================== ★ 文件属性（2026-09-07新增） ====================
+                RelayCommands.CMD_FS_STAT -> {
+                    RelayCommands.RSP_FS_STAT to handleFsStat(payloadText)
                 }
 
                 RelayCommands.CMD_SMS_QUERY -> {
@@ -1167,6 +1196,171 @@ object RelayServerHandler {
         } else {
             f.delete()
         }
+    }
+
+    // ==================== ★ 文件上传（2026-09-07新增） ====================
+
+    /**
+     * 上传请求处理：负载 "目标目录|文件名|文件大小"
+     * 创建/打开目标文件，回 RSP_FS_UPREADY("ok|起始偏移") 通知控制端开始发数据。
+     */
+    private fun startFsUpload(raw: String, sender: RelaySender?, peerKey: Any?) {
+        if (sender == null) {
+            Log.w(TAG, "文件上传失败: sender为空")
+            return
+        }
+        val parts = raw.split("|")
+        if (parts.size < 3) {
+            sender.sendSync(RelayCommands.RSP_FS_UPREADY, "error|参数不完整".toByteArray(Charsets.UTF_8), 5000)
+            return
+        }
+        val targetDir = parts[0].trim()
+        val fileName = parts[1].trim()
+        val expectedSize = parts[2].trim().toLongOrNull() ?: -1L
+        if (targetDir.isEmpty() || fileName.isEmpty() || expectedSize < 0) {
+            sender.sendSync(RelayCommands.RSP_FS_UPREADY, "error|参数无效".toByteArray(Charsets.UTF_8), 5000)
+            return
+        }
+        val dir = File(targetDir)
+        if (!dir.exists()) dir.mkdirs()
+        if (!dir.isDirectory) {
+            sender.sendSync(RelayCommands.RSP_FS_UPREADY, "error|目标目录不存在".toByteArray(Charsets.UTF_8), 5000)
+            return
+        }
+        val targetFile = File(dir, fileName)
+        val session = sessionOf(peerKey)
+        // 清理旧上传状态
+        try { session.fsUploadRaf?.close() } catch (_: Throwable) {}
+        session.fsUploadCancelled = false
+        session.fsUploadPath = targetFile.absolutePath
+        session.fsUploadExpected = expectedSize
+        // 断点续传：同名文件已存在且小于 expectedSize → 从已有长度继续
+        var offset = 0L
+        if (targetFile.exists() && targetFile.length() < expectedSize && targetFile.length() > 0) {
+            offset = targetFile.length()
+        } else if (targetFile.exists()) {
+            // 文件已存在且大小≥预期 → 覆盖，从头写
+            targetFile.delete()
+        }
+        try {
+            val raf = java.io.RandomAccessFile(targetFile, "rw")
+            if (offset > 0) raf.seek(offset) else raf.setLength(0)
+            session.fsUploadRaf = raf
+            session.fsUploadReceived = offset
+        } catch (e: Exception) {
+            Log.w(TAG, "上传: 创建文件失败 ${targetFile.absolutePath} ${e.message}")
+            sender.sendSync(RelayCommands.RSP_FS_UPREADY, "error|${e.message}".toByteArray(Charsets.UTF_8), 5000)
+            return
+        }
+        Log.i(TAG, "★ 文件上传开始: ${targetFile.absolutePath} 预期=$expectedSize 续传偏移=$offset")
+        val ok = sender.sendSync(RelayCommands.RSP_FS_UPREADY, "ok|$offset".toByteArray(Charsets.UTF_8), 10000)
+        if (!ok) {
+            Log.w(TAG, "上传: RSP_FS_UPREADY 发送失败")
+        }
+    }
+
+    /**
+     * 上传数据块处理：二进制负载 = 4字节大端块序号 + 文件数据
+     * 写入文件后回 RSP_FS_UPACK(块序号) 确认。
+     */
+    private fun handleFsUpData(payload: ByteArray, sender: RelaySender?, peerKey: Any?): Pair<String, String>? {
+        if (sender == null || payload.size < 4) return null
+        val session = sessionOf(peerKey)
+        if (session.fsUploadCancelled) return null
+        val raf = session.fsUploadRaf
+        if (raf == null) {
+            Log.w(TAG, "上传数据到达但文件未打开")
+            return null
+        }
+        // 解析块序号
+        val seq = ((payload[0].toInt() and 0xFF) shl 24) or
+                  ((payload[1].toInt() and 0xFF) shl 16) or
+                  ((payload[2].toInt() and 0xFF) shl 8) or
+                  (payload[3].toInt() and 0xFF)
+        val data = payload.copyOfRange(4, payload.size)
+        try {
+            raf.write(data)
+            session.fsUploadReceived += data.size
+        } catch (e: Exception) {
+            Log.w(TAG, "上传写入失败: ${e.message}")
+            try { raf.close() } catch (_: Throwable) {}
+            session.fsUploadRaf = null
+            sender.sendSync(RelayCommands.RSP_FS_UPRST, "0|failed|写入失败: ${e.message}".toByteArray(Charsets.UTF_8), 5000)
+            return null
+        }
+        // 回 ACK
+        sender.sendSync(RelayCommands.RSP_FS_UPACK, seq.toString().toByteArray(Charsets.UTF_8), 10000)
+        return null
+    }
+
+    /**
+     * 上传完成处理：关闭文件、校验大小，回 RSP_FS_UPRST
+     */
+    private fun finishFsUpload(sender: RelaySender?, peerKey: Any?): Pair<String, String>? {
+        val session = sessionOf(peerKey)
+        try { session.fsUploadRaf?.close() } catch (_: Throwable) {}
+        session.fsUploadRaf = null
+        val path = session.fsUploadPath
+        val expected = session.fsUploadExpected
+        val received = session.fsUploadReceived
+        val file = File(path)
+        if (sender != null) {
+            val result = if (!file.exists()) {
+                "0|failed|文件不存在"
+            } else if (expected > 0 && file.length() != expected) {
+                "0|failed|大小不匹配(${file.length()}/${expected})"
+            } else {
+                "1|success|上传成功"
+            }
+            Log.i(TAG, "★ 文件上传完成: $path 预期=$expected 实际=${file.length()} 结果=$result")
+            sender.sendSync(RelayCommands.RSP_FS_UPRST, result.toByteArray(Charsets.UTF_8), 10000)
+        }
+        session.fsUploadPath = ""
+        session.fsUploadExpected = 0L
+        session.fsUploadReceived = 0L
+        session.fsUploadCancelled = false
+        return null
+    }
+
+    // ==================== ★ 文件属性（2026-09-07新增，Windows风格） ====================
+
+    /**
+     * 获取文件/目录属性：返回 JSON 字符串，包含 Windows 风格的属性信息。
+     * Android File 类不支持创建时间和访问时间，这两项用 lastModified() 代替。
+     */
+    private fun handleFsStat(path: String): String {
+        val p = path.trim()
+        if (p.isEmpty()) return "{}"
+        val f = File(p)
+        if (!f.exists()) return "{}"
+        val isDir = f.isDirectory
+        val map = linkedMapOf<String, Any>()
+        map["name"] = f.name ?: p
+        map["type"] = if (isDir) "目录" else "文件"
+        map["path"] = f.parent ?: p
+        map["size"] = if (isDir) 0L else f.length()
+        map["mtime"] = f.lastModified()
+        // Android 不支持创建/访问时间，用 lastModified 代替
+        map["ctime"] = f.lastModified()
+        map["atime"] = f.lastModified()
+        map["hidden"] = f.isHidden
+        map["readonly"] = !f.canWrite()
+        map["canRead"] = f.canRead()
+        map["canWrite"] = f.canWrite()
+        if (isDir) {
+            // 统计子目录数和文件数
+            val children = f.listFiles()
+            var dirCount = 0
+            var fileCount = 0
+            if (children != null) {
+                for (c in children) {
+                    if (c.isDirectory) dirCount++ else fileCount++
+                }
+            }
+            map["dirCount"] = dirCount
+            map["fileCount"] = fileCount
+        }
+        return gson.toJson(map)
     }
 
     /**

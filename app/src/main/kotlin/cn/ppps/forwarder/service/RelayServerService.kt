@@ -87,6 +87,8 @@ class RelayServerService : Service() {
             RelayCommands.CMD_FS_ACK,
             RelayCommands.CMD_FS_CANCEL,
             RelayCommands.CMD_FS_GET,
+            RelayCommands.CMD_FS_UPDATA,
+            RelayCommands.CMD_FS_UPDONE,
             RelayCommands.CMD_RD_MOUSE_DOWN,
             RelayCommands.CMD_RD_MOUSE_MOVE,
             RelayCommands.CMD_RD_MOUSE_UP,
