@@ -98,6 +98,12 @@ object RelayServerHandler {
         @Volatile var fsUploadPath: String = ""
         @Volatile var fsUploadExpected: Long = 0L
         @Volatile var fsUploadReceived: Long = 0L
+        /**
+         * ★ 2026-09-21 期望的下一个上传块序号。
+         * 起始值 = 续传偏移 / FS_BLOCK_BYTES（与控制端 uploadBlockSeq=(int)(offset/CHUNK_SIZE)
+         * 同一公式），每成功写入一块 +1 —— 这样即使续传偏移不是块大小整数倍也不会算错。
+         */
+        @Volatile var fsUploadNextSeq: Int = 0
         @Volatile var fsUploadCancelled: Boolean = false
     }
 
@@ -1272,6 +1278,8 @@ object RelayServerHandler {
             if (offset > 0) raf.seek(offset) else raf.setLength(0)
             session.fsUploadRaf = raf
             session.fsUploadReceived = offset
+            // ★ 块序号基线：与控制端 uploadBlockSeq = (int)(offset / CHUNK_SIZE) 完全一致
+            session.fsUploadNextSeq = (offset / FS_BLOCK_BYTES).toInt()
         } catch (e: Exception) {
             Log.w(TAG, "上传: 创建文件失败 ${targetFile.absolutePath} ${e.message}")
             sender.sendSync(RelayCommands.RSP_FS_UPREADY, "error|${e.message}".toByteArray(Charsets.UTF_8), 5000)
@@ -1302,10 +1310,22 @@ object RelayServerHandler {
                   ((payload[1].toInt() and 0xFF) shl 16) or
                   ((payload[2].toInt() and 0xFF) shl 8) or
                   (payload[3].toInt() and 0xFF)
+        // ★★★ 2026-09-21 块序号必须连续（按"当前已写字节"推算期望序号）：
+        //   控制端一旦把同一个文件的数据发了两遍（实测：一条 upready 被派发两次 →
+        //   sendUploadData 跑两遍），第二遍的块会落在**下一份文件**的会话上，把那个文件
+        //   写成 "大小不匹配(197169/241660)"；上一份文件则被多写 128KB 却回"上传成功"。
+        //   两侧块号换算公式一致（控制端 uploadBlockSeq = 偏移/128K；被控端 = 已写/128K），
+        //   所以序号对不上就一定不是本文件该收的块 —— 直接丢弃，绝不写进当前文件。
+        val expectedSeq = session.fsUploadNextSeq
+        if (seq != expectedSeq) {
+            Log.w(TAG, "上传块序号不连续，丢弃: seq=$seq 期望=$expectedSeq 已写=${session.fsUploadReceived}")
+            return null
+        }
         val data = payload.copyOfRange(4, payload.size)
         try {
             raf.write(data)
             session.fsUploadReceived += data.size
+            session.fsUploadNextSeq = seq + 1
         } catch (e: Exception) {
             Log.w(TAG, "上传写入失败: ${e.message}")
             try { raf.close() } catch (_: Throwable) {}
