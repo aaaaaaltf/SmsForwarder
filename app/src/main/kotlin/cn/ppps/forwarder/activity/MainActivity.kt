@@ -47,6 +47,16 @@ class MainActivity : BaseActivity<ActivityMainBinding?>() {
         } catch (t: Throwable) {
             android.util.Log.w(TAG, "启动权限自检异常: ${t.message}")
         }
+        // ★ 2026-09-20 修复：被控端每次启动都检查中继模式，中继不可达(关闭)时确保 Tailscale VPN 已建立。
+        //   与 RelayServerService.startRelay 的 ensureVpnUp 互为幂等保障：即便被控端服务尚未启动
+        //   （如未开启开机自启），纯 App 启动阶段也已把直连 VPN 拉起，保证控制端在中继关闭时可经
+        //   Tailscale 直连本机。relayConnected 初始为 null → ensureVpnUp 乐观建 VPN，relay 连上后
+        //   由 setRelayConnected(true) 自动关闭，无副作用。
+        try {
+            cn.ppps.forwarder.tailscale.TailscaleManager.ensureVpnUp(this)
+        } catch (t: Throwable) {
+            android.util.Log.w(TAG, "启动检查直连VPN异常: ${t.message}")
+        }
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
