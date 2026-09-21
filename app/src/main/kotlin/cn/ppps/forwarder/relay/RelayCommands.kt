@@ -204,6 +204,13 @@ object RelayCommands {
     /** 文件属性响应（负载: JSON {name,type,path,size,mtime,hidden,readonly,dirCount,fileCount,...}） */
     const val RSP_FS_STAT = "sfstatrsp000"
 
+    // ==================== ★ 新建文件夹（2026-09-21新增，控制端→被控端） ====================
+    /** 新建文件夹（负载: 待创建文件夹的完整路径），被控端回 RSP_FS_MKDIR */
+    const val CMD_FS_MKDIR = "sfmkdir00000"
+
+    /** 新建文件夹响应（负载: "1|success|信息" 或 "0|failed|原因"，原因含"已存在"表示重名冲突） */
+    const val RSP_FS_MKDIR = "sfmkdirrsp00"
+
     // ==================== ★ WebRTC 信令命令（2026-08-10新增，复用现有命令通道传SDP/ICE） ★ ====================
     // ★ 摄像头预览 + 麦克风同步的WebRTC模式：控制端发送CMD_WEBRTC_OFFER(而非分开的vcdstr/sfmicstr)，
     //   被控端回ANSWER+ICE+CANDIDATES，两端建立PeerConnection后音视频由WebRTC传输（VP8/H264+Opus+AEC/NS/AGC+抗抖动）

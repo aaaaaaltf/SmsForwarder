@@ -401,6 +401,11 @@ object RelayServerHandler {
                     RelayCommands.RSP_FS_DELETE to handleFsDelete(payloadText)
                 }
 
+                RelayCommands.CMD_FS_MKDIR -> {
+                    // ★ 2026-09-21 新建文件夹：在所选目录内创建子文件夹；重名回"已存在"由控制端提示重新输入
+                    RelayCommands.RSP_FS_MKDIR to handleFsMkdir(payloadText)
+                }
+
                 RelayCommands.CMD_FS_GET -> {
                     // ★ 下载：启动后台线程推送（RSP_FS_GET → CMD_FS_DATA分块 → CMD_FS_DONE），此处不返回
                     startFsDownload(payloadText, sender, peerKey)
@@ -1183,6 +1188,26 @@ object RelayServerHandler {
         } catch (e: Exception) {
             Log.w(TAG, "删除失败: $p ${e.message}")
             "0|failed|${e.message ?: "删除失败"}"
+        }
+    }
+
+    /**
+     * 新建文件夹（目录递归创建）
+     * @return "1|success|信息" 或 "0|failed|原因"（原因含"已存在"表示重名冲突，控制端据此提示重新输入）
+     */
+    private fun handleFsMkdir(path: String): String {
+        val p = path.trim()
+        if (p.isEmpty()) return "0|failed|路径为空"
+        val f = File(p)
+        if (f.exists()) {
+            // ★ 重名（文件或文件夹均视为冲突）：回失败，控制端弹“当前目录存在同名的文件夹，重新输入”
+            return "0|failed|已存在: ${f.name ?: p}"
+        }
+        return try {
+            if (f.mkdirs()) "1|success|新建文件夹成功: $p" else "0|failed|新建文件夹失败"
+        } catch (e: Exception) {
+            Log.w(TAG, "新建文件夹失败: $p ${e.message}")
+            "0|failed|${e.message ?: "新建文件夹失败"}"
         }
     }
 
