@@ -204,7 +204,29 @@ private class TailscaleVpnBuilder(private val builder: VpnService.Builder) : VPN
 
     @Throws(Exception::class)
     override fun establish(): ParcelFileDescriptor? {
-        val fd = builder.establish() ?: return null
+        // ★★★ 2026-09-22 修复被控端"VPN 起不来却毫无线索"：
+        //   旧实现是 `builder.establish() ?: return null` —— 系统拒绝建 tun 时【静默返回】，
+        //   不打印、不计数、不上报事件。于是看门狗只会反复打"检测到VPN未建立，重新启动"，
+        //   真正原因永远不可见（实测华为上盲目空转 115 轮 ≈ 1.8 小时）。
+        //   与控制器 2026-09-19 的同名修复对齐：显式记录 + 通知 TailscaleManager 累计并提示。
+        //   注意日志 TAG 用字面量 "TailscaleVpn"：companion 里的 TAG 是 private，
+        //   本类是文件级（顶层）类，访问不到。
+        val fd = try {
+            builder.establish()
+        } catch (t: Throwable) {
+            cn.ppps.forwarder.utils.Log.e("TailscaleVpn",
+                "★ builder.establish() 抛异常: ${t.javaClass.simpleName}: ${t.message}")
+            null
+        }
+        if (fd == null) {
+            TailscaleVpnService.setVpnEstablished(false)
+            cn.ppps.forwarder.utils.Log.e("TailscaleVpn",
+                "★ builder.establish() 返回 null：系统拒绝建立 tun" +
+                        "（可能已有其它 VPN 占用唯一的 VPN 槽位 —— 被控端与控制端装在同一台手机时二者互抢；" +
+                        "或华为/EMUI「应用启动管理/后台权限」受限）")
+            TailscaleManager.notifyVpnEstablishFailed()
+            return null
+        }
         TailscaleVpnService.setVpnEstablished(true)
         return TailscaleParcelFd(fd)
     }

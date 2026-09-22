@@ -228,6 +228,12 @@ object TailscaleManager {
     @Volatile
     private var provisioning = false
 
+    /** ★ 2026-09-22：上次因"后端始终未注册身份"而清空失效 authkey 的时间戳（0=从未） */
+    @Volatile
+    private var staleAuthkeyClearedAt = 0L
+    /** ★ 清空的冷却时间：OAuth 也失败时不必每轮都清一次 */
+    private const val STALE_AUTHKEY_CLEAR_COOLDOWN_MS = 10 * 60 * 1000L
+
     /**
      * ★ 2026-08-29 控制端刚下发了 OAuth 凭证 → 立刻尝试签发 AuthKey 并重登，
      *   不必等下一次冷启动（本方法由 RelayServerHandler 在落盘成功后调用）。
@@ -325,12 +331,50 @@ object TailscaleManager {
     /** 启动 Tailscale：初始化后端 + authkey 登录（幂等，可在服务/Application 任意处调用） */
     @Synchronized
     fun ensureStarted(ctx: Context) {
-        if (initialized) return
+        if (initialized) {
+            // ★★★ 2026-09-22 修复被控端"VPN 永不建立"根因：旧实现首行就是 `if (initialized) return`，
+            //   于是只要【首次】startLogin 没拿到节点身份（凭证尚未下发 / 网络未就绪 / key 失效），
+            //   startLogin 在整个进程生命周期内再也不会执行 → Go 后端永远停在 NeedsLogin
+            //   → 永不建 tun → 看门狗每轮都"启动 Tailscale VPN"却毫无效果（实测空转 115 轮）。
+            //   与控制器 android_controller 的 2026-09-13 同名修复对齐：后端未注册身份时重走 startLogin。
+            //   ★ 必须在后台线程做：hasRegisteredIdentity() 要调 localapi，主线程调用会 ANR。
+            val actx = ctx.applicationContext
+            if (app == null) {
+                // ★★★ 2026-09-22（补）：initialized 为真但后端对象为空（上次 start() 返回 null、
+                //   或后端已被释放）时绝不能直接 return —— 那样整个进程内后端再也重启不了，
+                //   看门狗只会空转（实测连 "libtailscale 后端已启动" 都不再出现，app 恒为 null）。
+                //   复位 initialized，让下方重新走一次启动流程。
+                Log.w(TAG, "★ initialized=true 但 app==null，复位后重新尝试启动后端")
+                initialized = false
+            } else {
+                Thread({
+                    try {
+                        if (!hasRegisteredIdentity()) {
+                            Log.i(TAG, "★ 后端已启动但未注册身份（实时判定），重新尝试登录流程")
+                            startLogin(actx)
+                        }
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "重试登录检查异常: ${t.message}")
+                    }
+                }, "TsReloginCheck").apply { isDaemon = true }.start()
+                return
+            }
+        }
         initialized = true
         try {
             val dataDir = ctx.filesDir.absolutePath
             TailscaleContext.init(ctx)
-            app = Libtailscale.start(dataDir, dataDir, false, TailscaleContext.get())
+            val started = Libtailscale.start(dataDir, dataDir, false, TailscaleContext.get())
+            app = started
+            if (started == null) {
+                // ★★★ 2026-09-22：start() 可能【返回 null 而不抛异常】。旧实现照样把 initialized
+                //   保持为 true 并打印 "libtailscale 后端已启动"，于是 app 恒为 null：
+                //   既走不到上面的重登分支（那里要求 app != null），又被 initialized 挡住无法重启
+                //   → 后端在整个进程生命周期内再也起不来（实测 VPN 永远起不来、日志毫无进展）。
+                Log.e(TAG, "★ libtailscale.start() 返回 null（后端未起来），复位 initialized 以便下一轮重试")
+                initialized = false
+                return
+            }
             Log.i(TAG, "libtailscale 后端已启动")
             startLogin(ctx)
         } catch (t: Throwable) {
@@ -466,7 +510,16 @@ object TailscaleManager {
         val json = statusJson() ?: return false
         return try {
             val obj = JSONObject(json)
-            if (obj.optJSONObject("Self") != null) return true
+            // ★★★ 2026-09-22 修复被控端"VPN 永远起不来"的总根因：
+            //   旧判据第一句是 `if (obj.optJSONObject("Self") != null) return true`。
+            //   但 /localapi/v0/status 里的 Self 是【任何时候都存在】的本节点描述对象，
+            //   未登录（NeedsLogin）时它照样存在 —— 于是本函数恒为 true，
+            //   startLogin 每轮都走进"复用已持久化身份，仅置 WantRunning"分支并 return，
+            //   【永远不带 authkey 走 POST /localapi/v0/start】→ 后端永久停在
+            //   NeedsLogin + WantRunning=false（日志 health: Tailscale is stopped）
+            //   → 永不建 tun → VPN 永远起不来（establish 失败计数恒为 0）。
+            //   与控制端 android_controller 2026-09-13 的修复对齐：判据只看 BackendState，
+            //   NeedsLogin / NoState / InUseOtherUser 一律视为【未注册】，必须走 authkey 注册。
             val state = obj.optString("BackendState", "")
             state.isNotEmpty() && state !in NEEDS_LOGIN_STATES
         } catch (t: Throwable) {
@@ -492,6 +545,22 @@ object TailscaleManager {
         }
         if (TailscaleVpnService.vpnEstablished) {
             Log.i(TAG, "VPN 通道已存在，跳过启动")
+            return
+        }
+        // ★★★ 2026-09-22 修复"被控端一启动就把 VPN 顶掉"：本机已有【真实隧道】而自己却没有
+        //   任何可用凭证时，绝不能再调 establish()。Android 单 VPN 限制下这会让系统撤销
+        //   对方（控制端）正在用的 VPN，而自己因为还没登录（NeedsLogin）根本建不出可用隧道
+        //   —— 结果就是"VPN 图标消失、与 PC/其他被控端的连接全部断开"。
+        //   实测：华为上启动被控端后，控制端进程立刻收到 onRevoke "VPN 授权被撤销"。
+        //   凭证到位（控制端下发 tscred / 构建期预置）后才允许自己开 VPN。
+        val hasCred = try {
+            getAuthkey(ctx).isNotEmpty() || hasOAuthCred(ctx)
+        } catch (t: Throwable) {
+            false
+        }
+        if (!hasCred) {
+            Log.w(TAG, "★ 无可用 authkey/OAuth 凭证，跳过开 VPN（避免顶掉本机已有的可用隧道，"
+                    + "等控制端下发凭证后自动重试）")
             return
         }
         try {
@@ -589,7 +658,49 @@ object TailscaleManager {
                     if (TailscaleVpnService.vpnEstablished) continue  // VPN在，保持
                     // ★ 未授权也不杀看门狗，continue 等待界面授权后下一轮再尝试启动（避免永久失活）
                     if (!isVpnAuthorized(ctx)) continue
-                    Log.i(TAG, "★ VPN看门狗：检测到VPN未建立，重新启动（第${downRounds + 1}轮，下轮间隔${minOf(VPN_WATCHDOG_BUSY_MS shl (downRounds + 1).coerceAtMost(3), VPN_WATCHDOG_MAX_MS) / 1000}s）")
+                    // ★ 2026-09-22：把"建 tun 被系统拒绝"的次数一并打出来 —— 一眼区分
+                    //   "没凭证/没授权"（该计数为 0）与"系统拒绝建 tun"（该计数 >0）。
+                    // ★★★ 2026-09-22 修复被控端"VPN 永远起不来"的最后一环：
+                    //   旧看门狗只调 startVpnService()，从不调 ensureStarted()。
+                    //   后果：后端没起（app==null）时 requestVPN 空转；更糟的是首次冷启动若
+                    //   startLogin 没被任何路径调用，Go 后端会永远停在 NeedsLogin（实测日志
+                    //   `gojni: Rebind; defIf="", ips=[]`、`Switching ipn state NoState -> NeedsLogin`），
+                    //   establish() 根本不会被触发（establish失败恒为0）→ VPN 永远起不来。
+                    //   先 ensureStarted：没起就启动后端并登录；起了但未注册身份则由其内部重登。
+                    try {
+                        ensureStarted(ctx)
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "看门狗 ensureStarted 异常: ${t.message}")
+                    }
+                    // ★★★ 2026-09-22 修复"攥着失效 authkey 永远不重试"（被控端 VPN 起不来的真凶）：
+                    //   startLogin 的分支是 `authkey 为空 或 前缀是 tskey-auth-kHFoj` 才走 OAuth 签发。
+                    //   实测被控端 SP 里存着一把【已失效但格式合法】的 key
+                    //   （tskey-auth-knuERHtjtt11CNTRL-…，非空、也不匹配那个前缀），于是：
+                    //     · 永远跳过 OAuth 分支（日志里一条 OAuth 记录都没有）；
+                    //     · 拿它登录必败 → gojni 停在 want=false loggedout=true / NeedsLogin；
+                    //     · 下一轮 authkey 依旧非空 → 再次跳过 → 死循环且毫无日志。
+                    //   修法：后端已启动但始终没注册身份时，判定该 key 失效，清空后强制走 OAuth 重签。
+                    //   ★ 加冷却：OAuth 也失败时不至于每轮都清（避免刷屏与无谓的重签）。
+                    if (app != null && !hasRegisteredIdentity()) {
+                        val now = System.currentTimeMillis()
+                        if (now - staleAuthkeyClearedAt > STALE_AUTHKEY_CLEAR_COOLDOWN_MS) {
+                            val old = try {
+                                getAuthkey(ctx)
+                            } catch (t: Throwable) {
+                                ""
+                            }
+                            if (old.isNotEmpty()) {
+                                staleAuthkeyClearedAt = now
+                                Log.w(TAG, "★ 后端始终未注册身份 → 判定本机 authkey 已失效(len=${old.length})，"
+                                        + "清空后改用 OAuth 重新签发")
+                                setAuthkey(ctx, "")
+                                startLogin(ctx)
+                            }
+                        }
+                    }
+                    Log.i(TAG, "★ VPN看门狗：检测到VPN未建立，重新启动（第${downRounds + 1}轮"
+                            + "，establish失败${vpnEstablishFailed}次"
+                            + "，下轮间隔${minOf(VPN_WATCHDOG_BUSY_MS shl (downRounds + 1).coerceAtMost(3), VPN_WATCHDOG_MAX_MS) / 1000}s）")
                     downRounds++
                     startVpnService(ctx)
                 }
@@ -667,6 +778,25 @@ object TailscaleManager {
     fun onVpnRequested() {
         vpnPending = true
     }
+
+    /** ★ 2026-09-22：Go 后端请求建 tun 但 builder.establish() 被系统拒绝的累计次数（诊断用） */
+    @Volatile
+    private var vpnEstablishFailed = 0
+
+    /**
+     * ★ 2026-09-22 新增：建 tun 被系统拒绝时由 TailscaleVpnService 回调（与控制器 Android 侧同名语义）。
+     * 为什么必须要有：旧实现 establish() 返回 null 时完全静默，看门狗只能反复打"VPN未建立"，
+     * 现场无法判断到底是"没授权/没凭证"还是"系统拒绝了 tun"（华为实测盲转 115 轮）。
+     */
+    fun notifyVpnEstablishFailed() {
+        vpnEstablishFailed++
+        Log.w(TAG, "★ builder.establish() 返回 null：系统拒绝建立 tun（累计 ${vpnEstablishFailed} 次）"
+                + " → 请检查华为「应用启动管理/后台权限」与是否已有其它 VPN 占用")
+        emit("vpn_establish_failed")
+    }
+
+    /** 建 tun 被拒次数（诊断用；>0 说明是系统层拒绝而不是凭证问题） */
+    fun getVpnEstablishFailedCount(): Int = vpnEstablishFailed
 
     /** VPN 授权被撤销（onRevoke） */
     fun notifyVpnRevoked() {
