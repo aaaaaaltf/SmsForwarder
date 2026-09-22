@@ -447,8 +447,8 @@ object RelayServerHandler {
                 }
 
                 RelayCommands.CMD_FS_UPDONE -> {
-                    // 上传完成：关闭文件并校验，回 RSP_FS_UPRST
-                    finishFsUpload(sender, peerKey)
+                    // 上传完成：关闭文件并校验（★ 负载=控制端下发的整包 sha256，旧控制端为空），回 RSP_FS_UPRST
+                    finishFsUpload(sender, peerKey, payloadText)
                 }
 
                 // ==================== ★ 文件属性（2026-09-07新增） ====================
@@ -1341,19 +1341,26 @@ object RelayServerHandler {
     /**
      * 上传完成处理：关闭文件、校验大小，回 RSP_FS_UPRST
      */
-    private fun finishFsUpload(sender: RelaySender?, peerKey: Any?): Pair<String, String>? {
+    private fun finishFsUpload(sender: RelaySender?, peerKey: Any?, expectSha: String? = null): Pair<String, String>? {
         val session = sessionOf(peerKey)
         try { session.fsUploadRaf?.close() } catch (_: Throwable) {}
         session.fsUploadRaf = null
         val path = session.fsUploadPath
         val expected = session.fsUploadExpected
         val received = session.fsUploadReceived
+        val wantSha = (expectSha ?: "").trim().lowercase()
         val file = File(path)
         if (sender != null) {
             val result = if (!file.exists()) {
                 "0|failed|文件不存在"
             } else if (expected > 0 && file.length() != expected) {
                 "0|failed|大小不匹配(${file.length()}/${expected})"
+            } else if (wantSha.length == 64 && sha256File(file) != wantSha) {
+                // ★ 2026-09-22 内容校验失败：只比大小无法发现"等长但内容损坏"，这里删除损坏文件，
+                //   绝不留下坏文件（控制端据此判失败并重传）。
+                try { file.delete() } catch (_: Throwable) {}
+                Log.w(TAG, "★ 上传内容校验失败(sha256)，已删除损坏文件: $path")
+                "0|failed|内容校验(sha256)不符，已删除损坏文件"
             } else {
                 "1|success|上传成功"
             }
@@ -1365,6 +1372,25 @@ object RelayServerHandler {
         session.fsUploadReceived = 0L
         session.fsUploadCancelled = false
         return null
+    }
+
+    /** ★ 2026-09-22 计算文件 sha256（十六进制小写，64 字符）；失败返回空串 */
+    private fun sha256File(f: File): String {
+        return try {
+            val md = java.security.MessageDigest.getInstance("SHA-256")
+            java.io.FileInputStream(f).use { input ->
+                val buf = ByteArray(FS_BLOCK_BYTES)
+                while (true) {
+                    val n = input.read(buf)
+                    if (n <= 0) break
+                    md.update(buf, 0, n)
+                }
+            }
+            md.digest().joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+        } catch (e: Exception) {
+            Log.w(TAG, "计算 sha256 失败: ${e.message}")
+            ""
+        }
     }
 
     // ==================== ★ 文件属性（2026-09-07新增，Windows风格） ====================
@@ -1550,6 +1576,26 @@ object RelayServerHandler {
                 var sentBytes = startBytes
                 var blockIdx = startBlock
                 var lastLogProgress = -1
+                // ★ 2026-09-22 整包 sha256：续传时先把"已有前缀"喂进摘要，发送中再逐块累计，
+                //   得到整包哈希随 CMD_FS_DONE 下发；控制端收完后据此校验内容（空=不校验）。
+                val md = java.security.MessageDigest.getInstance("SHA-256")
+                if (startBytes > 0L) {
+                    try {
+                        java.io.RandomAccessFile(f, "r").use { pre ->
+                            var remaining = startBytes
+                            val pb = ByteArray(FS_BLOCK_BYTES)
+                            while (remaining > 0L) {
+                                val want = minOf(pb.size.toLong(), remaining).toInt()
+                                val r = pre.read(pb, 0, want)
+                                if (r <= 0) break
+                                md.update(pb, 0, r)
+                                remaining -= r
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "下载续传前缀哈希计算失败: ${e.message}")
+                    }
+                }
                 // ★ 分块确认：控制端每收到一块回ACK(块序号)，被控端等待确认后才发送下一块
                 //   参照PC端微信_download_send_file_blocked：发送→等待ACK→确认后继续
                 //   防止中继→控制端链路拥塞时盲目高速发送导致数据堆积丢失
@@ -1573,6 +1619,7 @@ object RelayServerHandler {
                         }
                         if (n <= 0) break
                         val chunk = if (n == buf.size) buf else buf.copyOf(n)
+                        md.update(chunk, 0, chunk.size)   // ★ 2026-09-22 计入整包 sha256
                         // ★ 数据块负载加4字节大端块序号前缀（供控制端去重，防止ACK丢失重发导致重复写盘）
                         val framedChunk = java.nio.ByteBuffer.allocate(4 + chunk.size)
                             .putInt(blockIdx).put(chunk).array()
@@ -1692,7 +1739,13 @@ object RelayServerHandler {
                     Log.w(TAG, "文件下载完成但连接断开，无法发送完成标记: $p")
                     return@Thread
                 }
-                if (!sender.sendSync(RelayCommands.CMD_FS_DONE, ByteArray(0), 15000)) {
+                // ★ 2026-09-22 完成帧携带整包 sha256（控制端收完后校验内容）
+                val doneSha = try {
+                    md.digest().joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+                } catch (e: Exception) {
+                    ""
+                }
+                if (!sender.sendSync(RelayCommands.CMD_FS_DONE, doneSha.toByteArray(Charsets.UTF_8), 15000)) {
                     Log.w(TAG, "文件下载: 发送完成标记CMD_FS_DONE失败 $p")
                     return@Thread
                 }
