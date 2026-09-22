@@ -80,24 +80,25 @@ class PhoneUtils private constructor() {
                     Log.d(TAG, "2.版本低于5.1的系统，首先调用数据库，看能不能访问到")
                     val uri = Uri.parse("content://telephony/siminfo") //访问raw_contacts表
                     val resolver: ContentResolver = XUtil.getContext().contentResolver
-                    val cursor = resolver.query(
+                    // ★ 修复：Cursor 持有 FD，moveToFirst 失败时会泄漏，改用 use{}。
+                    resolver.query(
                         uri, arrayOf(
                             "_id", "icc_id", "sim_id", "display_name", "carrier_name", "name_source", "color", "number", "display_number_format", "data_roaming", "mcc", "mnc"
                         ), null, null, null
-                    )
-                    if (cursor != null && cursor.moveToFirst()) {
-                        do {
-                            val simInfo = SimInfo()
-                            simInfo.mCarrierName = cursor.getString(cursor.getColumnIndex("carrier_name"))
-                            simInfo.mIccId = cursor.getString(cursor.getColumnIndex("icc_id"))
-                            simInfo.mSimSlotIndex = cursor.getInt(cursor.getColumnIndex("sim_id"))
-                            simInfo.mNumber = cursor.getString(cursor.getColumnIndex("number"))
-                            simInfo.mCountryIso = cursor.getString(cursor.getColumnIndex("mcc"))
-                            //val id = cursor.getString(cursor.getColumnIndex("_id"))
-                            Log.d(TAG, simInfo.toString())
-                            infoList[simInfo.mSimSlotIndex] = simInfo
-                        } while (cursor.moveToNext())
-                        cursor.close()
+                    )?.use { cursor ->
+                        if (cursor.moveToFirst()) {
+                            do {
+                                val simInfo = SimInfo()
+                                simInfo.mCarrierName = cursor.getString(cursor.getColumnIndex("carrier_name"))
+                                simInfo.mIccId = cursor.getString(cursor.getColumnIndex("icc_id"))
+                                simInfo.mSimSlotIndex = cursor.getInt(cursor.getColumnIndex("sim_id"))
+                                simInfo.mNumber = cursor.getString(cursor.getColumnIndex("number"))
+                                simInfo.mCountryIso = cursor.getString(cursor.getColumnIndex("mcc"))
+                                //val id = cursor.getString(cursor.getColumnIndex("_id"))
+                                Log.d(TAG, simInfo.toString())
+                                infoList[simInfo.mSimSlotIndex] = simInfo
+                            } while (cursor.moveToNext())
+                        }
                     }
                 }
             } catch (e: java.lang.Exception) {
@@ -194,85 +195,84 @@ class PhoneUtils private constructor() {
                 Log.d(TAG, "selectionArgs = $selectionArgs")
 
                 //为了兼容性这里全部取出后手动分页
-                val cursor = Core.app.contentResolver.query(
+                // ★ 修复：Cursor 持有 FD，原先在异常路径 / moveToFirst 失败时会泄漏，改用 use{}。
+                Core.app.contentResolver.query(
                     CallLog.Calls.CONTENT_URI, null, selection, selectionArgs.toTypedArray(), CallLog.Calls.DEFAULT_SORT_ORDER // + " limit $limit offset $offset"
-                ) ?: return callInfoList
-                Log.i(TAG, "cursor count:" + cursor.count)
+                )?.use { cursor ->
+                    Log.i(TAG, "cursor count:" + cursor.count)
 
-                // 避免超过总数后循环取出
-                if (cursor.count == 0 || offset >= cursor.count) {
-                    cursor.close()
-                    return callInfoList
-                }
-
-                if (cursor.moveToFirst()) {
-                    Log.d(TAG, "Call ColumnNames=${cursor.columnNames.contentToString()}")
-                    val indexName = cursor.getColumnIndex(CallLog.Calls.CACHED_NAME)
-                    val indexNumber = cursor.getColumnIndex(CallLog.Calls.NUMBER)
-                    val indexDate = cursor.getColumnIndex(CallLog.Calls.DATE)
-                    val indexDuration = cursor.getColumnIndex(CallLog.Calls.DURATION)
-                    val indexType = cursor.getColumnIndex(CallLog.Calls.TYPE)
-                    val indexViaNumber = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && cursor.getColumnIndex("via_number") != -1) cursor.getColumnIndex("via_number") else -1
-                    var indexSimId = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) cursor.getColumnIndex(CallLog.Calls.PHONE_ACCOUNT_ID) else -1
-                    var indexSubId = indexSimId
-                    //遍历列名带有`forward`的字段
-                    val forwardColumns = cursor.columnNames.filter { it.contains("forward", ignoreCase = true) }
-
-                    /**
-                     * TODO:卡槽识别，这里需要适配机型
-                     * MIUI系统：simid 字段实际为 subscription_id
-                     * EMUI系统：subscription_id 实际为 sim_id
-                     */
-                    var isSimId = false
-                    val manufacturer = Build.MANUFACTURER.lowercase(Locale.getDefault())
-                    Log.i(TAG, "manufacturer = $manufacturer")
-                    if (manufacturer.contains(Regex(pattern = "xiaomi|redmi"))) {
-                        if (cursor.getColumnIndex("simid") != -1) indexSimId = cursor.getColumnIndex("simid")
-                        indexSubId = indexSimId
-                    } else if (manufacturer.contains(Regex(pattern = "huawei|honor"))) {
-                        indexSubId = -1 //TODO:暂时不支持华为
-                        isSimId = true
+                    // 避免超过总数后循环取出
+                    if (cursor.count == 0 || offset >= cursor.count) {
+                        return callInfoList
                     }
 
-                    var curOffset = 0
-                    do {
-                        if (curOffset >= offset) {
-                            // 遍历 forwardColumns 字段，找到合适的 isForwarded 字段
-                            var isForwarded = false;
-                            for (forwardColumn in forwardColumns) {
-                                val forwardIndex = cursor.getColumnIndex(forwardColumn)
-                                if (forwardIndex != -1) {
-                                    val forwardedValue = cursor.getInt(forwardIndex)
-                                    Log.d(TAG, "forwardColumn = $forwardColumn, forwardedValue = $forwardedValue")
-                                    if (forwardedValue == 1) {
-                                        isForwarded = true
-                                        break
+                    if (cursor.moveToFirst()) {
+                        Log.d(TAG, "Call ColumnNames=${cursor.columnNames.contentToString()}")
+                        val indexName = cursor.getColumnIndex(CallLog.Calls.CACHED_NAME)
+                        val indexNumber = cursor.getColumnIndex(CallLog.Calls.NUMBER)
+                        val indexDate = cursor.getColumnIndex(CallLog.Calls.DATE)
+                        val indexDuration = cursor.getColumnIndex(CallLog.Calls.DURATION)
+                        val indexType = cursor.getColumnIndex(CallLog.Calls.TYPE)
+                        val indexViaNumber = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && cursor.getColumnIndex("via_number") != -1) cursor.getColumnIndex("via_number") else -1
+                        var indexSimId = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) cursor.getColumnIndex(CallLog.Calls.PHONE_ACCOUNT_ID) else -1
+                        var indexSubId = indexSimId
+                        //遍历列名带有`forward`的字段
+                        val forwardColumns = cursor.columnNames.filter { it.contains("forward", ignoreCase = true) }
+
+                        /**
+                         * TODO:卡槽识别，这里需要适配机型
+                         * MIUI系统：simid 字段实际为 subscription_id
+                         * EMUI系统：subscription_id 实际为 sim_id
+                         */
+                        var isSimId = false
+                        val manufacturer = Build.MANUFACTURER.lowercase(Locale.getDefault())
+                        Log.i(TAG, "manufacturer = $manufacturer")
+                        if (manufacturer.contains(Regex(pattern = "xiaomi|redmi"))) {
+                            if (cursor.getColumnIndex("simid") != -1) indexSimId = cursor.getColumnIndex("simid")
+                            indexSubId = indexSimId
+                        } else if (manufacturer.contains(Regex(pattern = "huawei|honor"))) {
+                            indexSubId = -1 //TODO:暂时不支持华为
+                            isSimId = true
+                        }
+
+                        var curOffset = 0
+                        do {
+                            if (curOffset >= offset) {
+                                // 遍历 forwardColumns 字段，找到合适的 isForwarded 字段
+                                var isForwarded = false;
+                                for (forwardColumn in forwardColumns) {
+                                    val forwardIndex = cursor.getColumnIndex(forwardColumn)
+                                    if (forwardIndex != -1) {
+                                        val forwardedValue = cursor.getInt(forwardIndex)
+                                        Log.d(TAG, "forwardColumn = $forwardColumn, forwardedValue = $forwardedValue")
+                                        if (forwardedValue == 1) {
+                                            isForwarded = true
+                                            break
+                                        }
                                     }
                                 }
-                            }
 
-                            val callInfo = CallInfo(
-                                cursor.getString(indexName) ?: "",  //姓名
-                                cursor.getString(indexNumber) ?: "",  //号码
-                                cursor.getLong(indexDate),  //获取通话日期
-                                cursor.getInt(indexDuration),  //获取通话时长，值为多少秒
-                                cursor.getInt(indexType),  //获取通话类型：1.呼入 2.呼出 3.未接
-                                if (indexViaNumber != -1) cursor.getString(indexViaNumber) else "",  //来源号码
-                                if (indexSimId != -1) getSimId(cursor.getInt(indexSimId), isSimId) else -1,  //卡槽ID： 0=Sim1, 1=Sim2, -1=获取失败
-                                if (indexSubId != -1) cursor.getInt(indexSubId) else 0,  //卡槽主键
-                                isForwarded //是否来电转移
-                            )
-                            Log.d(TAG, callInfo.toString())
-                            callInfoList.add(callInfo)
-                            if (limit == 1) {
-                                cursor.close()
-                                return callInfoList
+                                val callInfo = CallInfo(
+                                    cursor.getString(indexName) ?: "",  //姓名
+                                    cursor.getString(indexNumber) ?: "",  //号码
+                                    cursor.getLong(indexDate),  //获取通话日期
+                                    cursor.getInt(indexDuration),  //获取通话时长，值为多少秒
+                                    cursor.getInt(indexType),  //获取通话类型：1.呼入 2.呼出 3.未接
+                                    if (indexViaNumber != -1) cursor.getString(indexViaNumber) else "",  //来源号码
+                                    if (indexSimId != -1) getSimId(cursor.getInt(indexSimId), isSimId) else -1,  //卡槽ID： 0=Sim1, 1=Sim2, -1=获取失败
+                                    if (indexSubId != -1) cursor.getInt(indexSubId) else 0,  //卡槽主键
+                                    isForwarded //是否来电转移
+                                )
+                                Log.d(TAG, callInfo.toString())
+                                callInfoList.add(callInfo)
+                                if (limit == 1) {
+                                    return callInfoList
+                                }
                             }
-                        }
-                        curOffset++
-                        if (curOffset >= offset + limit) break
-                    } while (cursor.moveToNext())
-                    if (!cursor.isClosed) cursor.close()
+                            curOffset++
+                            if (curOffset >= offset + limit) break
+                        } while (cursor.moveToNext())
+                    }
                 }
             } catch (e: java.lang.Exception) {
                 Log.e(TAG, "getCallInfoList:", e)
@@ -313,33 +313,32 @@ class PhoneUtils private constructor() {
                 Log.d(TAG, "selection = $selection")
                 Log.d(TAG, "selectionArgs = $selectionArgs")
 
-                val cursor = Core.app.contentResolver.query(
+                // ★ 修复：Cursor 持有 FD，异常路径 / moveToFirst 失败会泄漏，改用 use{}。
+                Core.app.contentResolver.query(
                     ContactsContract.CommonDataKinds.Phone.CONTENT_URI, null, selection, selectionArgs.toTypedArray(), ContactsContract.CommonDataKinds.Phone.SORT_KEY_PRIMARY
-                ) ?: return contactInfoList
-                Log.i(TAG, "cursor count:" + cursor.count)
+                )?.use { cursor ->
+                    Log.i(TAG, "cursor count:" + cursor.count)
 
-                // 避免超过总数后循环取出
-                if (cursor.count == 0 || offset >= cursor.count) {
-                    cursor.close()
-                    return contactInfoList
-                }
+                    // 避免超过总数后循环取出
+                    if (cursor.count == 0 || offset >= cursor.count) {
+                        return contactInfoList
+                    }
 
-                if (cursor.moveToFirst()) {
-                    val displayNameIndex = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
-                    val mobileNoIndex = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
-                    do {
-                        val contactInfo = ContactInfo(
-                            cursor.getString(displayNameIndex),  //姓名
-                            cursor.getString(mobileNoIndex),  //号码
-                        )
-                        Log.d(TAG, contactInfo.toString())
-                        contactInfoList.add(contactInfo)
-                        if (limit == 1) {
-                            cursor.close()
-                            return contactInfoList
-                        }
-                    } while (cursor.moveToNext())
-                    if (!cursor.isClosed) cursor.close()
+                    if (cursor.moveToFirst()) {
+                        val displayNameIndex = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
+                        val mobileNoIndex = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
+                        do {
+                            val contactInfo = ContactInfo(
+                                cursor.getString(displayNameIndex),  //姓名
+                                cursor.getString(mobileNoIndex),  //号码
+                            )
+                            Log.d(TAG, contactInfo.toString())
+                            contactInfoList.add(contactInfo)
+                            if (limit == 1) {
+                                return contactInfoList
+                            }
+                        } while (cursor.moveToNext())
+                    }
                 }
             } catch (e: java.lang.Exception) {
                 Log.e(TAG, "getContactInfoList:", e)
@@ -499,72 +498,72 @@ class PhoneUtils private constructor() {
                 Log.d(TAG, "selectionArgs = $selectionArgs")
 
                 // 避免超过总数后循环取出
-                val cursorTotal = Core.app.contentResolver.query(
+                // ★ 修复：Cursor 持有 CursorWindow（ashmem FD），原先在多个 return 分支与异常路径下
+                //   未关闭 cursorTotal/cursor，控制端频繁下发 CMD_SMS_QUERY 会累积 FD → 进程崩溃。
+                //   改用 use{} 保证任何分支/异常都关闭。
+                Core.app.contentResolver.query(
                     Uri.parse("content://sms/"), null, selection, selectionArgs.toTypedArray(), "date desc"
-                ) ?: return smsInfoList
-                if (offset >= cursorTotal.count) {
-                    cursorTotal.close()
-                    return smsInfoList
-                }
-
-                val cursor = Core.app.contentResolver.query(
-                    Uri.parse("content://sms/"), null, selection, selectionArgs.toTypedArray(), "date desc limit $limit offset $offset"
-                ) ?: return smsInfoList
-
-                Log.i(TAG, "cursor count:" + cursor.count)
-                if (cursor.count == 0) {
-                    cursor.close()
-                    return smsInfoList
-                }
-
-                if (cursor.moveToFirst()) {
-                    Log.d(TAG, "SMS ColumnNames=${cursor.columnNames.contentToString()}")
-                    val indexAddress = cursor.getColumnIndex("address")
-                    val indexBody = cursor.getColumnIndex("body")
-                    val indexDate = cursor.getColumnIndex("date")
-                    val indexType = cursor.getColumnIndex("type")
-                    var indexSimId = cursor.getColumnIndex("sim_id")
-                    var indexSubId = cursor.getColumnIndex("sub_id")
-
-                    /**
-                     * TODO:卡槽识别，这里需要适配机型
-                     * MIUI系统：sim_id 字段实际为 subscription_id
-                     * EMUI系统：sub_id 实际为 sim_id
-                     */
-                    var isSimId = false
-                    val manufacturer = Build.MANUFACTURER.lowercase(Locale.getDefault())
-                    Log.i(TAG, "manufacturer = $manufacturer")
-                    if (manufacturer.contains(Regex(pattern = "xiaomi|redmi"))) {
-                        indexSubId = cursor.getColumnIndex("sim_id")
-                    } else if (manufacturer.contains(Regex(pattern = "huawei|honor"))) {
-                        indexSimId = cursor.getColumnIndex("sub_id")
-                        isSimId = true
+                )?.use { cursorTotal ->
+                    if (offset >= cursorTotal.count) {
+                        return smsInfoList
                     }
 
-                    do {
-                        val smsInfo = SmsInfo()
-                        val phoneNumber = cursor.getString(indexAddress)
-                        // 根据手机号码查询用户名
-                        val contacts = getContactByNumber(phoneNumber)
-                        smsInfo.name = if (contacts.isNotEmpty()) contacts[0].name else getString(R.string.unknown_number)
-                        // 联系人号码
-                        smsInfo.number = phoneNumber
-                        // 短信内容
-                        smsInfo.content = cursor.getString(indexBody)
-                        // 短信时间
-                        smsInfo.date = cursor.getLong(indexDate)
-                        // 短信类型: 1=接收, 2=发送
-                        smsInfo.type = cursor.getInt(indexType)
-                        // 卡槽ID： 0=Sim1, 1=Sim2, -1=获取失败
-                        smsInfo.simId = if (indexSimId != -1) getSimId(cursor.getInt(indexSimId), isSimId) else -1
-                        // 卡槽主键
-                        smsInfo.subId = if (indexSubId != -1) cursor.getInt(indexSubId) else 0
+                    Core.app.contentResolver.query(
+                        Uri.parse("content://sms/"), null, selection, selectionArgs.toTypedArray(), "date desc limit $limit offset $offset"
+                    )?.use { cursor ->
 
-                        smsInfoList.add(smsInfo)
-                    } while (cursor.moveToNext())
+                        Log.i(TAG, "cursor count:" + cursor.count)
+                        if (cursor.count == 0) {
+                            return smsInfoList
+                        }
 
-                    if (!cursorTotal.isClosed) cursorTotal.close()
-                    if (!cursor.isClosed) cursor.close()
+                        if (cursor.moveToFirst()) {
+                            Log.d(TAG, "SMS ColumnNames=${cursor.columnNames.contentToString()}")
+                            val indexAddress = cursor.getColumnIndex("address")
+                            val indexBody = cursor.getColumnIndex("body")
+                            val indexDate = cursor.getColumnIndex("date")
+                            val indexType = cursor.getColumnIndex("type")
+                            var indexSimId = cursor.getColumnIndex("sim_id")
+                            var indexSubId = cursor.getColumnIndex("sub_id")
+
+                            /**
+                             * TODO:卡槽识别，这里需要适配机型
+                             * MIUI系统：sim_id 字段实际为 subscription_id
+                             * EMUI系统：sub_id 实际为 sim_id
+                             */
+                            var isSimId = false
+                            val manufacturer = Build.MANUFACTURER.lowercase(Locale.getDefault())
+                            Log.i(TAG, "manufacturer = $manufacturer")
+                            if (manufacturer.contains(Regex(pattern = "xiaomi|redmi"))) {
+                                indexSubId = cursor.getColumnIndex("sim_id")
+                            } else if (manufacturer.contains(Regex(pattern = "huawei|honor"))) {
+                                indexSimId = cursor.getColumnIndex("sub_id")
+                                isSimId = true
+                            }
+
+                            do {
+                                val smsInfo = SmsInfo()
+                                val phoneNumber = cursor.getString(indexAddress)
+                                // 根据手机号码查询用户名
+                                val contacts = getContactByNumber(phoneNumber)
+                                smsInfo.name = if (contacts.isNotEmpty()) contacts[0].name else getString(R.string.unknown_number)
+                                // 联系人号码
+                                smsInfo.number = phoneNumber
+                                // 短信内容
+                                smsInfo.content = cursor.getString(indexBody)
+                                // 短信时间
+                                smsInfo.date = cursor.getLong(indexDate)
+                                // 短信类型: 1=接收, 2=发送
+                                smsInfo.type = cursor.getInt(indexType)
+                                // 卡槽ID： 0=Sim1, 1=Sim2, -1=获取失败
+                                smsInfo.simId = if (indexSimId != -1) getSimId(cursor.getInt(indexSimId), isSimId) else -1
+                                // 卡槽主键
+                                smsInfo.subId = if (indexSubId != -1) cursor.getInt(indexSubId) else 0
+
+                                smsInfoList.add(smsInfo)
+                            } while (cursor.moveToNext())
+                        }
+                    }
                 }
             } catch (e: java.lang.Exception) {
                 e.printStackTrace()

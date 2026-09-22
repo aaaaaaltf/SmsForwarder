@@ -582,9 +582,13 @@ object TailscaleManager {
                     }
                     Thread.sleep(sleepMs)
                     if (!vpnWatchdogRunning) break
-                    if (isRelayConnected()) break                // 中继模式无需VPN
+                    // ★ 修复：中继模式(relay已连)时原本 break 会直接杀死看门狗线程，导致此后中继一旦掉线，
+                    //   再无周期性兜底层去拉起直连VPN。改为 continue：本轮跳过，线程保持存活，
+                    //   中继掉线(setRelayConnected(false))后下一轮即重新拉起VPN。
+                    if (isRelayConnected()) continue              // 中继模式：本轮跳过，保持看门狗存活
                     if (TailscaleVpnService.vpnEstablished) continue  // VPN在，保持
-                    if (!isVpnAuthorized(ctx)) break             // 未授权，等界面授权后由ensureVpnUp重启
+                    // ★ 未授权也不杀看门狗，continue 等待界面授权后下一轮再尝试启动（避免永久失活）
+                    if (!isVpnAuthorized(ctx)) continue
                     Log.i(TAG, "★ VPN看门狗：检测到VPN未建立，重新启动（第${downRounds + 1}轮，下轮间隔${minOf(VPN_WATCHDOG_BUSY_MS shl (downRounds + 1).coerceAtMost(3), VPN_WATCHDOG_MAX_MS) / 1000}s）")
                     downRounds++
                     startVpnService(ctx)

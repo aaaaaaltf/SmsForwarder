@@ -40,7 +40,10 @@ class App : Application(), Configuration.Provider by Core {
         lateinit var context: Context
 
         //已插入SIM卡信息
-        var SimInfoList: MutableMap<Int, SimInfo> = mutableMapOf()
+        // ★ 修复：该字段在 relay 命令线程池上被读取与整体替换，原 mutableMapOf() 返回非线程安全的
+        //   LinkedHashMap，并发迭代/替换会触发 ConcurrentModificationException；改用 ConcurrentHashMap
+        //   （其迭代器弱一致，替换引用时旧实例仍可安全遍历）。
+        var SimInfoList: MutableMap<Int, SimInfo> = java.util.concurrent.ConcurrentHashMap()
 
         /**
          * @return 当前app是否是调试开发模式

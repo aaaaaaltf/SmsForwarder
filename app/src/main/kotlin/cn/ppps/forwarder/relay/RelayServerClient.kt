@@ -111,6 +111,10 @@ class RelayServerClient(
 
     fun stop() {
         running = false
+        // ★ 修复：connectLoop 在独立 daemon 线程运行，stop() 仅靠 running=false + 关 socket 让其
+        //   退出，最坏卡在 Thread.sleep(nextRetryDelayMs) 不被中断（~20s 延迟）。主动 interrupt
+        //   以尽快退出重连等待。
+        thread?.interrupt()
         try {
             socket?.close()
         } catch (_: Exception) {
@@ -162,6 +166,11 @@ class RelayServerClient(
 
     private fun receiveLoop(s: Socket) {
         val input = try {
+            // ★ 修复：半开连接检测——中继进程被杀/网络分区未发FIN时，read会永久阻塞，
+            //   导致 onDisconnected 永不触发 → setRelayConnected(false) 不执行 → VPN 永不开启。
+            //   与控制端 RelayControllerClient 一致设 40s 读超时：无下行数据即判定失效，主动断开进入重连，
+            //   重连成功后 onConnected 再 setRelayConnected(true) 关闭VPN。
+            s.soTimeout = 40000
             s.getInputStream()
         } catch (e: IOException) {
             return
