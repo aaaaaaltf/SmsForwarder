@@ -133,6 +133,21 @@ object TailscaleManager {
     @Volatile
     private var backendStarted = false
 
+    /**
+     * ★★★ 2026-09-23：本 App 的 VPN 是否【被另一个 App（同机控制端）顶掉】（TailscaleVpnService.onRevoke 置位）。
+     * 供 shouldYieldVpnToExternalTun() 判定是否让位复用对方的隧道。
+     */
+    @Volatile
+    private var vpnLostToAnotherApp = false
+
+    /** ★ 2026-09-23：本节点 TS IP 的短缓存。getSelfIp() 走 localapi(超时 15s)，主线程绝不能调（会 ANR），
+     *  故主线程只读此缓存；后台线程负责刷新。 */
+    @Volatile
+    private var cachedSelfIp: String? = null
+    @Volatile
+    private var cachedSelfIpAt: Long = 0L
+    private const val SELF_IP_CACHE_MS = 30_000L
+
     private val listeners = CopyOnWriteArrayList<(String) -> Unit>()
 
     /** 登录/状态变化监听（"vpn_consent_needed" / "connected" / "ip:<x.x.x.x>"） */
@@ -532,6 +547,85 @@ object TailscaleManager {
         return "android-$model".replace(" ", "-").replace(Regex("[^A-Za-z0-9._-]"), "-")
     }
 
+    /** ★ 2026-09-23：判断 IPv4 是否属于 Tailscale CGNAT 段 100.64.0.0/10 */
+    private fun isTsCgnatIp(ip: String): Boolean {
+        val p = ip.split(".")
+        if (p.size != 4) return false
+        val a = p[0].toIntOrNull() ?: return false
+        val b = p[1].toIntOrNull() ?: return false
+        return a == 100 && b in 64..127
+    }
+
+    /**
+     * ★ 2026-09-23：找本机【真实 tun 隧道】的 IPv4 —— 网卡名必须形如 tun<数字>
+     *   （排除内核 tunl0 / ip6tnl0 等），且绑有 100.64.0.0/10 地址；找不到返回 null。
+     */
+    private fun findRealTunIp(): String? {
+        return try {
+            val nis = java.net.NetworkInterface.getNetworkInterfaces() ?: return null
+            for (ni in java.util.Collections.list(nis)) {
+                val name = ni.name ?: continue
+                if (!Regex("^tun\\d+$").matches(name)) continue
+                for (ia in java.util.Collections.list(ni.inetAddresses)) {
+                    if (ia is java.net.Inet4Address) {
+                        val host = ia.hostAddress ?: continue
+                        if (isTsCgnatIp(host)) return host
+                    }
+                }
+            }
+            null
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
+    /**
+     * ★★★ 2026-09-23（按用户明确要求；与控制端 TailscaleManager.shouldYieldVpnToControlledApp 对称）：
+     *   要求原文——"两个 App 都装了…只有任一个 App 启动了，都要建立隧道，先启动的建立，
+     *   不能把责任推给别人"。
+     *   本 App 是否应【复用另一方建起的真实 tun】而不自建：
+     *     · 自己的 VPN 已在 → false（隧道就是自己的）
+     *     · 无真实 tun     → false（没人在用隧道，必须自建；同时清除"被顶掉"标记）
+     *     · 有真实 tun 且(刚被顶掉 / 自己没有 Go 后端) → true（让位复用）
+     *     · 有真实 tun、自己有后端：tun 的 IP ≠ 本节点 IP → 别人的 → true；
+     *       tun 的 IP == 本节点 IP → 是自己 VpnService 被杀后残留的【僵尸 tun】→ false（必须重建）
+     *     ★ 僵尸防护：拿不到本节点 IP 时保守返回 false（宁可自建，绝不僵死在死网卡上）。
+     */
+    fun shouldYieldVpnToExternalTun(): Boolean {
+        if (TailscaleVpnService.vpnEstablished) {
+            vpnLostToAnotherApp = false
+            return false
+        }
+        val tunIp = findRealTunIp()
+        if (tunIp == null) {
+            vpnLostToAnotherApp = false
+            return false
+        }
+        if (vpnLostToAnotherApp) return true
+        if (app == null) return true
+        // ★ 僵尸防护：tun 的 IP 与本节点 IP 比较。主线程绝不调 localapi（15s 超时 → ANR），
+        //   主线程只用缓存；缓存为空时保守返回 false（宁可自建，绝不僵死在死网卡上）。
+        val selfIp = getSelfIpSafe() ?: return false
+        return selfIp != tunIp
+    }
+
+    /**
+     * ★ 2026-09-23：带缓存的本节点 TS IP。getSelfIp() 内部是 localapi(GET /status，超时 15000ms)，
+     *   绝不能在主线程调用 —— 主线程只返回缓存（可能为 null），由后台线程负责刷新。
+     */
+    private fun getSelfIpSafe(): String? {
+        val now = System.currentTimeMillis()
+        val c = cachedSelfIp
+        if (c != null && now - cachedSelfIpAt < SELF_IP_CACHE_MS) return c
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) return c
+        val fresh = try { getSelfIp() } catch (t: Throwable) { null }
+        if (fresh != null) {
+            cachedSelfIp = fresh
+            cachedSelfIpAt = now
+        }
+        return fresh ?: c
+    }
+
     /** VPN 授权后调用：拉起 VpnService 使 Go 后端建立 tun 通道（幂等，VPN 已在运行时跳过） */
     @SuppressLint("StartActivityAndCollapseDeprecated")
     fun startVpnService(ctx: Context) {
@@ -545,6 +639,16 @@ object TailscaleManager {
         }
         if (TailscaleVpnService.vpnEstablished) {
             Log.i(TAG, "VPN 通道已存在，跳过启动")
+            return
+        }
+        // ★★★ 2026-09-23（按用户要求，与控制端对称）：本机已有【另一方建起的真实 tun】时，
+        //   本 App 让位复用，不再 establish —— 先启动者持有隧道、后启动者复用，不把责任推给别人。
+        //   ★ 僵尸防护已内置于 shouldYieldVpnToExternalTun()：若那块 tun 是本 App 自己 VpnService
+        //     被杀后残留的死网卡（IP == 本节点 IP），该函数返回 false → 仍会重建，不会僵死。
+        //   ★ 中继开启时的"必须关闭任何 VPN"由 setRelayConnected(true)/onVpnEstablished 负责，与此不冲突。
+        if (shouldYieldVpnToExternalTun()) {
+            Log.i(TAG, "★ 本机已存在另一方建起的真实 tun → 让位复用，本 App 不重复建 VPN"
+                    + "（先启动者持有隧道）")
             return
         }
         // ★★★ 2026-09-22 修复"被控端一启动就把 VPN 顶掉"：本机已有【真实隧道】而自己却没有
@@ -656,6 +760,9 @@ object TailscaleManager {
                     //   中继掉线(setRelayConnected(false))后下一轮即重新拉起VPN。
                     if (isRelayConnected()) continue              // 中继模式：本轮跳过，保持看门狗存活
                     if (TailscaleVpnService.vpnEstablished) continue  // VPN在，保持
+                    // ★ 2026-09-23：另一方已建起真实 tun → 让位复用，本轮不再抢（先启动者持有隧道；
+                    //   僵尸防护见 shouldYieldVpnToExternalTun）。中继关闭后由中继联动/看门狗自动接管。
+                    if (shouldYieldVpnToExternalTun()) continue
                     // ★ 未授权也不杀看门狗，continue 等待界面授权后下一轮再尝试启动（避免永久失活）
                     if (!isVpnAuthorized(ctx)) continue
                     // ★ 2026-09-22：把"建 tun 被系统拒绝"的次数一并打出来 —— 一眼区分
@@ -735,6 +842,9 @@ object TailscaleManager {
      *   因此这里必须立即返回，关闭动作延迟到专用后台线程执行。
      */
     fun onVpnEstablished() {
+        // ★ 2026-09-23：本 App 成功持有 VPN → 清除"被顶掉"标记，避免残留标记在下次
+        //   VpnService 被杀留下僵尸 tun 时误判为"别人的隧道"而让位（防死锁）。
+        vpnLostToAnotherApp = false
         vpnCloseHandler.postDelayed({
             if (relayConnected == true && TailscaleVpnService.vpnEstablished) {
                 Log.i(TAG, "★ VPN 已建立但中继正常，延迟关闭 Tailscale VPN（节省资源）")
@@ -800,6 +910,9 @@ object TailscaleManager {
 
     /** VPN 授权被撤销（onRevoke） */
     fun notifyVpnRevoked() {
+        // ★ 2026-09-23：标记"本 App 的 VPN 被别的 App 顶掉"，供 shouldYieldVpnToExternalTun 判定让位
+        //   （仅当本机确有另一方建起的真实 tun 时才让位；没有 tun 时会自动清除该标记并自建）。
+        vpnLostToAnotherApp = true
         vpnAuthorized = false
         vpnPending = false
         emit("vpn_consent_needed")
