@@ -98,6 +98,17 @@ class RelayServerClient(
     private var running = false
     private var thread: Thread? = null
 
+    /**
+     * ★★★ 2026-09-23 本条连接是否已完成注册帧发送。
+     * 真机实测的断连循环根因：onConnected() 后服务立即开始 5 秒周期发 CMD_DEV_STATE（心跳），
+     * 心跳走独立线程池 heartBeatExecutor，与 connectLoop 线程直写的注册帧【并发竞速】——
+     * 服务器(56786)要求首帧必须是 regsms 注册命令，读到 devstate 即断开
+     * （服务器日志："首帧不是注册命令('devstate0000') → 断开"，每 20~40 秒一轮）。
+     * 修复：注册完成前【丢弃心跳类命令】（连接初期丢心跳无碍），注册后再放行。
+     */
+    @Volatile
+    private var registered = false
+
     override fun isConnected(): Boolean {
         val s = socket ?: return false
         return s.isConnected && !s.isClosed && !s.isInputShutdown && !s.isOutputShutdown
@@ -141,7 +152,45 @@ class RelayServerClient(
                 }
                 socket = s
                 consecutiveFailures = 0
+                registered = false   // ★ 新连接未注册，心跳先挡住（见 send()）
                 Log.i(TAG, "已连接中继服务 $host:$port")
+                // ★★★ 2026-09-23 连上后【先发注册帧】再进入收发：服务器(56786)要求 10 秒内
+                //   收到 regsms000000 + 共享令牌，否则判定为扫描连接直接断开（不裸开端口）。
+                //   注册成功后服务器会：①登记本机为"手机被控端"(pc_id)→控制端经中继可见可管理；
+                //   ②立即下发当前中继总闸状态(relayst on/off)→本端据此开/关VPN（首次启动检测）；
+                //   ③之后总闸每次变更主动推送→被动联动，无轮询开销。
+                //   注册帧发送失败会抛异常走下方 catch → 视为连接失败进入重连（与服务器语义一致）。
+                try {
+                    val out = s.getOutputStream()
+                    val dev = try {
+                        (cn.ppps.forwarder.App.context.let {
+                            android.os.Build.MODEL ?: "phone"
+                        })
+                    } catch (_: Throwable) {
+                        "phone"
+                    }
+                    val payload = (RelayCommands.RELAY_REG_TOKEN + "|" + dev)
+                        .toByteArray(Charsets.UTF_8)
+                    val data = ByteArray(12 + payload.size)
+                    System.arraycopy(
+                        RelayCommands.CMD_PHONE_REG.toByteArray(Charsets.US_ASCII), 0, data, 0, 12
+                    )
+                    System.arraycopy(payload, 0, data, 12, payload.size)
+                    val len = data.size
+                    val frame = ByteArray(4 + len)
+                    frame[0] = ((len ushr 24) and 0xFF).toByte()
+                    frame[1] = ((len ushr 16) and 0xFF).toByte()
+                    frame[2] = ((len ushr 8) and 0xFF).toByte()
+                    frame[3] = (len and 0xFF).toByte()
+                    System.arraycopy(data, 0, frame, 4, len)
+                    out.write(frame)
+                    out.flush()
+                    registered = true   // ★ 注册帧已上线，放行后续心跳/数据
+                    Log.i(TAG, "已发送注册帧 regsms (设备=$dev)")
+                } catch (e: Exception) {
+                    Log.w(TAG, "发送注册帧失败: ${e.message}")
+                    throw e   // 视为连接失败 → 重连
+                }
                 onConnected()
                 receiveLoop(s)
             } catch (e: Exception) {
@@ -207,6 +256,13 @@ class RelayServerClient(
      */
     override fun send(cmd: String, payload: ByteArray) {
         val s = socket ?: return
+        // ★★★ 2026-09-23 注册竞速防护：注册帧发出前丢弃心跳类命令——
+        //   服务器要求首帧必须是 regsms，竞速的 devstate 会让服务器直接断开（真机实测
+        //   每 20~40 秒重连一轮）。连接初期丢一两个心跳无碍，注册完成(≤1秒)后自动恢复。
+        if (!registered && isHeartBeatCmd(cmd)) {
+            Log.d(TAG, "注册未完成，丢弃心跳 $cmd（防注册竞速）")
+            return
+        }
         val frame = FrameCodec.encode(cmd.toByteArray(Charsets.US_ASCII) + payload)
         // ★ WebRTC/大数据命令额外打印帧长度
         if (cmd.startsWith("wrx") || frame.size > 1024) {

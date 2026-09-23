@@ -290,32 +290,69 @@ class RelayServerService : Service() {
         val onConnected: () -> Unit = {
             isConnected = true
             Log.i(TAG, "被控端已连接中继 ${RelaySettings.relayHost}:${RelaySettings.relayServerPort}")
-            // ★ 2026-08-16 中继联动：中继正常 → 关闭 Tailscale VPN（节省资源，Go 后端保留）
-            cn.ppps.forwarder.tailscale.TailscaleManager.setRelayConnected(this, true)
+            // ★★★ 2026-09-23 防振荡（与 onDisconnected 同一窗口）：本client"连上"只说明
+            //   命令通道可达，不代表总闸开着——总闸 off 时命令通道仍然连得上（设计如此），
+            //   若此时按 onConnected 强制 setRelayConnected(true) 关VPN，就会与服务器推送的
+            //   relayst=off（开VPN）打架。权威窗口内一律以 relayst/同机广播为准。
+            if (cn.ppps.forwarder.tailscale.TailscaleManager.isExternalRelayStateFresh()) {
+                Log.i(TAG, "★ 权威中继状态窗口内 → 忽略本次 onConnected 关VPN（防振荡，以relayst为准）")
+            } else {
+                // ★ 2026-08-16 中继联动：中继正常 → 关闭 Tailscale VPN（节省资源，Go 后端保留）
+                cn.ppps.forwarder.tailscale.TailscaleManager.setRelayConnected(this, true)
+            }
         }
         val onDisconnected: () -> Unit = {
             isConnected = false
             Log.i(TAG, "被控端连接已断开")
-            // ★ 2026-08-16 中继联动：中继不可用 → 自动开启 Tailscale 直连
-            cn.ppps.forwarder.tailscale.TailscaleManager.setRelayConnected(this, false)
+            // ★★★ 2026-09-23 防振荡：若 180 秒内收到过权威中继状态（relayst 推送/同机广播），
+            //   忽略本次"本client连不上→开VPN"（真机实测：两者打架导致 VPN 反复开关、
+            //   系统同时出现 tun0+tun1）。窗口过后自动回落本信号，直连能力不丢。
+            if (cn.ppps.forwarder.tailscale.TailscaleManager.isExternalRelayStateFresh()) {
+                Log.i(TAG, "★ 权威中继状态窗口内 → 忽略本次断连开VPN（防振荡）")
+            } else {
+                // ★ 2026-08-16 中继联动：中继不可用 → 自动开启 Tailscale 直连
+                cn.ppps.forwarder.tailscale.TailscaleManager.setRelayConnected(this, false)
+            }
             // ★ 中继断开后由 TailscaleDirectScanner 自动探测并建立 TS 直连（扫描器每15秒探测56789），
             //   不再自动操作 Tailscale 开关（2026-08-13 取消：避免无障碍窗口出现在被控端；Tailscale 无公开API可编程开关）
         }
         // ★ 中继连接的命令处理：响应经中继回传（控制端经中继56782/56787接收）
         val onRelayCommand: (String, ByteArray) -> Unit = { cmd: String, payload: ByteArray ->
-            // 慢命令进线程池避免阻塞接收循环；快命令（ACK/CANCEL/下载/手势/心跳）内联执行
-            submitCommand(cmd) {
-                try {
-                    // ★ 2026-08-06：传入中继client作为sender，文件下载等二进制推送经中继连接回传
-                    val result = RelayServerHandler.handle(cmd, payload, RelayServerHandler.CHANNEL_RELAY, client, peerKey = client)
-                    if (result != null) {
-                        client?.send(result.first, result.second)
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "命令处理异常: ${e.message}")
+            // ★★★ 2026-09-23 服务器推送的中继总闸状态（relayst on/off）→ 被动联动开关VPN。
+            //   这是"中继开→关VPN / 中继关→开VPN"的权威信号源（跨机场景，无需同机控制端）：
+            //   服务器在①本机注册成功时②总闸每次变更时主动推送，本App零轮询开销。
+            //   注意 setRelayConnected 内部有去重（状态未变直接返回），推送频次无关紧要。
+            if (cmd == RelayCommands.CMD_RELAY_STATE_SERVER || cmd == "relayst00000") {
+                val st = try {
+                    String(payload, Charsets.US_ASCII).trim().lowercase()
+                } catch (_: Throwable) { "" }
+                if (st == "on" || st == "off") {
+                    val on = (st == "on")
+                    Log.i(TAG, "★ 收到服务器中继状态推送: $st → "
+                            + if (on) "关闭VPN（中继开）" else "开启VPN（中继关）")
+                    // ★ 刷新权威窗口：180秒内忽略本client onConnected/onDisconnected 的传输层信号
+                    cn.ppps.forwarder.tailscale.TailscaleManager.externalRelayStateUntil =
+                        System.currentTimeMillis() + 180_000L
+                    cn.ppps.forwarder.tailscale.TailscaleManager.setRelayConnected(this, on)
+                } else {
+                    Log.w(TAG, "中继状态推送负载异常: ${payload.size}字节，忽略")
                 }
+                Unit
+            } else {
+                // 慢命令进线程池避免阻塞接收循环；快命令（ACK/CANCEL/下载/手势/心跳）内联执行
+                submitCommand(cmd) {
+                    try {
+                        // ★ 2026-08-06：传入中继client作为sender，文件下载等二进制推送经中继连接回传
+                        val result = RelayServerHandler.handle(cmd, payload, RelayServerHandler.CHANNEL_RELAY, client, peerKey = client)
+                        if (result != null) {
+                            client?.send(result.first, result.second)
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "命令处理异常: ${e.message}")
+                    }
+                }
+                Unit
             }
-            Unit
         }
         // ★ 直连监听(56786)的命令处理：响应经来源连接回传（控制端TS/局域网直连被控端时，多控制端按来源回发）
         val onDirectCommand: (Long, String, ByteArray) -> Unit = { connId: Long, cmd: String, payload: ByteArray ->

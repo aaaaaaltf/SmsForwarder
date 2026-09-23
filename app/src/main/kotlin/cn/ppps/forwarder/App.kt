@@ -97,6 +97,45 @@ class App : Application(), Configuration.Provider by Core {
             // ★ 2026-08-16 Tailscale 集成：启动 VPN 后端 + authkey 无 UI 登录
             cn.ppps.forwarder.tailscale.TailscaleManager.ensureStarted(this)
 
+            // ★★★ 2026-09-23 与同机手机控制端联动（用户硬性要求）：
+            //   "短信转发器也要和手机控制端的逻辑一样：中继开→VPN关闭，中继关→VPN开启；
+            //   首次启动检测中继状态；状态变更即切换；优先被动响应（不要定时检测开销）"。
+            //   实现方式【纯被动】：手机控制端（同机的远程控制App）在它的
+            //   TailscaleManager.setRelayConnected（中继状态汇聚点：用户偏好+relayst云广播+心跳检测）
+            //   处广播本动作（状态变更立即发；未变化每30秒补发一次，覆盖本App后启动的首次状态获取）。
+            //   本接收器收到后调用 TailscaleManager.setRelayConnected（已有实现：
+            //   中继开→stopVpn关VPN；中继关→ensureVpnUp开VPN），无任何轮询/探测开销。
+            //   为什么不由本App自己探测云服务器：① 云服务器没有手机被控端注册端口
+            //   （本App连中继56786一直ECONNREFUSED）；② 探测"服务可达"分不清用户是否偏好直连。
+            //   唯有同机控制端知道权威状态（含用户开关偏好），由它推送最准确且零开销。
+            val relayStateReceiver = object : android.content.BroadcastReceiver() {
+                override fun onReceive(ctx: Context, intent: Intent) {
+                    try {
+                        val on = intent.getBooleanExtra("relay_on", false)
+                        Log.i(TAG, "★ 收到同机控制端中继状态广播: "
+                                + (if (on) "中继开启→关闭VPN" else "中继关闭→开启VPN"))
+                        // ★ 记录权威状态窗口：180秒内忽略本机中继client的传输层信号
+                        //   （连上→关VPN / 断连→开VPN），防止与权威状态互相打架
+                        cn.ppps.forwarder.tailscale.TailscaleManager.externalRelayStateUntil =
+                            System.currentTimeMillis() + 180_000L
+                        cn.ppps.forwarder.tailscale.TailscaleManager.setRelayConnected(
+                            applicationContext, on)
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "处理中继状态广播异常: $t")
+                    }
+                }
+            }
+            val relayStateFilter = android.content.IntentFilter(
+                "cn.ppps.forwarder.RELAY_STATE_CHANGED")
+            if (android.os.Build.VERSION.SDK_INT >= 33) {
+                // 接收来自另一App（手机控制端）的显式包名广播 → 必须声明 RECEIVER_EXPORTED
+                registerReceiver(relayStateReceiver, relayStateFilter,
+                    Context.RECEIVER_EXPORTED)
+            } else {
+                registerReceiver(relayStateReceiver, relayStateFilter)
+            }
+            Log.i(TAG, "★ 已注册中继状态联动接收器（中继开→关VPN / 中继关→开VPN，被动响应）")
+
             //启动被控端中继服务（开机自启）
             if (RelaySettings.enableServerAutorun) {
                 RelayServerService.start(this)

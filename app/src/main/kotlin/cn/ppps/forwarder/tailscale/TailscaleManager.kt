@@ -596,6 +596,16 @@ object TailscaleManager {
             vpnLostToAnotherApp = false
             return false
         }
+        // ★★★ 2026-09-23 用户拍板："直连模式下 VPN 固定由本 App（被控端/SmsForwarder）持有，
+        //   控制端让位复用"——被控端侧才需要稳定的被连入通道（控制端要连它的 56786/56789）。
+        //   若此时让位给控制端建的 tun，双方就会来回抢唯一 VPN 槽位（真机每 25~30 秒互踢一次，
+        //   每次改路由都把本 App 到中继 56786 的 TCP 打断 → 重连风暴）。
+        //   因此：中继关闭（直连模式、需要 VPN）时本 App 【绝不】让位，必定建立/持有隧道。
+        //   中继开启时不需要 VPN，让位逻辑与其无关（由 setRelayConnected 关闭 VPN）。
+        if (!isRelayConnected()) {
+            vpnLostToAnotherApp = false
+            return false
+        }
         val tunIp = findRealTunIp()
         if (tunIp == null) {
             vpnLostToAnotherApp = false
@@ -626,6 +636,13 @@ object TailscaleManager {
         return fresh ?: c
     }
 
+    /** 2026-09-23：上次发起 VPN 建立的时间戳（0=从未），用于防重复建立 tun */
+    @Volatile
+    private var lastVpnStartIssuedAt: Long = 0L
+
+    /** 2026-09-23：两次发起 VPN 建立的最小间隔（Go 建 tun 需握手，过密会产生重复网卡） */
+    private const val VPN_START_MIN_INTERVAL_MS = 8000L
+
     /** VPN 授权后调用：拉起 VpnService 使 Go 后端建立 tun 通道（幂等，VPN 已在运行时跳过） */
     @SuppressLint("StartActivityAndCollapseDeprecated")
     fun startVpnService(ctx: Context) {
@@ -641,6 +658,16 @@ object TailscaleManager {
             Log.i(TAG, "VPN 通道已存在，跳过启动")
             return
         }
+        // ★★★ 2026-09-23 建立节流：真机实测 91 毫秒内连建了 tun0 + tun1 两块网卡
+        //   （ensureVpnUp 的重试线程与看门狗并发调用 startVpnService，而 vpnEstablished
+        //   标志是异步置位的，两次调用都通过了上面的检查）。
+        //   与控制端同款机制：8 秒内只发起一次建立请求，杜绝重复 tun。
+        val nowMs = System.currentTimeMillis()
+        if (nowMs - lastVpnStartIssuedAt < VPN_START_MIN_INTERVAL_MS) {
+            Log.i(TAG, "★ 距上次启动VPN仅${nowMs - lastVpnStartIssuedAt}ms（<8s），跳过本次建立（防重复tun）")
+            return
+        }
+        lastVpnStartIssuedAt = nowMs
         // ★★★ 2026-09-23（按用户要求，与控制端对称）：本机已有【另一方建起的真实 tun】时，
         //   本 App 让位复用，不再 establish —— 先启动者持有隧道、后启动者复用，不把责任推给别人。
         //   ★ 僵尸防护已内置于 shouldYieldVpnToExternalTun()：若那块 tun 是本 App 自己 VpnService
@@ -826,6 +853,22 @@ object TailscaleManager {
 
     @Volatile
     private var relayConnected: Boolean? = null
+
+    /**
+     * ★★★ 2026-09-23 权威中继状态有效窗口（毫秒时间戳）。
+     * 两个信号源会打架（真机实测：VPN被反复开关，系统里同时出现 tun0+tun1）：
+     *   ① 服务器 relayst 推送（总闸状态，权威）与 同机控制端本地广播（权威）；
+     *   ② 本机中继 client 的 onConnected/onDisconnected（【传输层】信号——命令通道
+     *      即使在总闸 off 时也保持可达，其"连上=中继开"判断与总闸语义不符）。
+     * 收到①后 180 秒内，忽略②（见 RelayServerService onConnected/onDisconnected）；
+     * 窗口过后（服务器不可达/长期未推）自动回落②，直连能力不丢。
+     */
+    @Volatile
+    var externalRelayStateUntil: Long = 0L
+
+    /** ★ 是否处于权威状态窗口内（180 秒内收到过 relayst 推送或同机广播） */
+    fun isExternalRelayStateFresh(): Boolean =
+        System.currentTimeMillis() < externalRelayStateUntil
 
     /** 中继是否正常（由 setRelayConnected 维护；未初始化返回 false） */
     fun isRelayConnected(): Boolean = relayConnected == true

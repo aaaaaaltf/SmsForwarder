@@ -34,6 +34,17 @@ object RelayCommands {
     /** 广播pc_id：中继系统消息 */
     const val BROADCAST_PC_ID: Int = 0xFFFFFFFF.toInt()
 
+    // ==================== 2026-09-23 手机被控端注册与中继状态联动 ====================
+
+    /** 连上中继56786后发送的注册命令（服务器校验令牌后才登记，防裸端口） */
+    const val CMD_PHONE_REG = "regsms000000"
+
+    /** 注册共享令牌（须与中继服务器 relay_server.py 的 PHONE_REG_TOKEN 一致） */
+    const val RELAY_REG_TOKEN = "RCPH-2026-56786"
+
+    /** 服务器→手机被控端：中继总闸当前状态（负载 on/off）。收到即联动开/关VPN（被动响应） */
+    const val CMD_RELAY_STATE_SERVER = "relayst00000"
+
     // ==================== 屏幕预览（远程桌面，被控端屏幕推流到中继56788） ====================
     /** 启动屏幕推流（负载: host|port|FPS|色深|质量|clientId，clientId=被控端pc_id用于56788配对） */
     const val CMD_RD_START = "rdstrt000000"
