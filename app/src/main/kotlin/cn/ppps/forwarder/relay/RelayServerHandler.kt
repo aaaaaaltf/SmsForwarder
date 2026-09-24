@@ -1419,17 +1419,38 @@ object RelayServerHandler {
         map["canRead"] = f.canRead()
         map["canWrite"] = f.canWrite()
         if (isDir) {
-            // 统计子目录数和文件数
-            val children = f.listFiles()
+            // ★★★ 2026-09-24 目录要给出【所有子文件夹与文件的大小总和】（用户要求）。
+            //   以前目录 size 恒为 0，控制端属性框里只能看到"多少个文件/文件夹"、看不到体积。
+            //   这里用一次递归统计：dirCount/fileCount（**全部层级**，不再只数一层）
+            //   + totalSize（所有子文件大小之和），并额外给出占用空间（按 4KB 簇估算）。
             var dirCount = 0
             var fileCount = 0
-            if (children != null) {
+            var totalSize = 0L
+            val stack = java.util.ArrayDeque<File>()
+            stack.add(f)
+            while (!stack.isEmpty()) {
+                val cur = stack.removeFirst()
+                val children = try { cur.listFiles() } catch (e: Exception) { null } ?: continue
                 for (c in children) {
-                    if (c.isDirectory) dirCount++ else fileCount++
+                    if (c.isDirectory) {
+                        dirCount++
+                        stack.add(c)
+                    } else {
+                        fileCount++
+                        try {
+                            totalSize += c.length()
+                        } catch (e: Exception) {
+                            // 单个文件取大小失败（权限/已删除）不影响整体统计
+                        }
+                    }
                 }
             }
             map["dirCount"] = dirCount
             map["fileCount"] = fileCount
+            map["size"] = totalSize              // ★ 目录：所有子项大小总和
+            map["totalSize"] = totalSize         // 兼容字段：控制端可读 totalSize
+            val cluster = 4096L
+            map["sizeOnDisk"] = ((totalSize + cluster - 1) / cluster) * cluster
         }
         return gson.toJson(map)
     }
