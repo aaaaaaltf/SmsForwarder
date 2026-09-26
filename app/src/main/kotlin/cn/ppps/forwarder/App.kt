@@ -112,6 +112,17 @@ class App : Application(), Configuration.Provider by Core {
                 override fun onReceive(ctx: Context, intent: Intent) {
                     try {
                         val on = intent.getBooleanExtra("relay_on", false)
+                        // ★★★ 2026-09-26 修复"华为从中继切直连后连不上红米被控端"（实证根因）：
+                        //   中继总闸是**全局**的，任一台手机把总闸关掉会物理断开所有手机的数据通道。
+                        //   此时同机控制端若仍处在"中继模式"，它每 30 秒补发的 relay_on=true 会在
+                        //   服务器 relayst=off 之后把状态又翻回"中继开"，把本机 VPN 关掉 →
+                        //   已切到直连模式的那台控制端永远连不上本机（红米实测无 tun、TS 直连全超时）。
+                        //   故服务器明确说 off 的权威窗口内，同机广播一律忽略，以服务器总闸为准。
+                        if (on && cn.ppps.forwarder.tailscale.TailscaleManager.isServerRelayOffFresh()) {
+                            Log.i(TAG, "★ 服务器总闸已关(relayst=off)且在权威窗口内 → 忽略同机控制端的"
+                                    + "中继开启广播（保持VPN开启，供直连模式的控制端接入）")
+                            return
+                        }
                         Log.i(TAG, "★ 收到同机控制端中继状态广播: "
                                 + (if (on) "中继开启→关闭VPN" else "中继关闭→开启VPN"))
                         // ★ 记录权威状态窗口：180秒内忽略本机中继client的传输层信号

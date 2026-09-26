@@ -333,6 +333,12 @@ class RelayServerService : Service() {
                     // ★ 刷新权威窗口：180秒内忽略本client onConnected/onDisconnected 的传输层信号
                     cn.ppps.forwarder.tailscale.TailscaleManager.externalRelayStateUntil =
                         System.currentTimeMillis() + 180_000L
+                    // ★★★ 2026-09-26 总闸 off 的权威时间戳（只由服务器推送刷新）：
+                    //   窗口内同机控制端的 relay_on=true 广播将被忽略（见 App.relayStateReceiver）——
+                    //   总闸 off 意味着所有手机的数据通道已被物理断开，本机必须开 VPN 才能被
+                    //   已切到直连模式的控制端连上。on 时清零，恢复"以同机控制端为准"。
+                    cn.ppps.forwarder.tailscale.TailscaleManager.serverRelayOffUntil =
+                        if (on) 0L else System.currentTimeMillis() + 180_000L
                     cn.ppps.forwarder.tailscale.TailscaleManager.setRelayConnected(this, on)
                 } else {
                     Log.w(TAG, "中继状态推送负载异常: ${payload.size}字节，忽略")

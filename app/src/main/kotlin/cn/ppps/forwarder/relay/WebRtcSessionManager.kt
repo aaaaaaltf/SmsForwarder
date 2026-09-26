@@ -211,6 +211,31 @@ class WebRtcSessionManager(
     private val LIVENESS_CHECK_INTERVAL_MS = 15000L
     private var livenessWatchdog: Thread? = null
 
+    // ★★★ 2026-09-26 修复：入站活跃探测（getStats 指纹），替代上面失效的 onIceConnectionReceivingChange。
+    //   【故障现场】2026-09-26 20:01:05 华为(控制端)预览红米(被控端)：红米日志
+    //     "★ 省电：已连续 180s 收不到对端任何报文…关闭 WebRTC 会话" → ICE 变 CLOSED → 图像停传。
+    //     时间戳恰好是 19:58:04.729 ICE=CONNECTED 之后 181 秒，即"连通后固定 180 秒必关"。
+    //   【根因】判据 onIceConnectionReceivingChange 在当前 libwebrtc(livekit fork) 中【从不回调】——
+    //     红米整份日志里该方法出现 0 次，iceReceiving 恒为 false，看门狗必然误判。
+    //     而同一份日志里 getStats 的 remote-inbound-rtp.jitter 每 2 秒都在变，证明对端 RTCP
+    //     一直在到达（对端根本没走，纯粹是判据失灵）。这是"预览/麦克风约 3 分钟必断"的真因。
+    //   【新判据】周期性 getStats，对"入站字节数"和"对端报告指纹"做变化检测，任一分量变化即
+    //     视为收到对端报文。同时覆盖 transport / candidate-pair / inbound-rtp 的 bytesReceived
+    //     （单调递增）与 remote-inbound-rtp 的 jitter/packetsLost/roundTripTime（每次 RTCP RR 都会变），
+    //     不依赖任何单一统计类型，避免某个版本缺字段时再次失灵。
+    //   【安全性】对端真的消失时所有入站统计都会冻结 → 指纹不再变化 → 180 秒后照常收尾，
+    //     与旧行为一致，只是不再误杀。
+    @Volatile private var inboundBytesFingerprint = -1L
+    @Volatile private var inboundReportFingerprint = 0.0
+    /** 最近一次入站探测的读数（仅用于"无入站证据"时的诊断日志） */
+    @Volatile private var lastProbeDesc = "尚未探测"
+    // ★★★ 2026-09-26 兜底判据：最近一次 onIceConnectionChange 上报的状态。
+    //   该回调在本 libwebrtc 版本【工作正常】（红米日志里 CONNECTED/DISCONNECTED/FAILED/CLOSED 均有记录），
+    //   而 onIceConnectionReceivingChange 从不回调。libwebrtc 自己会用 STUN consent freshness
+    //   （约 30 秒无响应即判 DISCONNECTED/FAILED）维护该状态，所以"ICE 仍 CONNECTED/COMPLETED"
+    //   等价于"链路确实还在收发"——这是比失效回调可靠得多的存活信号。
+    @Volatile private var lastIceState: PeerConnection.IceConnectionState? = null
+
     /**
      * 收到控制端 OFFER：启动摄像头+麦克风 → 设置远端SDP → 生成ANSWER → 通过callback发回
      * @param cameraFacing ★ 2026-08-29 语义化为"朝向目标"：0=后置(LENS_FACING_BACK) 1=前置(LENS_FACING_FRONT)；越界值退化为 deviceNames 数组下标(旧行为)
@@ -232,6 +257,10 @@ class WebRtcSessionManager(
         // ★ 2026-08-28 省电：启动"对端已走"存活看门狗（控制端掉线/被杀时自动释放摄像头+编码器+麦克风）
         iceReceiving = false
         lastInboundActivityTime = 0L
+        // ★ 2026-09-26：新会话重置入站指纹（-1/0 表示"尚未取样"，首轮不判定为变化）
+        inboundBytesFingerprint = -1L
+        inboundReportFingerprint = 0.0
+        lastIceState = null
         startLivenessWatchdog()
         Log.i(TAG, "$stepTag ★ 中继优先模式 relayPreferred=$relayPreferred（true=媒体走TURN中继转发 / false=TS直连兜底）")
         this.signalingCallback = cb
@@ -472,6 +501,8 @@ class WebRtcSessionManager(
             }
             override fun onIceConnectionChange(state: PeerConnection.IceConnectionState?) {
                 Log.i(TAG, "onIceConnectionChange: $state everConnected=$everConnected")
+                // ★ 2026-09-26：记录最新 ICE 状态，供存活看门狗兜底判据使用（见 lastIceState 说明）
+                lastIceState = state
                 // —— 先取消任何挂起的FAILED延迟判断任务 ——
                 iceFailedPendingRunnable?.let { r ->
                     try { iceMainHandler.removeCallbacks(r) } catch (_: Throwable) {}
@@ -920,9 +951,32 @@ class WebRtcSessionManager(
                     lastInboundActivityTime = System.currentTimeMillis()
                     continue
                 }
+                // ★★★ 2026-09-26 兜底（本次"图像停传"的关键修复）：ICE 仍 CONNECTED/COMPLETED 即视为链路在用。
+                //   为什么必须有它：本轮实测发现 iceReceiving 恒为 false，而 getStats 指纹探测也存在取不到
+                //   变化的情况（两种判据都不可靠）。而 onIceConnectionChange 在本版本工作正常，libwebrtc 用
+                //   STUN consent freshness 维护它（对端真消失 → 约 30 秒内变 DISCONNECTED/FAILED）。所以
+                //   "ICE 仍连通" = "帧确实还在传"，直接作为主判据即可杜绝"连通后固定 180 秒误关"。
+                val ice = lastIceState
+                if (ice == PeerConnection.IceConnectionState.CONNECTED ||
+                    ice == PeerConnection.IceConnectionState.COMPLETED
+                ) {
+                    lastInboundActivityTime = System.currentTimeMillis()
+                    continue
+                }
+                // ★★★ 2026-09-26：iceReceiving 在本 libwebrtc 版本恒为 false（该回调从不触发），
+                //   再用 getStats 指纹补一层"仍在收到对端报文"的证据（见 inboundBytesFingerprint 处说明）
+                if (probeInboundActivity(3000L)) {
+                    lastInboundActivityTime = System.currentTimeMillis()
+                    continue
+                }
                 val since = System.currentTimeMillis() - lastInboundActivityTime
-                if (since < PEER_GONE_MS) continue
-                Log.w(TAG, "$TAG ★ 省电：已连续 ${since / 1000}s 收不到对端任何报文（控制端可能已退出/被杀），关闭 WebRTC 会话释放摄像头+编码器+麦克风")
+                if (since < PEER_GONE_MS) {
+                    // ★ 2026-09-26：仅在"本轮无入站证据"时记一行，便于实测核对看门狗判据
+                    //   （正常情况每 15 秒都能探到新证据，不会走到这里，故不会刷日志）
+                    Log.i(TAG, "$TAG 存活看门狗：本轮未探到入站证据（已 ${since / 1000}s / 上限 ${PEER_GONE_MS / 1000}s，ICE=$ice，探测读数: $lastProbeDesc）")
+                    continue
+                }
+                Log.w(TAG, "$TAG ★ 省电：已连续 ${since / 1000}s 未探到任何入站证据（ICE=$ice，探测读数: $lastProbeDesc），控制端可能已退出/被杀，关闭 WebRTC 会话释放摄像头+编码器+麦克风")
                 try {
                     close()
                 } catch (t: Throwable) {
@@ -941,6 +995,95 @@ class WebRtcSessionManager(
         } catch (_: Throwable) {
         }
         livenessWatchdog = null
+    }
+
+    /**
+     * ★★★ 2026-09-26 修复：同步探测一次"是否仍在收到对端报文"。
+     *   返回 true = 相比上次取样出现了新的入站证据（对端还活着）。
+     *
+     *   为什么需要它：存活看门狗原判据 [onIceConnectionReceivingChange] 在本项目的
+     *   libwebrtc(livekit fork) 中从不回调（实测红米日志出现 0 次），导致 iceReceiving
+     *   恒为 false → 连通后固定 180 秒误关会话 → 预览/麦克风约 3 分钟必断。
+     *
+     *   取样内容（任一变化即判定活跃，不依赖单一字段，避免某版本缺字段时再次失灵）：
+     *     · transport / candidate-pair / inbound-rtp 的 bytesReceived —— 单调递增，最可靠；
+     *     · remote-inbound-rtp 的 jitter / packetsLost / roundTripTime —— 每次收到对端 RTCP RR 都会变。
+     *   对端真的消失时这些值全部冻结 → 返回 false → 180 秒后照常收尾释放摄像头。
+     *
+     *   仅由看门狗线程（非 WebRTC 信令线程）调用，带超时等待，不会造成捕获线程自锁。
+     */
+    private fun probeInboundActivity(timeoutMs: Long): Boolean {
+        val p = peerConnection
+        if (p == null) {
+            lastProbeDesc = "peerConnection=null"
+            return false
+        }
+        val latch = java.util.concurrent.CountDownLatch(1)
+        var bytes = -1L
+        var report = 0.0
+        var cnt = 0
+        var errMsg: String? = null
+        try {
+            p.getStats(object : org.webrtc.RTCStatsCollectorCallback {
+                override fun onStatsDelivered(rep: org.webrtc.RTCStatsReport) {
+                    try {
+                        var b = 0L
+                        var acc = 0.0
+                        var n = 0
+                        for ((_, st) in rep.statsMap) {
+                            n++
+                            when (st.type) {
+                                "transport", "candidate-pair", "inbound-rtp" ->
+                                    (st.members["bytesReceived"] as? Number)?.let { b += it.toLong() }
+                                "remote-inbound-rtp" -> {
+                                    (st.members["jitter"] as? Number)?.let { acc += it.toDouble() }
+                                    (st.members["packetsLost"] as? Number)?.let { acc += it.toDouble() * 1e6 }
+                                    (st.members["roundTripTime"] as? Number)?.let { acc += it.toDouble() * 1e9 }
+                                }
+                            }
+                        }
+                        bytes = b
+                        report = acc
+                        cnt = n
+                    } catch (t: Throwable) {
+                        // ★ 2026-09-26：此前这里静默吞异常，导致"探测恒 false"无法定位，改为记录到诊断字段
+                        errMsg = "回调解析异常: ${t.message}"
+                    } finally {
+                        latch.countDown()
+                    }
+                }
+            })
+        } catch (t: Throwable) {
+            lastProbeDesc = "getStats调用异常: ${t.message}"
+            Log.w(TAG, "$TAG 入站活跃探测 getStats 调用失败: ${t.message}")
+            return false
+        }
+        try {
+            if (!latch.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                lastProbeDesc = "getStats超时(${timeoutMs}ms)"
+                Log.w(TAG, "$TAG 入站活跃探测 getStats 超时(${timeoutMs}ms)，本轮按无变化处理")
+                return false
+            }
+        } catch (_: InterruptedException) {
+            lastProbeDesc = "探测被中断"
+            return false
+        }
+        val err = errMsg
+        if (err != null) {
+            lastProbeDesc = err
+            return false
+        }
+        lastProbeDesc = "bytes=$bytes report=${java.lang.String.format(java.util.Locale.US, "%.6f", report)} 统计条数=$cnt"
+        var changed = false
+        if (bytes >= 0 && bytes != inboundBytesFingerprint) {
+            if (inboundBytesFingerprint >= 0) changed = true
+            inboundBytesFingerprint = bytes
+        }
+        if (report != inboundReportFingerprint) {
+            if (inboundReportFingerprint != 0.0) changed = true
+            inboundReportFingerprint = report
+        }
+        return changed
     }
 
     /** ★★★ 2026-08-14 启动周期关键帧线程：每2秒对videoTrack做setEnabled(false→true)抖动，
@@ -988,6 +1131,10 @@ class WebRtcSessionManager(
         stopLivenessWatchdog()
         iceReceiving = false
         lastInboundActivityTime = 0L
+        // ★ 2026-09-26：一并清掉入站指纹，防止残留值影响下一个会话的首轮判定
+        inboundBytesFingerprint = -1L
+        inboundReportFingerprint = 0.0
+        lastIceState = null
         keyFrameTimer = null
         videoTrackRef = null
         try { videoCapturer?.stopCapture() } catch (_: Throwable) {}

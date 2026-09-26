@@ -870,6 +870,24 @@ object TailscaleManager {
     fun isExternalRelayStateFresh(): Boolean =
         System.currentTimeMillis() < externalRelayStateUntil
 
+    /**
+     * ★★★ 2026-09-26 服务器总闸"off"的权威时间戳（**只**由 relayst=off 推送刷新）。
+     *
+     * 总闸是**全局**的：任一台手机把中继总闸关掉（relayrp=off → relay_server.DATA_ENABLED=false）
+     * 会物理断开所有手机的 56783/56785/56791 数据通道。此时若同机控制端仍处于"中继模式"，
+     * 它每 30 秒补发一次的 relay_on=true 会在服务器 relayst=off **之后**把 relayConnected 又翻回
+     * true → 本机 VPN 被关掉 → 切到直连模式的那台控制端（华为）无论怎样都连不上本机
+     * （真机实测：红米被控端 `ip -4 addr` 无 tun，华为侧 TS 直连全超时）。
+     * 故：窗口内且服务器明确说 off → 同机广播一律忽略，以服务器总闸为准；
+     * relayst=on 时仍以同机控制端为准（尊重本机用户自己的模式偏好）。
+     */
+    @Volatile
+    var serverRelayOffUntil: Long = 0L
+
+    /** ★ 服务器总闸"off"是否仍在权威窗口内 */
+    fun isServerRelayOffFresh(): Boolean =
+        System.currentTimeMillis() < serverRelayOffUntil
+
     /** 中继是否正常（由 setRelayConnected 维护；未初始化返回 false） */
     fun isRelayConnected(): Boolean = relayConnected == true
 
