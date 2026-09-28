@@ -602,6 +602,13 @@ object TailscaleManager {
         //   每次改路由都把本 App 到中继 56786 的 TCP 打断 → 重连风暴）。
         //   因此：中继关闭（直连模式、需要 VPN）时本 App 【绝不】让位，必定建立/持有隧道。
         //   中继开启时不需要 VPN，让位逻辑与其无关（由 setRelayConnected 关闭 VPN）。
+        // ★★★ 2026-09-28 FINAL DECISION (per user, plan docs/完整修复方案_2026-09-28.md):
+        //   Tunnel ownership = CONTROLLED END HOLDS, CONTROLLER REUSES.
+        //   The controlled end therefore must NOT yield in DIRECT mode: it keeps its own tun
+        //   (it is the side that must stay reachable), and the controller reuses it and
+        //   additionally binds its outbound sockets to this VPN network (Android TRANSPORT_VPN)
+        //   so its dial-out works while reusing.
+        //   Relay mode needs no tun at all (server push `relayst` drives setRelayConnected).
         if (!isRelayConnected()) {
             vpnLostToAnotherApp = false
             return false
@@ -656,6 +663,17 @@ object TailscaleManager {
         }
         if (TailscaleVpnService.vpnEstablished) {
             Log.i(TAG, "VPN 通道已存在，跳过启动")
+            return
+        }
+        // ★★★ 2026-09-28 【中继模式闸门 —— 本函数是所有 establish 的唯一入口，所以闸门放这里】
+        //   权威中继状态=开（relayst=on / 同机控制端广播"中继开"）→ **绝不建立 VPN**：
+        //   中继模式下 establish/revoke 会重建路由、打断本机到中继服务器的 TCP（这也是
+        //   "VPN 开一秒就退 + 被控端断开重连"的物理机理）。只有明确收到 relayst=off 才允许建。
+        if (externalRelayStateOn) {
+            Log.i(TAG, "★ [VPN闸门] 权威中继状态=开 → 不建立 VPN（中继模式下必须关闭任何 VPN）")
+            if (TailscaleVpnService.vpnEstablished) {
+                try { TailscaleVpnService.shutdown() } catch (_: Throwable) {}
+            }
             return
         }
         // ★★★ 2026-09-23 建立节流：真机实测 91 毫秒内连建了 tun0 + tun1 两块网卡
@@ -871,6 +889,22 @@ object TailscaleManager {
         System.currentTimeMillis() < externalRelayStateUntil
 
     /**
+     * ★★★ 2026-09-28 权威中继状态【值】（relayst 推送 / 同机控制端广播），**粘性**保持到下一次明确变更。
+     *
+     * 为什么必须有"值"而不只有"窗口"：原来的 `externalRelayStateUntil` 只记录"180 秒内收到过权威状态"，
+     * 用它忽略传输层信号；但 **180 秒一过窗口失效** → 中继 TCP 的瞬时断开（往往正是本机 VPN
+     * establish 自己造成的）就被当成"中继不可用" → `setRelayConnected(false)` → 又建立 VPN →
+     * establish 重建路由又把中继 TCP 打断 → **自持振荡**（真机 logcat：`cn.ppps.forwarder …
+     * START_VPN` 每 10~70 秒一次）。每一次 establish/revoke 都会让中继服务器判定本机掉线 →
+     * 控制端看到"被控端断开后重连"。
+     *
+     * 语义：true = 用户在用中继（权威信号）→ **任何情况下都不建 VPN**（等中继自己重连）；
+     *       false = 用户关了中继 → 才允许建 VPN 走直连。
+     */
+    @Volatile
+    var externalRelayStateOn: Boolean = false
+
+    /**
      * ★★★ 2026-09-26 服务器总闸"off"的权威时间戳（**只**由 relayst=off 推送刷新）。
      *
      * 总闸是**全局**的：任一台手机把中继总闸关掉（relayrp=off → relay_server.DATA_ENABLED=false）
@@ -922,6 +956,10 @@ object TailscaleManager {
         // ★ 状态未变化时不重复执行/打日志（中继每5秒重试失败会高频触发，避免日志刷屏）
         if (relayConnected == connected) return
         relayConnected = connected
+        // ★★★ 2026-09-28 传输层"中继已连上"也是"用户在用中继"的强证据 → 置粘性判据；
+        //   注意：**只置 true，绝不因传输层断连置 false**（那正是自持振荡的来源）；
+        //   置 false 只由权威信号 relayst=off 负责（见 RelayServerService 的 relayst 处理）。
+        if (connected) externalRelayStateOn = true
         try {
             if (connected) {
                 // 中继正常 → 关闭直连 VPN 通道（Go 后端保留，随时可快速重建）
@@ -930,6 +968,13 @@ object TailscaleManager {
                     TailscaleVpnService.shutdown()
                 }
             } else {
+                // ★★★ 2026-09-28 中继模式闸门：权威状态显示"用户在用中继"时，即使本 client 暂时连不上
+                //   （往往正是本机 VPN establish 自己造成的瞬时断连），也**不建 VPN**，只等中继重连。
+                //   否则就会"建 VPN → 打断中继 TCP → 判定中继不可用 → 再建 VPN"自持振荡。
+                if (externalRelayStateOn) {
+                    Log.i(TAG, "★ [VPN闸门] 中继暂时不可用但权威状态=开 → 不建 VPN，等中继自动重连")
+                    return
+                }
                 // 中继不可用 → 自动开启 Tailscale 直连
                 Log.i(TAG, "★ 中继不可用，自动开启 Tailscale 直连")
                 ensureStarted(ctx)
