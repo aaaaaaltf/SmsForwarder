@@ -336,12 +336,20 @@ class RelayServerService : Service() {
                     // ★★★ 2026-09-28 记录权威状态【值】（粘性）：true=用户在用中继 →
                     //   本机任何情况下都不建 VPN（唯一的 establish 闸门见 TailscaleManager.startVpnService）。
                     cn.ppps.forwarder.tailscale.TailscaleManager.externalRelayStateOn = on
-                    // ★★★ 2026-09-26 总闸 off 的权威时间戳（只由服务器推送刷新）：
-                    //   窗口内同机控制端的 relay_on=true 广播将被忽略（见 App.relayStateReceiver）——
-                    //   总闸 off 意味着所有手机的数据通道已被物理断开，本机必须开 VPN 才能被
-                    //   已切到直连模式的控制端连上。on 时清零，恢复"以同机控制端为准"。
-                    cn.ppps.forwarder.tailscale.TailscaleManager.serverRelayOffUntil =
-                        if (on) 0L else System.currentTimeMillis() + 180_000L
+                    // ★★★ 2026-10-01 权威状态变化 → 复位看门狗退避：
+                    //   否则闸门放开后，看门狗仍按已涨到的 60s 才重试 → 切直连后要等近一分钟才开 VPN。
+                    cn.ppps.forwarder.tailscale.TailscaleManager.resetVpnWatchdogBackoff()
+                    // ★★★ 2026-10-01【双向权威窗口】总闸是唯一权威（用户要求："一处控制端切换开关、
+                    //   所有控制端同步；被控端按切换后的总闸状态决定是否开 VPN"）：
+                    //   窗口内同机控制端的【相反】广播一律忽略（见 App.relayStateReceiver）——
+                    //   否则 off 方向会被每 30s 补发的 relay_on=true 翻回（历史真机：红米无 tun、
+                    //   华为 TS 直连全超时）；on 方向会被每 30s 补发的 relay_on=false 把刚关掉的
+                    //   VPN 又打开（establish 还会打断被控端到中继的 TCP）。
+                    //   ★ 旧的单向字段 serverRelayOffUntil / isServerRelayOffFresh 已删除，
+                    //     避免"单向 + 双向"两套口径并存互相漂移。
+                    cn.ppps.forwarder.tailscale.TailscaleManager.serverRelayStateFreshUntil =
+                        System.currentTimeMillis() + 180_000L
+                    cn.ppps.forwarder.tailscale.TailscaleManager.serverRelayStateValue = on
                     cn.ppps.forwarder.tailscale.TailscaleManager.setRelayConnected(this, on)
                 } else {
                     Log.w(TAG, "中继状态推送负载异常: ${payload.size}字节，忽略")

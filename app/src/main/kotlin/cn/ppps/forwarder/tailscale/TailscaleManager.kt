@@ -769,6 +769,18 @@ object TailscaleManager {
     @Volatile
     private var vpnWatchdogRunning = false
 
+    /** ★★★ 2026-10-01 连续"拉起 VPN 但仍未建立"的轮数（看门狗递增退避用，建立成功即归零）。
+     *   改为【字段】而非线程内局部变量，是为了让"权威中继状态变更"能立刻复位退避——
+     *   否则闸门放开后，看门狗仍要按已涨到的 60s 才重试（真机：切直连后近 1 分钟才开 VPN）。 */
+    @Volatile
+    private var vpnDownRounds = 0
+
+    /** ★★★ 2026-10-01 权威中继状态变更（服务器 relayst / 同机控制端广播）时调用：
+     *   复位看门狗退避，使下一轮巡检立刻（10s 内）重试建立 VPN。 */
+    fun resetVpnWatchdogBackoff() {
+        vpnDownRounds = 0
+    }
+
     /**
      * ★ 省电：看门狗当前是否"有人在用"。busyProvider 未注入（或异常）时按忙处理，
      *   宁可不省电也不能让直连恢复变慢。
@@ -787,16 +799,15 @@ object TailscaleManager {
         vpnWatchdogRunning = true
         Thread({
             try {
-                // ★ 连续"拉起 VPN 但仍未建立"的轮数，用于递增退避（建立成功即归零）
-                var downRounds = 0
+                // ★ 连续"拉起 VPN 但仍未建立"的轮数（字段 vpnDownRounds）：递增退避，建立成功/权威状态变更即归零
                 while (vpnWatchdogRunning) {
                     // ★ 2026-08-28 省电：间隔按"忙/闲 + 隧道状态"自适应，详见 VPN_WATCHDOG_* 常量注释
                     val up = TailscaleVpnService.vpnEstablished
                     val sleepMs = if (up) {
-                        downRounds = 0
+                        vpnDownRounds = 0
                         if (isBusyNow()) VPN_WATCHDOG_BUSY_MS else VPN_WATCHDOG_IDLE_MS
                     } else {
-                        minOf(VPN_WATCHDOG_BUSY_MS shl downRounds.coerceAtMost(3), VPN_WATCHDOG_MAX_MS)
+                        minOf(VPN_WATCHDOG_BUSY_MS shl vpnDownRounds.coerceAtMost(3), VPN_WATCHDOG_MAX_MS)
                     }
                     Thread.sleep(sleepMs)
                     if (!vpnWatchdogRunning) break
@@ -850,10 +861,10 @@ object TailscaleManager {
                             }
                         }
                     }
-                    Log.i(TAG, "★ VPN看门狗：检测到VPN未建立，重新启动（第${downRounds + 1}轮"
+                    Log.i(TAG, "★ VPN看门狗：检测到VPN未建立，重新启动（第${vpnDownRounds + 1}轮"
                             + "，establish失败${vpnEstablishFailed}次"
-                            + "，下轮间隔${minOf(VPN_WATCHDOG_BUSY_MS shl (downRounds + 1).coerceAtMost(3), VPN_WATCHDOG_MAX_MS) / 1000}s）")
-                    downRounds++
+                            + "，下轮间隔${minOf(VPN_WATCHDOG_BUSY_MS shl (vpnDownRounds + 1).coerceAtMost(3), VPN_WATCHDOG_MAX_MS) / 1000}s）")
+                    vpnDownRounds++
                     startVpnService(ctx)
                 }
             } catch (t: Throwable) {
@@ -905,22 +916,36 @@ object TailscaleManager {
     var externalRelayStateOn: Boolean = false
 
     /**
-     * ★★★ 2026-09-26 服务器总闸"off"的权威时间戳（**只**由 relayst=off 推送刷新）。
+     * ★★★ 2026-10-01 服务器总闸的【双向】权威窗口与值
+     *   （用户硬性要求："一处控制端切换中继开关，所有控制端同步；**被控端按切换后的总闸状态
+     *    决定是否开 VPN**" → 总闸是唯一权威）。
      *
-     * 总闸是**全局**的：任一台手机把中继总闸关掉（relayrp=off → relay_server.DATA_ENABLED=false）
-     * 会物理断开所有手机的 56783/56785/56791 数据通道。此时若同机控制端仍处于"中继模式"，
-     * 它每 30 秒补发一次的 relay_on=true 会在服务器 relayst=off **之后**把 relayConnected 又翻回
-     * true → 本机 VPN 被关掉 → 切到直连模式的那台控制端（华为）无论怎样都连不上本机
-     * （真机实测：红米被控端 `ip -4 addr` 无 tun，华为侧 TS 直连全超时）。
-     * 故：窗口内且服务器明确说 off → 同机广播一律忽略，以服务器总闸为准；
-     * relayst=on 时仍以同机控制端为准（尊重本机用户自己的模式偏好）。
+     * 为什么需要"权威窗口"（历史根因，2026-09-26 真机实证）：总闸是**全局**的，任一台手机把总闸
+     * 关掉（relayrp=off → relay_server.DATA_ENABLED=false）会物理断开所有手机的 56783/56785/56791
+     * 数据通道。此时若同机控制端仍处于"中继模式"，它每 30 秒补发一次的 relay_on=true 会在服务器
+     * relayst=off **之后**把状态又翻回"中继开" → 本机 VPN 被关掉 → 已切到直连模式的那台控制端
+     * 无论如何都连不上本机（真机：红米被控端 `ip -4 addr` 无 tun、华为侧 TS 直连全超时）。
+     *
+     * 为什么必须【双向】（本次收敛）：旧实现只有 `serverRelayOffUntil`（**仅 off 方向**），且在收到
+     * relayst=on 时把它清零（旧注释"on 时清零，恢复以同机控制端为准"）→ 总闸切到 **on** 时被控端
+     * 毫无保护：只要本机控制端 App 的偏好还停在"直连"（它每 30s 补发一次 relay_on=false），就能把
+     * 刚关掉的 VPN 又打开，且 establish 重建路由还会打断被控端到中继的 TCP（"换号/闪断"的物理机理）。
+     * 已删除旧的单向字段/方法——两套口径并存只会互相漂移。
+     *
+     * 语义：窗口内（180s）同机广播**不得与服务器值相反**（相反即忽略，见 App.relayStateReceiver）；
+     *       窗口过期（服务器不可达/长期未推）自动回落"以同机控制端为准"——保留既有兜底哲学，
+     *       保证服务器侧异常时直连能力不丢。
      */
     @Volatile
-    var serverRelayOffUntil: Long = 0L
+    var serverRelayStateFreshUntil: Long = 0L
 
-    /** ★ 服务器总闸"off"是否仍在权威窗口内 */
-    fun isServerRelayOffFresh(): Boolean =
-        System.currentTimeMillis() < serverRelayOffUntil
+    /** 服务器总闸当前值（仅在 serverRelayStateFreshUntil 窗口内有意义） */
+    @Volatile
+    var serverRelayStateValue: Boolean = false
+
+    /** ★ 服务器总闸值是否仍在权威窗口内（双向） */
+    fun isServerRelayStateFresh(): Boolean =
+        System.currentTimeMillis() < serverRelayStateFreshUntil
 
     /** 中继是否正常（由 setRelayConnected 维护；未初始化返回 false） */
     fun isRelayConnected(): Boolean = relayConnected == true
@@ -954,7 +979,19 @@ object TailscaleManager {
      */
     fun setRelayConnected(ctx: Context, connected: Boolean) {
         // ★ 状态未变化时不重复执行/打日志（中继每5秒重试失败会高频触发，避免日志刷屏）
-        if (relayConnected == connected) return
+        // ★★★ 2026-10-01 修复"中继→直连后近 1 分钟才开 VPN"：
+        //   旧实现"状态未变就直接 return"。但权威闸门 externalRelayStateOn 往往在
+        //   relayConnected 已被置 false **之后**才放开（服务器 relayst=off / 同机广播到达时），
+        //   此时再调 setRelayConnected(false) 就被这句等值早退吞掉 → 不建 VPN，只能等看门狗；
+        //   而看门狗退避此时已涨到 60s（前几轮都被闸门拦下却仍在累加）→ 用户要等近一分钟。
+        //   改为：去重判据必须与【VPN 实际状态】绑定——请求与现状一致才跳过。
+        if (relayConnected == connected) {
+            val satisfied = if (connected) !TailscaleVpnService.vpnEstablished
+                            else TailscaleVpnService.vpnEstablished
+            if (satisfied) return
+            Log.i(TAG, "★ 中继状态未变($connected)但 VPN 状态不符（vpnEstablished="
+                    + TailscaleVpnService.vpnEstablished + "）→ 仍执行联动（修复切换直连后迟迟不开 VPN）")
+        }
         relayConnected = connected
         // ★★★ 2026-09-28 传输层"中继已连上"也是"用户在用中继"的强证据 → 置粘性判据；
         //   注意：**只置 true，绝不因传输层断连置 false**（那正是自持振荡的来源）；

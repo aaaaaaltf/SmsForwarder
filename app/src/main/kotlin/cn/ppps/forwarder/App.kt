@@ -111,6 +111,25 @@ class App : Application(), Configuration.Provider by Core {
             val relayStateReceiver = object : android.content.BroadcastReceiver() {
                 override fun onReceive(ctx: Context, intent: Intent) {
                     try {
+                        // ★★★ 2026-10-01 防误发/防串扰：本广播只应由【同机手机控制端】发出。
+                        //   旧实现用 getBooleanExtra("relay_on", false) 的**默认值 false**，
+                        //   于是任何 App 只要广播这个 action（不带 extra）就会被当成"中继关闭"，
+                        //   把本机强行切到直连/开 VPN（2026-10-01 新增的粘性写入会让它更持久）。
+                        //   控制端已用 setPackage 限制目标包，但广播【发送方】身份在接收侧无法直接
+                        //   校验，这里做两道最小校验；★ 不用签名/令牌校验，避免与控制端 APK 版本
+                        //   强耦合——老版本控制端没带令牌就会让整条联动静默失效。
+                        //   ① 必须显式带 relay_on（我们的控制端一定会带）；
+                        //   ② 若广播带了包名，必须是本包。
+                        if (!intent.hasExtra("relay_on")) {
+                            Log.w(TAG, "忽略缺少 relay_on 的中继状态广播（疑似误发/伪造）: action="
+                                    + intent.action)
+                            return
+                        }
+                        val pkg = intent.`package`
+                        if (pkg != null && pkg != packageName) {
+                            Log.w(TAG, "忽略非本包的中继状态广播（疑似串扰）: pkg=$pkg")
+                            return
+                        }
                         val on = intent.getBooleanExtra("relay_on", false)
                         // ★★★ 2026-09-26 修复"华为从中继切直连后连不上红米被控端"（实证根因）：
                         //   中继总闸是**全局**的，任一台手机把总闸关掉会物理断开所有手机的数据通道。
@@ -118,9 +137,17 @@ class App : Application(), Configuration.Provider by Core {
                         //   服务器 relayst=off 之后把状态又翻回"中继开"，把本机 VPN 关掉 →
                         //   已切到直连模式的那台控制端永远连不上本机（红米实测无 tun、TS 直连全超时）。
                         //   故服务器明确说 off 的权威窗口内，同机广播一律忽略，以服务器总闸为准。
-                        if (on && cn.ppps.forwarder.tailscale.TailscaleManager.isServerRelayOffFresh()) {
-                            Log.i(TAG, "★ 服务器总闸已关(relayst=off)且在权威窗口内 → 忽略同机控制端的"
-                                    + "中继开启广播（保持VPN开启，供直连模式的控制端接入）")
+                        // ★★★ 2026-10-01【升级为双向权威】用户硬性要求："一处控制端切换中继开关，
+                        //   所有控制端同步；被控端按切换后的总闸状态决定是否开 VPN" → 总闸是唯一权威，
+                        //   窗口内同机广播**不得与服务器值相反**。旧实现只拦 off 方向（且注释写"on 时
+                        //   恢复以同机控制端为准"），于是总闸=on 时同机那条每 30s 补发的 relay_on=false
+                        //   能把刚关掉的 VPN 又打开（establish 还会打断被控端到中继的 TCP）。
+                        if (cn.ppps.forwarder.tailscale.TailscaleManager.isServerRelayStateFresh()
+                                && on != cn.ppps.forwarder.tailscale.TailscaleManager.serverRelayStateValue) {
+                            Log.i(TAG, "★ 服务器总闸["
+                                    + (if (cn.ppps.forwarder.tailscale.TailscaleManager.serverRelayStateValue) "开" else "关")
+                                    + "]仍在权威窗口内 → 忽略同机控制端的相反广播["
+                                    + (if (on) "开" else "关") + "]（用户要求：总闸为唯一权威）")
                             return
                         }
                         Log.i(TAG, "★ 收到同机控制端中继状态广播: "
@@ -129,6 +156,14 @@ class App : Application(), Configuration.Provider by Core {
                         //   （连上→关VPN / 断连→开VPN），防止与权威状态互相打架
                         cn.ppps.forwarder.tailscale.TailscaleManager.externalRelayStateUntil =
                             System.currentTimeMillis() + 180_000L
+                        // ★★★ 2026-10-01 修复"中继→直连后近 1 分钟才开 VPN"：
+                        //   同机控制端的广播同样是【权威状态值】（与服务器 relayst 同级，见 TailscaleManager 注释），
+                        //   必须同时更新粘性判据。旧实现只写窗口、不写值 → 收到"中继关闭"时，
+                        //   闸门 externalRelayStateOn 仍为 true（更早的中继态）→ setRelayConnected(false)
+                        //   被闸门拦下、不建 VPN，只能等服务器 relayst=off + 看门狗退避（最坏约 60s）才起来。
+                        cn.ppps.forwarder.tailscale.TailscaleManager.externalRelayStateOn = on
+                        // ★ 权威状态变化 → 复位看门狗退避，使建立失败后也能在 10s 内快速重试
+                        cn.ppps.forwarder.tailscale.TailscaleManager.resetVpnWatchdogBackoff()
                         cn.ppps.forwarder.tailscale.TailscaleManager.setRelayConnected(
                             applicationContext, on)
                     } catch (t: Throwable) {
