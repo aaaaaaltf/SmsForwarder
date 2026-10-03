@@ -25,8 +25,12 @@ object RelayCommands {
     /** 控制端连接中继的端口（本项目专用，原56782） */
     const val RELAY_CONTROLLER_PORT = 56787
 
-    /** 中继视频流端口（屏幕预览推流/收流，本项目专用，原56783 → 56888与服务器一致） */
-    const val RELAY_VIDEO_PORT = 56888
+    /** 中继视频流端口（屏幕预览推流/收流）
+     *  ★★★ 2026-10-03 修复"手机屏幕预览黑屏 / 控制端提示'中继视频流端口未开放'"：
+     *  原值 56888 **服务器从未监听**（core/relay_server.py 只 bind VIDEO_PORT=56783，
+     *  线上 ss 实测只有 56783）→ 两端连 56888 都 ECONNREFUSED。
+     *  改回 56783：与服务器、与 PC 屏幕预览一致（中继视频通道按 PUSHER/LISTENER 的 clientId 配对）。 */
+    const val RELAY_VIDEO_PORT = 56783
 
     /** 控制端类型标识：手机控制端 */
     const val CTRL_TYPE_PHONE: Byte = 0x01
