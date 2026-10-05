@@ -742,8 +742,30 @@ object RelayServerHandler {
                     if (!HttpServerUtils.enableApiCamera) return RelayCommands.CMD_CAMERA_STATUS_REPORT to error("0|failed|服务端已禁用摄像头")
                     // ★ 2026-08-29 payload 语义 = 朝向目标：0=后置(BACK) / 1=前置(FRONT)；
                     //   越界值（如2/3）由 CameraStreamManager 退化为 cameraIdList 数组下标解释（旧行为，向后兼容）
-                    val facingTarget = payloadText.toIntOrNull() ?: CameraStreamManager.FACING_BACK
-                    val ok = CameraStreamManager.start(facingTarget)
+                    // ★★★ 2026-10-05【摄像头画质】负载扩展为 `<facing>|w=|h=|fps=|q=`
+                    //   （控制端设置页的摄像头档位，见 android_controller core/QualityProfile.CAM_PROFILES）。
+                    //   ★ 必须**先按 `|` 切段**：原实现是 `payloadText.toIntOrNull()` 对整串解析，
+                    //     带扩展段后整串不是数字 ⇒ 静默退化成"后置摄像头"，
+                    //     表现为"用户切前置镜头被无视、画质档位也不生效"。
+                    //     老控制端只发一个数字 ⇒ 切段后第一段仍是它，行为不变。
+                    val camSegs = payloadText.split("|")
+                    val facingTarget = camSegs.getOrNull(0)?.trim()?.toIntOrNull()
+                        ?: CameraStreamManager.FACING_BACK
+                    var camW = 0
+                    var camH = 0
+                    var camFps = 0
+                    var camQ = 0
+                    for (i in 1 until camSegs.size) {
+                        val seg = camSegs[i].trim()
+                        val n = seg.substringAfter('=', "").toIntOrNull() ?: continue
+                        when (seg.substringBefore('=', "")) {
+                            "w" -> camW = n
+                            "h" -> camH = n
+                            "fps" -> camFps = n
+                            "q" -> camQ = n
+                        }
+                    }
+                    val ok = CameraStreamManager.start(facingTarget, camW, camH, camFps, camQ)
                     // 回报：首字段=实际打开的朝向（与帧头一致）；成功时末尾追加契约字段 |facing=<0|1>[|fallback=1]
                     // 失败分支保持旧格式 "<target>|failed|原因"，旧控制端无需改动即可解析
                     RelayCommands.CMD_CAMERA_STATUS_REPORT to if (ok)
@@ -820,6 +842,10 @@ object RelayServerHandler {
                     var screenFps = 12
                     var screenMaxW = 0
                     var screenMaxH = 0
+                    // ★★★ 2026-10-05【摄像头画质】摄像头会话的 fps/分辨率上限（来自控制端档位）
+                    var camFps = 0
+                    var camMaxW = 0
+                    var camMaxH = 0
                     if (firstPipeIdx > 0) {
                         val headToken = payloadText.substring(0, firstPipeIdx).trim()
                         // ★★★ 2026-10-05 用 startswith 而不是 equals("screen")：
@@ -850,8 +876,28 @@ object RelayServerHandler {
                             offerB64 = if (segs.size > b64From) segs.drop(b64From).joinToString("|") else rest
                             idx = 0
                         } else {
-                            idx = headToken.toIntOrNull() ?: 0
-                            offerB64 = payloadText.substring(firstPipeIdx + 1)
+                            // ★★★ 2026-10-05【摄像头画质】摄像头分支也支持可选参数段：
+                            //   `<facing>|<fps>|<maxW>|<maxH>|<SDP_BASE64>`（控制端设置页档位下发）。
+                            //   ★ 与屏幕分支同款判据：第 2 段起若是 ≤5 位纯数字就当参数，
+                            //     否则原样拼回 SDP —— 老控制端只发 `<facing>|<b64>`，行为不变。
+                            //     （首段可能是 `<facing>:<cid>`：中继多路同看注入，取冒号前的数字。）
+                            idx = headToken.substringBefore(':').trim().toIntOrNull() ?: 0
+                            val rest2 = payloadText.substring(firstPipeIdx + 1)
+                            val segs2 = rest2.split("|")
+                            var from2 = 1
+                            val f2 = segs2.getOrNull(0)?.trim()
+                            val w2 = segs2.getOrNull(1)?.trim()
+                            val h2 = segs2.getOrNull(2)?.trim()
+                            if (segs2.size > 3 && f2 != null && w2 != null && h2 != null
+                                    && f2.length <= 5 && w2.length <= 5 && h2.length <= 5
+                                    && f2.toIntOrNull() != null && w2.toIntOrNull() != null
+                                    && h2.toIntOrNull() != null) {
+                                camFps = f2.toInt()
+                                camMaxW = w2.toInt()
+                                camMaxH = h2.toInt()
+                                from2 = 3
+                            }
+                            offerB64 = if (segs2.size > from2) segs2.drop(from2).joinToString("|") else rest2
                         }
                         try {
                             val sdpRaw = String(Base64.getDecoder().decode(offerB64), Charsets.UTF_8)
@@ -924,7 +970,7 @@ object RelayServerHandler {
                     Thread {
                         try {
                             mgr.startWithOffer(idx, offerB64, cb, relayPreferred, screenMode, screenFps,
-                                    screenMaxW, screenMaxH)
+                                    screenMaxW, screenMaxH, camFps, camMaxW, camMaxH)
                             Log.i(TAG, "★ [WebRTC OFFER IN] startWithOffer 线程执行完毕（ANSWER 将由 signaling callback 异步发送）")
                         } catch (t: Throwable) {
                             Log.e(TAG, "★ [WebRTC OFFER IN] startWithOffer 异常: type=${t.javaClass.name} msg=${t.message}", t)

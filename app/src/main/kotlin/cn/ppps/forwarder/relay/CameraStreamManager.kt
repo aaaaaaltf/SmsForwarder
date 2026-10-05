@@ -47,6 +47,20 @@ object CameraStreamManager {
     private const val QOS_RESTORE_GUARD = 3
     /** 摄像头原始质量（原来的硬编码 70 改为可变字段的初始值） */
     @Volatile private var qosQuality: Int = 70
+
+    // ===== ★★★ 2026-10-05【摄像头画质】控制端档位下发的采集参数 =====
+    //   改造前这三个值是**写死的常量**（640×480 / 100ms / q70），控制端无从调整 ——
+    //   这正是"手机摄像头不是高清"的根因。现在它们是"默认值"，
+    //   由 start(facing, maxW, maxH, fps, quality) 按控制端档位覆盖；
+    //   **未下发（老控制端）或越界时一律回落到这些默认值** ⇒ 行为与改造前一致。
+    /** 采集宽度上限（0/越界 ⇒ WIDTH） */
+    @Volatile private var capWidth: Int = WIDTH
+    /** 采集高度上限（0/越界 ⇒ HEIGHT） */
+    @Volatile private var capHeight: Int = HEIGHT
+    /** 帧间隔（ms）（0/越界 ⇒ FRAME_INTERVAL_MS） */
+    @Volatile private var capFrameIntervalMs: Long = FRAME_INTERVAL_MS
+    /** 起始画质（0/越界 ⇒ qosQuality 的初值 70）；同时用于旋转后的二次编码 */
+    @Volatile private var capStartQuality: Int = 70
     private var qosBadSamples = 0
     private var qosGoodSamples = 0
     private var qosEmaMs = 0.0
@@ -319,7 +333,21 @@ object CameraStreamManager {
      * @return 是否成功启动
      */
     @Synchronized
-    fun start(facingTarget: Int): Boolean {
+    fun start(facingTarget: Int, maxW: Int = 0, maxH: Int = 0, fps: Int = 0, quality: Int = 0): Boolean {
+        // ★★★ 2026-10-05【摄像头画质】先落定本次会话的采集参数（**必须在"同 facing 继续推流"
+        //   那个提前 return 之前**）：控制端在"不切镜头、只改画质"时会复用同一条流，
+        //   若把参数放在 return 之后，用户改完档位再进来一次就不会生效。
+        //   夹取口径与三端一致（宽 160..4096 / 高 120..4096 / fps 1..30 / 画质 10..90），
+        //   越界即视为"未指定" ⇒ 回落 WIDTH/HEIGHT/FRAME_INTERVAL_MS/70（= 改造前写死值）。
+        capWidth = if (maxW in 160..4096) maxW else WIDTH
+        capHeight = if (maxH in 120..4096) maxH else HEIGHT
+        capFrameIntervalMs = if (fps in 1..60) (1000L / fps.coerceIn(1, 30)) else FRAME_INTERVAL_MS
+        capStartQuality = if (quality in 10..90) quality else 70
+        // 新会话必须把自适应质量**复位**到本次档位的起始值：否则上一段会话降下来的
+        // qosQuality 会莫名其妙延续到新会话（用户在设置里调高了画质却看起来没变）。
+        qosQuality = capStartQuality
+        Log.i(TAG, "★ 摄像头画质: ${capWidth}x${capHeight}@${1000L / capFrameIntervalMs}fps 起始画质=$capStartQuality"
+                + if (maxW in 160..4096) "（控制端指定）" else "（控制端未指定，用默认）")
         // ★ 2026-08-05修复：直连模式下中继client未连接（云服务关闭/中继不可达）时，
         //   只要存在任一已连接的发送通道（直连监听56786 / TS直连56789），摄像头仍可推流。
         //   原逻辑只检查中继client，导致直连模式摄像头永远启动失败。
@@ -538,7 +566,8 @@ object CameraStreamManager {
         cameraThread = HandlerThread("CameraStreamThread").also { it.start() }
         cameraHandler = Handler(cameraThread!!.looper)
 
-        val reader = ImageReader.newInstance(WIDTH, HEIGHT, ImageFormat.YUV_420_888, 2)
+        // ★ 2026-10-05【摄像头画质】用控制端档位的分辨率上限（未指定时 = 改造前的 WIDTH×HEIGHT）
+        val reader = ImageReader.newInstance(capWidth, capHeight, ImageFormat.YUV_420_888, 2)
         reader.setOnImageAvailableListener({ r ->
             if (!running) return@setOnImageAvailableListener
             val image = try {
@@ -579,7 +608,8 @@ object CameraStreamManager {
                         // ★ 流控：帧发送后sleep，防止中继服务器缓冲区溢出导致画面卡死
                         // 与文件下载的流控逻辑一致，每帧间隔100ms（约10fps）
                         try {
-                            Thread.sleep(FRAME_INTERVAL_MS)
+                            // ★ 2026-10-05【摄像头画质】帧间隔由控制端档位的 fps 决定
+                        Thread.sleep(capFrameIntervalMs)
                         } catch (_: InterruptedException) {}
                     }
                 } finally {
@@ -795,7 +825,9 @@ object CameraStreamManager {
             matrix.postRotate(rotateDeg.toFloat())
             val rotated = android.graphics.Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
             val out = java.io.ByteArrayOutputStream()
-            rotated.compress(android.graphics.Bitmap.CompressFormat.JPEG, 70, out)
+            // ★ 2026-10-05【摄像头画质】二次编码的质量原来**写死 70**（自适应完全管不到它），
+            //   这是"用户把画质调低但画面没变糊"的漏点之一。改用自适应的 qosQuality。
+            rotated.compress(android.graphics.Bitmap.CompressFormat.JPEG, qosQuality, out)
             if (rotated != bmp) bmp.recycle()
             rotated.recycle()
             out.toByteArray()
@@ -813,7 +845,8 @@ object CameraStreamManager {
             matrix.preScale(1f, -1f)  // 垂直翻转
             val flipped = android.graphics.Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
             val out = java.io.ByteArrayOutputStream()
-            flipped.compress(android.graphics.Bitmap.CompressFormat.JPEG, 70, out)
+            // ★ 2026-10-05 同上：二次编码质量改用自适应值（原来写死 70）
+            flipped.compress(android.graphics.Bitmap.CompressFormat.JPEG, qosQuality, out)
             if (flipped != bmp) bmp.recycle()
             flipped.recycle()
             out.toByteArray()

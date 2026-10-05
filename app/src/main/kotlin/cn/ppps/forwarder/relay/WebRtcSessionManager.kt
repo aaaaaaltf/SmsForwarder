@@ -194,6 +194,14 @@ class WebRtcSessionManager(
      *  0 或越界 ⇒ 采集器用自己的默认值 1280×720（= 改造前行为）。 */
     @Volatile private var screenMaxW: Int = 0
     @Volatile private var screenMaxH: Int = 0
+
+    /** ★★★ 2026-10-05【摄像头画质】本次会话**统一**的采集目标尺寸/帧率。
+     *  由 startWithOffer 按采集源（屏幕/摄像头）与控制端档位一次算出，
+     *  随后被 startCapture(...) 与 RtpParameters(maxFramerate/码率) 共用 —— 必须同源，
+     *  否则"只改分辨率被码率压回 / 只改帧率被 maxFramerate 压回"，用户看不到任何变化。 */
+    @Volatile private var effCapW: Int = 1280
+    @Volatile private var effCapH: Int = 720
+    @Volatile private var effCapFps: Int = 12
     private val KEY_FRAME_INTERVAL_MS = 2000L
     /** ★★★ 2026-08-14 修复"只传一帧"：enable抖动必须保持disabled足够久（编码器感知帧中断才出关键帧）。
      *  立即 setEnabled(false→true) 两事件在同一次native消息队列合并 → VideoStreamEncoder感知不到中断 → 不出关键帧。 */
@@ -264,7 +272,8 @@ class WebRtcSessionManager(
     fun startWithOffer(cameraFacing: Int, offerSdpBase64: String, cb: SignalingCallback,
                        relayPreferred: Boolean = true,
                        screenMode: Boolean = false, screenFps: Int = 12,
-                       screenMaxW: Int = 0, screenMaxH: Int = 0) {
+                       screenMaxW: Int = 0, screenMaxH: Int = 0,
+                       camFps: Int = 0, camMaxW: Int = 0, camMaxH: Int = 0) {
         val stepTag = "[WebRTC-INIT]"
         if (running) {
             Log.w(TAG, "$stepTag 已在运行中，先关闭旧会话")
@@ -278,6 +287,22 @@ class WebRtcSessionManager(
         // ★★★ 2026-10-05【画面质量】人为分辨率上限（控制端档位；0=采集器默认 1280×720）
         this.screenMaxW = if (screenMaxW in 160..4096) screenMaxW else 0
         this.screenMaxH = if (screenMaxH in 120..4096) screenMaxH else 0
+        // ★★★ 2026-10-05【摄像头画质】统一算出"本次会话的采集目标尺寸/帧率"（effCap*）。
+        //   ★ 为什么必须**一处算出、三处复用**（采集 startCapture / RtpParameters 的
+        //     maxFramerate / 码率上限）：这三者任一不同源都会互相打架 ——
+        //     分辨率调上去却被 800kbps 压回马赛克、帧率调上去却被 maxFramerate=10 压回 10fps，
+        //     用户看到的就是"设置里选了高清、画质没变"（本项目已经吃过一次亏：
+        //     2026-08-12 那次 20→10 就是只改了采集帧率、没同步 maxFramerate）。
+        //   摄像头未下发时回落 640×480@10（= 改造前写死值）；屏幕沿用 1280×720 + 档位帧率。
+        if (screenMode) {
+            effCapW = if (this.screenMaxW in 160..4096) this.screenMaxW else 1280
+            effCapH = if (this.screenMaxH in 120..4096) this.screenMaxH else 720
+            effCapFps = this.screenFps
+        } else {
+            effCapW = if (camMaxW in 160..4096) camMaxW else 640
+            effCapH = if (camMaxH in 120..4096) camMaxH else 480
+            effCapFps = if (camFps in 1..30) camFps else 10
+        }
         Log.i(TAG, "$stepTag ★ 采集源=${if (screenMode) "手机屏幕(ScreenWebRtcCapturer ${screenFps}fps)" else "摄像头"}"
                 + "，screenMode=$screenMode"
                 + (if (this.screenMaxW > 0) "，分辨率上限=${this.screenMaxW}x${this.screenMaxH}" else "，分辨率上限=默认(1280x720)"))
@@ -828,14 +853,29 @@ class WebRtcSessionManager(
                                                 org.webrtc.RtpParameters.DegradationPreference.MAINTAIN_RESOLUTION
                                         } catch (_: Throwable) {}
                                         val encs = p.encodings
+                                        // ★★★ 2026-10-05【摄像头画质】码率/帧率上限随档位联动。
+                                        //   ★ 帧率必须用**同一份** effCapFps（见其字段注释）：
+                                        //     只改采集帧率、不改 maxFramerate 就是 2026-08-12 那次
+                                        //     "设了 20fps 却仍是 10fps"的同一个坑。
+                                        //   码率经验式 ≈ 0.1 bit/px/frame，夹在 [800k, 6M]：
+                                        //     下限 800k = 改造前的硬顶值（保证不因新公式反而变差）：
+                                        //     640×480@10 → 0.3M ⇒ 取 800k（与改造前逐字一致）；
+                                        //     1280×720@12 → 1.1M；1920×1080@12 → 2.5M。
+                                        //   ★ 屏幕通路**保持 800k 不变**：屏幕文本对码率远比摄像头敏感，
+                                        //     线上 27fps 已验证良好，不在本次改动范围内（最小爆炸半径）。
+                                        val bitCapBps = if (screenMode) 800_000
+                                        else maxOf(800_000, minOf(6_000_000, effCapW * effCapH * effCapFps / 10))
                                         for (enc in encs) {
                                             try { enc.scaleResolutionDownBy = 1.0 } catch (_: Throwable) {}
                                             enc.minBitrateBps = 100_000
-                                            enc.maxBitrateBps = 800_000
-                                            try { enc.maxFramerate = 10 } catch (_: Throwable) {} // ★★★ 2026-08-12 20→10 配合采集降帧
+                                            enc.maxBitrateBps = bitCapBps
+                                            try { enc.maxFramerate = effCapFps } catch (_: Throwable) {}
                                         }
                                         sender.parameters = p
-                                        Log.i(TAG, "$stepTag ★ 视频sender已设置 degradationPreference=MAINTAIN_RESOLUTION scaleResolutionDownBy=1.0 min=100k max=800kbps fps=10（禁用QualityScaler，分辨率固定640x480不重建编码器）")
+                                        Log.i(TAG, "$stepTag ★ 视频sender degradationPreference=MAINTAIN_RESOLUTION"
+                                                + " scaleResolutionDownBy=1.0 min=100k max=${bitCapBps / 1000}kbps"
+                                                + " fps=${effCapFps} 采集=${effCapW}x${effCapH}@${effCapFps}"
+                                                + "（★2026-10-05 采集尺寸/帧率/码率三者同源，避免只改一处被另一处压回）")
                                     }
                                 }
                             } catch (t: Throwable) {
@@ -1456,11 +1496,13 @@ class WebRtcSessionManager(
             Log.e(TAG, "$tag [v6] capturer.initialize 失败 type=${t.javaClass.name} msg=${t.message}", t)
             throw t
         }
-        // ★ 屏幕高清模式：1280x720 @（控制端指定帧率）；摄像头模式保持 640x480@10
-        //   （摄像头那一档是 2026-08-12"饥饿修复"定下来的：降低相机 HAL + 编码 CPU 负载）
-        val capW = if (screenMode) 1280 else 640
-        val capH = if (screenMode) 720 else 480
-        val capFps = if (screenMode) screenFps else 10
+        // ★★★ 2026-10-05【摄像头画质】采集尺寸/帧率改为读**统一算出的** effCap*：
+        //   屏幕 → 1280×720 + 档位帧率；摄像头 → 控制端档位（未下发时仍是 640×480@10，
+        //   即 2026-08-12"饥饿修复"定下来的那一档，保持不变）。
+        //   ★ 与 RtpParameters 的 maxFramerate/码率上限同源（见 effCapW 字段注释）。
+        val capW = effCapW
+        val capH = effCapH
+        val capFps = effCapFps
         Log.i(TAG, "$tag [v7] capturer.startCapture(${capW}x${capH}@${capFps}) 开始..."
                 + "（摄像头档 640x480@10 为 2026-08-12 饥饿修复口径）")
         try {
