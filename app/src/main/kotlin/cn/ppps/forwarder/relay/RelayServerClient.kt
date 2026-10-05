@@ -135,6 +135,52 @@ class RelayServerClient(
         heartBeatExecutor.shutdownNow()
     }
 
+    /**
+     * ★★★ 2026-10-04【C批次】同步读一帧并校验命令字（用于注册握手：服务器先发 challenge）。
+     *  帧格式与主循环一致：[4B大端长度][12B命令][负载]。读到指定命令返回其负载；否则 null。
+     */
+    private fun readOneFrame(input: java.io.InputStream, expectCmd: (String) -> Boolean): String? {
+        val hdr = ByteArray(4)
+        var off = 0
+        while (off < 4) {
+            val n = input.read(hdr, off, 4 - off)
+            if (n < 0) return null
+            off += n
+        }
+        val len = ((hdr[0].toInt() and 0xFF) shl 24) or ((hdr[1].toInt() and 0xFF) shl 16) or
+                ((hdr[2].toInt() and 0xFF) shl 8) or (hdr[3].toInt() and 0xFF)
+        if (len < 12 || len > 4096) return null
+        val body = ByteArray(len)
+        off = 0
+        while (off < len) {
+            val n = input.read(body, off, len - off)
+            if (n < 0) return null
+            off += n
+        }
+        val cmd = String(body, 0, 12, Charsets.US_ASCII)
+        return if (expectCmd(cmd)) String(body, 12, len - 12, Charsets.UTF_8) else null
+    }
+
+    /**
+     * ★★★ 2026-10-04【D批次】稳定的设备会话标识：首次生成 UUID 后存 SharedPreferences，
+     *  之后每次注册原样带回（RustDesk client.rs:2981-2997 的 session_id 持久化语义）。
+     *  服务器据此实现"同 sid 顶替旧连接"与"scope 摘要锁存"，消除幽灵设备。
+     */
+    private fun stableSessionId(): String {
+        val ctx = try {
+            cn.ppps.forwarder.App.context
+        } catch (_: Throwable) {
+            return ""
+        }
+        val sp = ctx.getSharedPreferences("relay_session", android.content.Context.MODE_PRIVATE)
+        var sid = sp.getString("sid", null)
+        if (sid.isNullOrBlank()) {
+            sid = java.util.UUID.randomUUID().toString()
+            sp.edit().putString("sid", sid).apply()
+        }
+        return sid
+    }
+
     private fun connectLoop() {
         // ★ 2026-08-28 省电：连续失败计数（用于退避 + 日志节流），成功连接后归零
         var consecutiveFailures = 0
@@ -162,6 +208,7 @@ class RelayServerClient(
                 //   注册帧发送失败会抛异常走下方 catch → 视为连接失败进入重连（与服务器语义一致）。
                 try {
                     val out = s.getOutputStream()
+                    val `in` = s.getInputStream()
                     val dev = try {
                         (cn.ppps.forwarder.App.context.let {
                             android.os.Build.MODEL ?: "phone"
@@ -169,7 +216,26 @@ class RelayServerClient(
                     } catch (_: Throwable) {
                         "phone"
                     }
-                    val payload = (RelayCommands.RELAY_REG_TOKEN + "|" + dev)
+                    // ★★★ 2026-10-04【C批次·challenge-response】服务器连上后先下发 regchal00000
+                    //   （32 字符随机 hex）。用共享令牌作 HMAC-SHA256 密钥对 challenge 签名，
+                    //   注册帧第一段放签名 hex —— **令牌永不上线**，抓包/重放皆无效。
+                    //   （旧"明文令牌"流程已废弃；连不上新服务器说明 APK 未更新。）
+                    val challenge = readOneFrame(`in`) { it == RelayCommands.CMD_REG_CHALLENGE }
+                        ?: throw IOException("未收到注册challenge（服务器版本过旧或超时）")
+                    val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+                    mac.init(javax.crypto.spec.SecretKeySpec(
+                        RelayCommands.RELAY_REG_TOKEN.toByteArray(Charsets.UTF_8), "HmacSHA256"))
+                    val hmacHex = mac.doFinal(challenge.toByteArray(Charsets.UTF_8))
+                        .joinToString("") { "%02x".format(it) }
+                    // ★★★ 2026-10-04【D批次·sessionId 持久化】同一台设备生成一次 UUID 后存 SP，
+                    //   之后每次注册都带同一个 sid —— 服务器用 (sid) 顶替旧连接、锁存会话范围，
+                    //   这是消"幽灵设备/重连换身份"的锚点。
+                    val sid = stableSessionId()
+                    // ★★★ 2026-10-03【v2 协商】注册帧尾部追加 proto/caps（RelayProtoState.regHint），
+                    //   服务器据此记下本端协议版本与屏幕能力位，并回推它自己的 ver/caps/ports。
+                    //   旧服务器不认这两段（最多把它们并进设备名显示），不影响注册结果。
+                    val payload = (hmacHex + "|" + dev
+                            + RelayProtoState.regHint() + "|sid=" + sid)
                         .toByteArray(Charsets.UTF_8)
                     val data = ByteArray(12 + payload.size)
                     System.arraycopy(

@@ -80,6 +80,12 @@ object RelayServerHandler {
         @Volatile var webrtcCameraIndex: Int = 0
         /** 当前 WebRTC 会话是否纯音频模式（麦克风）：回退时只启老麦克风，不启摄像头 */
         @Volatile var webrtcAudioOnly: Boolean = false
+        /**
+         * ★★★ 2026-10-04 当前 WebRTC 会话是否【屏幕高清模式】（采集屏幕而非摄像头）。
+         * 用途：控制端切回 JPEG 屏幕预览（rdstrt）时，据此关掉正在跑的屏幕 WebRTC 会话
+         * （两条采集链各建一个 VirtualDisplay，双份镜像+双份编码，纯浪费电）。
+         */
+        @Volatile var webrtcScreenMode: Boolean = false
         /** 本连接的文件下载取消标志（发 CMD_FS_CANCEL 后置 true，下载线程每块前检查） */
         @Volatile var fsDownloadCancelled: Boolean = false
         /** 本连接当前下载线程（互斥：防旧下载残留线程与新下载并发写同一 socket） */
@@ -188,6 +194,23 @@ object RelayServerHandler {
                             return@Thread
                         }
                         // —— 1) 老摄像头：JPEG推（纯音频模式跳过，不占用摄像头）
+                        // ★★★ 2026-10-04【屏幕预览回退修复】原实现只看"是否纯音频"，**漏了 screenMode**：
+                        //   屏幕预览(WebRTC)失败时也会去 `CameraStreamManager.start()` 开摄像头 ——
+                        //   结果是"用户点屏幕预览，被控端却打开了摄像头"，控制端拿到的是摄像头画面或全黑，
+                        //   而且摄像头一旦被占用，后续真正的屏幕预览/摄像头预览都抢不到（每 peer 仅 1 个槽）。
+                        //   现在：屏幕模式 → 只回退状态让控制端改走【屏幕 JPEG】，绝不开摄像头/麦克风。
+                        val webrtcIsScreen = try {
+                            sessionOf(peerKey).webrtcScreenMode
+                        } catch (_: Throwable) { false }
+                        if (webrtcIsScreen) {
+                            Log.w(TAG, "★ WebRTC回退：本次是【屏幕预览】会话 → 不开摄像头/麦克风，"
+                                    + "仅回退状态，由控制端改走屏幕 JPEG（rdstrt）")
+                            try {
+                                fallbackSender.send(RelayCommands.CMD_WEBRTC_STATUS,
+                                    "fallback_legacy|屏幕WebRTC失败，请改用屏幕JPEG(rdstrt): $reason")
+                            } catch (_: Throwable) {}
+                            return@Thread
+                        }
                         if (!webrtcIsAudioOnly) {
                             val okCam = CameraStreamManager.start(fallbackCamera)
                             Log.i(TAG, "★ WebRTC回退：摄像头 ${if (okCam) "成功" else "失败:${CameraStreamManager.lastError()}"}")
@@ -368,6 +391,16 @@ object RelayServerHandler {
             when (cmd) {
                 RelayCommands.CMD_GET_CONFIG -> RelayCommands.RSP_CONFIG to success(handleConfig())
 
+                // ★★★ 2026-10-03【v2 协议状态】服务器在【注册成功后】下发本命令（负载 ver/caps/ports）。
+                //   解析后与真源常量比对，端口/版本不一致会直接写日志点名（见 RelayProtoState），
+                //   这正是"客户端 56888 vs 服务器 56783 黑屏"那类事故的早期报警器。
+                //   ★ 只读、不回包（与 relayst/ping 等系统推送一致）；旧服务器不下发 → 无影响。
+                RelayCommands.CMD_PROTO_STATE -> {
+                    cn.ppps.forwarder.utils.Log.i("RelayServerHandler", "★ 收到服务器协议状态: "
+                            + RelayProtoState.acceptProtoState(payloadText))
+                    null
+                }
+
                 // ★ Tailscale直连请求（中继在线时触发）：负载 "目标Tailscale IP|控制端Tailscale IP|端口"
                 RelayCommands.CMD_TS_DIRECT_CONNECT -> {
                     val parts = payloadText.split("|")
@@ -517,12 +550,35 @@ object RelayServerHandler {
 
                 RelayCommands.CMD_RD_START -> {
                     // 屏幕预览（远程桌面）：负载格式 host|port|FPS|色深|质量|clientId
+                    // ★★★ 2026-10-05【画面质量】追加两个**可选**段 `w=<maxW>` / `h=<maxH>`
+                    //   （控制端设置页「手机被控端屏幕预览」档位，见 core/QualityProfile.java）。
+                    //   改造前分辨率由本端写死 1280×720（ScreenStreamManager 的 MAX_WIDTH/HEIGHT），
+                    //   控制端无从调整。
+                    //   ★ 按**前缀**在尾部各段里找，而不是按下标 —— 老控制端不发这两段，
+                    //     将来再插别的可选段也不会因为段序变化而互相错位（与 PC 侧 rdstrt 解析同风格）。
                     val parts = payloadText.split("|")
                     val fps = parts.getOrNull(2)?.toIntOrNull() ?: 15
                     val quality = parts.getOrNull(4)?.toIntOrNull() ?: 50
                     val clientId = parts.getOrNull(5)?.toIntOrNull() ?: -1
-                    // ★ 按命令来源通道决定推流模式（中继→PUSHER；直连/TS→监听56788）
-                    val ok = ScreenStreamManager.startStream(RelaySettings.relayHost, clientId, fps, quality, channel)
+                    var maxW = 0
+                    var maxH = 0
+                    for (i in 6 until parts.size) {
+                        val seg = parts[i].trim()
+                        if (seg.startsWith("w=")) maxW = seg.substring(2).toIntOrNull() ?: 0
+                        else if (seg.startsWith("h=")) maxH = seg.substring(2).toIntOrNull() ?: 0
+                    }
+                    // ★★★ 2026-10-04 互斥（另一半）：控制端从"WebRTC 高清"回退到 JPEG 之前，
+                    //   先关掉正在跑的屏幕 WebRTC 高清会话——否则两个 VirtualDisplay 同时镜像整屏
+                    //   （双份 GPU/内存拷贝 + 双份编码，纯浪费电）。
+                    if (sessionOf(peerKey).webrtcScreenMode) {
+                        Log.i(TAG, "★ 收到 JPEG 屏幕推流请求 → 关闭正在运行的屏幕 WebRTC 高清会话（互斥）")
+                        try { sessionOf(peerKey).webrtc?.close() } catch (_: Throwable) {}
+                        sessionOf(peerKey).webrtc = null
+                        sessionOf(peerKey).webrtcScreenMode = false
+                    }
+                    // ★ 按命令来源通道决定推流模式（中继→PUSHER；直连/TS→本机监听同端口）
+                    val ok = ScreenStreamManager.startStream(RelaySettings.relayHost, clientId, fps, quality, channel,
+                            maxW, maxH)
                     if (ok) {
                         RelayCommands.RSP_RD_START_ACK to RelayCommands.RELAY_VIDEO_PORT.toString()
                     } else {
@@ -616,11 +672,21 @@ object RelayServerHandler {
                 // ==================== 版本确认（PC协议兼容，控制端用于确认被控端在线） ====================
                 RelayCommands.CMD_GET_VERSION -> {
                     val versionName = try { AppUtils.getAppVersionName() } catch (_: Exception) { "1.0" }
-                    val deviceName = try {
-                        (android.os.Build.MANUFACTURER + " " + android.os.Build.MODEL).trim()
-                    } catch (_: Exception) { "Android" }
+                    // ★★★ 2026-10-04【设备名口径统一·修"屏幕预览没有图像"】此前这里报的是
+                    //   `MANUFACTURER + " " + MODEL`（如 "Xiaomi M2012K11AC"），而 devstate 报的是
+                    //   「用户备注优先」（如 "红米K40"），regsms000000 又报 `Build.MODEL` —— 三处不一致。
+                    //   控制端 `ScreenPreviewActivity` 的 caps 探测会用 devstate 名去比对 ver100 名，
+                    //   用户一旦设置备注就必然不等 → 判定"不是本设备"→ 丢弃响应 → 探测超时 → 屏幕预览
+                    //   一直卡在"正在请求被控端屏幕…"（真机 2026-10-04 18:52 华为→红米 实测）。
+                    //   ⇒ 统一走 selfDeviceName()，与 devstate / 列表显示完全同源。
+                    val deviceName = selfDeviceName()
                     // 负载格式与PC被控端一致: 版本|设备名|用户|isAdmin|isService（纯ASCII，编码安全）
-                    RelayCommands.CMD_VERSION_INFO to "$versionName|$deviceName|Android|0|0"
+                    // ★★★ 2026-10-04 尾部追加协商字段（老控制端按下标取前 5 段，多出来的字段被忽略）：
+                    //   proto=本端协议版本；caps=屏幕能力位（控制端据此决定"屏幕用 WebRTC 高清还是 JPEG"）。
+                    RelayCommands.CMD_VERSION_INFO to
+                            ("$versionName|$deviceName|Android|0|0"
+                                    + "|proto=" + RelayProtoState.OWN_PROTO_VERSION
+                                    + "|caps=0x" + Integer.toHexString(RelayProtoState.ownCaps()))
                 }
 
                 // ★★★ 2026-08-17 方案C：反向查询设备状态（控制端主动探活心跳）
@@ -747,13 +813,51 @@ object RelayServerHandler {
                     var idx = 0
                     var offerB64 = ""
                     var audioOnly = false
+                    // ★★★ 2026-10-04 屏幕 WebRTC 高清模式：payload 首段为字面量 "screen" 时
+                    //   表示为"看屏幕"会话，格式 = screen|<fps>|<SDP_BASE64>；
+                    //   摄像头会话仍是 <cameraIndex>|<SDP_BASE64>（老控制端不受影响）。
+                    var screenMode = false
+                    var screenFps = 12
+                    var screenMaxW = 0
+                    var screenMaxH = 0
                     if (firstPipeIdx > 0) {
-                        idx = payloadText.substring(0, firstPipeIdx).toIntOrNull() ?: 0
-                        offerB64 = payloadText.substring(firstPipeIdx + 1)
+                        val headToken = payloadText.substring(0, firstPipeIdx).trim()
+                        // ★★★ 2026-10-05 用 startswith 而不是 equals("screen")：
+                        //   中继在多路同看时会把 OFFER 首段改写成 `screen:<ctrlId>`
+                        //   （relay_server `_tag_offer_with_ctrl`），旧写法会把带标记的屏幕 OFFER
+                        //   误判成"摄像头会话 idx=0" ⇒ 多路看手机屏幕时拿到的是摄像头画面/黑屏。
+                        //   （与 PC 侧 `_cmd_screen_webrtc_offer` 的修法同源。）
+                        if (headToken.startsWith("screen", ignoreCase = true)) {
+                            screenMode = true
+                            val rest = payloadText.substring(firstPipeIdx + 1)
+                            val segs = rest.split("|")
+                            screenFps = segs.getOrNull(0)?.trim()?.toIntOrNull()?.coerceIn(5, 30) ?: 12
+                            // ★★★ 2026-10-05【画面质量】格式扩展为
+                            //   `screen|<fps>|<maxW>|<maxH>|<SDP_BASE64>`（控制端设置页档位下发）。
+                            //   判据：第 2/3 段都是 ≤5 位纯数字才是 w/h —— SDP 的 base64 有几千字符，
+                            //   绝不可能短到 5 位；老控制端发 `screen|<fps>|<b64>`（3 段）⇒ 不满足
+                            //   `segs.size > 3` ⇒ 走默认 1280×720，行为与改造前一致。
+                            var b64From = 1
+                            val ws = segs.getOrNull(1)?.trim()
+                            val hs = segs.getOrNull(2)?.trim()
+                            if (segs.size > 3 && ws != null && hs != null
+                                    && ws.length <= 5 && hs.length <= 5
+                                    && ws.toIntOrNull() != null && hs.toIntOrNull() != null) {
+                                screenMaxW = ws.toInt()
+                                screenMaxH = hs.toInt()
+                                b64From = 3
+                            }
+                            offerB64 = if (segs.size > b64From) segs.drop(b64From).joinToString("|") else rest
+                            idx = 0
+                        } else {
+                            idx = headToken.toIntOrNull() ?: 0
+                            offerB64 = payloadText.substring(firstPipeIdx + 1)
+                        }
                         try {
                             val sdpRaw = String(Base64.getDecoder().decode(offerB64), Charsets.UTF_8)
                             audioOnly = !sdpRaw.contains("m=video")
-                            Log.i(TAG, "★ [WebRTC OFFER IN] 解析: cameraIndex=$idx, offerB64Len=${offerB64.length}, audioOnly(纯音频麦克风)=$audioOnly")
+                            Log.i(TAG, "★ [WebRTC OFFER IN] 解析: screenMode=$screenMode cameraIndex=$idx"
+                                    + " screenFps=$screenFps, offerB64Len=${offerB64.length}, audioOnly(纯音频麦克风)=$audioOnly")
                         } catch (_: Throwable) {}
                     }
                     // 先权限检查（摄像头+麦克风；纯音频模式只要求麦克风）
@@ -767,7 +871,8 @@ object RelayServerHandler {
                     } catch (_: Throwable) { false }
                     Log.i(TAG, "★ [WebRTC OFFER IN] 权限检查: CAMERA=$permCamera, RECORD_AUDIO=$permAudio, enableApiCamera=${HttpServerUtils.enableApiCamera}, audioOnly=$audioOnly")
                     // ★ 2026-08-11 纯音频模式：只要求RECORD_AUDIO权限；摄像头权限/开关不要求
-                    val needCamera = !audioOnly
+                    // ★ 2026-10-04 屏幕高清模式：同样不要求摄像头权限/开关（采集屏幕靠 MediaProjection）
+                    val needCamera = !audioOnly && !screenMode
                     if ((needCamera && !permCamera) || !permAudio) {
                         // 无权限：直接走"优雅回退"，告知控制端 fallback
                         val missing = mutableListOf<String>()
@@ -793,10 +898,16 @@ object RelayServerHandler {
                     Log.i(TAG, "★ [WebRTC OFFER IN] 解析成功: cameraIndex=$idx, offerB64Len=${offerB64.length}")
                     sessionOf(peerKey).webrtcCameraIndex = idx
                     sessionOf(peerKey).webrtcAudioOnly = audioOnly
+                    sessionOf(peerKey).webrtcScreenMode = screenMode
                     // —— 先关闭旧 WebRTC / 旧 JPEG+PCM 会话（避免冲突）
                     try { sessionOf(peerKey).webrtc?.close() } catch (_: Throwable) {}
                     try { CameraStreamManager.stop() } catch (_: Throwable) {}
                     try { MicrophoneStreamManager.stop() } catch (_: Throwable) {}
+                    // ★★★ 2026-10-04 互斥：屏幕【JPEG】推流与屏幕【WebRTC】高清会话不能同时跑
+                    //   （两条采集链各建一个 VirtualDisplay，双份镜像 + 双份编码，纯浪费电）。
+                    //   控制端选路：先试 WebRTC 高清，失败/超时才回退 rdstrt(JPEG)，
+                    //   所以这里被控端只需保证"开 WebRTC 前先停 JPEG"这一半。
+                    try { ScreenStreamManager.stop() } catch (_: Throwable) {}
                     sessionOf(peerKey).webrtc = null
                     // —— 初始化新 WebRTC 会话
                     val mgr = WebRtcSessionManager(App.context)
@@ -812,7 +923,8 @@ object RelayServerHandler {
                     // 启动放到子线程（createAnswer/setRemoteDescription 会阻塞）
                     Thread {
                         try {
-                            mgr.startWithOffer(idx, offerB64, cb, relayPreferred)
+                            mgr.startWithOffer(idx, offerB64, cb, relayPreferred, screenMode, screenFps,
+                                    screenMaxW, screenMaxH)
                             Log.i(TAG, "★ [WebRTC OFFER IN] startWithOffer 线程执行完毕（ANSWER 将由 signaling callback 异步发送）")
                         } catch (t: Throwable) {
                             Log.e(TAG, "★ [WebRTC OFFER IN] startWithOffer 异常: type=${t.javaClass.name} msg=${t.message}", t)
@@ -861,14 +973,31 @@ object RelayServerHandler {
         }
     }
 
+    /** ★★★ 2026-10-04【设备名唯一真源】用户备注优先，否则"厂商 型号"。
+     *
+     *  为什么必须统一（真机 2026-10-04 18:52 华为→红米"屏幕预览没有图像"根因之一）：
+     *  本工程历史上三处各报各的 —— `regsms000000` 用 `Build.MODEL`（"M2012K11AC"）、
+     *  `ver100000000` 用 `MANUFACTURER + MODEL`（"Xiaomi M2012K11AC"）、devstate 用「备注优先」
+     *  （"红米K40"）。控制端 `ScreenPreviewActivity` 正是用 devstate 名去比对 ver100 名做身份校验，
+     *  用户一旦设置备注就必然对不上 ⇒ 丢弃本设备的版本响应 ⇒ caps 探测超时 ⇒ 预览无图像。
+     *  现在三处一律走本函数，列表显示、身份判定、能力探测用同一个名字。
+     */
+    private fun selfDeviceName(): String {
+        return try {
+            val mark = SettingUtils.extraDeviceMark
+            if (mark.isNotBlank()) mark else "${Build.MANUFACTURER} ${Build.MODEL}".trim()
+        } catch (_: Exception) {
+            try { "${Build.MANUFACTURER} ${Build.MODEL}".trim() } catch (_: Exception) { "Android" }
+        }
+    }
+
     /** ★ 2026-08-17 方案C：采集设备状态（与 RelayServerService.buildDeviceState 同格式）
      *   用于响应 CMD_GET_DEV_STATE 主动探活。通过 App.context 获取系统服务，独立于 Service 实例。
      *   不修改 RelayServerService.buildDeviceState 可见性，避免影响被动5秒上报逻辑。 */
     private fun buildDeviceStateForQuery(): String {
         val ctx = App.context
-        // 名称：用户备注优先，否则用品牌+型号
-        val mark = SettingUtils.extraDeviceMark
-        val name = if (mark.isNotBlank()) mark else "${Build.MANUFACTURER} ${Build.MODEL}".trim()
+        // 名称：与 ver100000000 / 列表显示同源（见 selfDeviceName 的口径统一说明）
+        val name = selfDeviceName()
         // 锁屏状态
         var locked = false
         try {

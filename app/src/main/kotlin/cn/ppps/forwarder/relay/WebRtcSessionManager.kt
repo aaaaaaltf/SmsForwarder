@@ -61,9 +61,12 @@ class WebRtcSessionManager(
         //   背景：WebRTC媒体流默认P2P直连（仅STUN），公网NAT下打洞失败→只传1帧就停。
         //   修复：部署coturn提供relay候选 → 中继服务在线时媒体经中继服务器转发（中继优先）；
         //         中继离线时relay候选不可用，退化为TS/WiFi host直连（兜底）。
-        const val TURN_SERVER_URL = "turn:106.12.48.88:3478"
-        const val TURN_USERNAME = "remote"
-        const val TURN_PASSWORD = "admin123456"
+        // ★★★ 2026-10-04【凭据单一真源】原为硬编码，改密码时极易漏改（表现为 ICE 永远
+        //   checking、30 秒后回退 JPEG）。现直接引用 RelayProtocol（由
+        //   protocol/relay_protocol.json 经 tools/gen_relay_protocol.py 生成）。
+        const val TURN_SERVER_URL = RelayProtocol.TURN_URL
+        const val TURN_USERNAME = RelayProtocol.TURN_USERNAME
+        const val TURN_PASSWORD = RelayProtocol.TURN_PASSWORD
 
         private fun buildIceServers(relayPreferred: Boolean): List<PeerConnection.IceServer> {
             val servers = STUN_SERVERS.toMutableList()
@@ -178,6 +181,19 @@ class WebRtcSessionManager(
     //   重新输出关键帧，即使P帧解码失败也能在2秒内恢复画面。
     @Volatile private var keyFrameTimer: Thread? = null
     @Volatile private var videoTrackRef: org.webrtc.VideoTrack? = null
+
+    /** ★★★ 2026-10-04 屏幕 WebRTC 高清模式：true=采集【屏幕】(ScreenWebRtcCapturer) 而非摄像头。
+     *   除采集源外，会话初始化/信令/回退/看门狗全部与摄像头会话共用同一套代码路径。 */
+    @Volatile private var screenMode: Boolean = false
+
+    /** 屏幕模式的目标帧率（由控制端 OFFER 指定，缺省 12） */
+    @Volatile private var screenFps: Int = 12
+
+    /** ★★★ 2026-10-05【画面质量】屏幕高清的**人为分辨率上限**（控制端设置页档位下发，
+     *  经 OFFER 首段 `screen|<fps>|<maxW>|<maxH>|<b64>` 传入）。
+     *  0 或越界 ⇒ 采集器用自己的默认值 1280×720（= 改造前行为）。 */
+    @Volatile private var screenMaxW: Int = 0
+    @Volatile private var screenMaxH: Int = 0
     private val KEY_FRAME_INTERVAL_MS = 2000L
     /** ★★★ 2026-08-14 修复"只传一帧"：enable抖动必须保持disabled足够久（编码器感知帧中断才出关键帧）。
      *  立即 setEnabled(false→true) 两事件在同一次native消息队列合并 → VideoStreamEncoder感知不到中断 → 不出关键帧。 */
@@ -246,7 +262,9 @@ class WebRtcSessionManager(
      */
     @Synchronized
     fun startWithOffer(cameraFacing: Int, offerSdpBase64: String, cb: SignalingCallback,
-                       relayPreferred: Boolean = true) {
+                       relayPreferred: Boolean = true,
+                       screenMode: Boolean = false, screenFps: Int = 12,
+                       screenMaxW: Int = 0, screenMaxH: Int = 0) {
         val stepTag = "[WebRTC-INIT]"
         if (running) {
             Log.w(TAG, "$stepTag 已在运行中，先关闭旧会话")
@@ -254,6 +272,15 @@ class WebRtcSessionManager(
         }
         running = true
         this.relayPreferred = relayPreferred
+        // ★★★ 2026-10-04 屏幕高清模式：只换"采集源"，其余（信令/回退/看门狗/时间戳矫正）全部复用
+        this.screenMode = screenMode
+        this.screenFps = screenFps.coerceIn(5, 30)
+        // ★★★ 2026-10-05【画面质量】人为分辨率上限（控制端档位；0=采集器默认 1280×720）
+        this.screenMaxW = if (screenMaxW in 160..4096) screenMaxW else 0
+        this.screenMaxH = if (screenMaxH in 120..4096) screenMaxH else 0
+        Log.i(TAG, "$stepTag ★ 采集源=${if (screenMode) "手机屏幕(ScreenWebRtcCapturer ${screenFps}fps)" else "摄像头"}"
+                + "，screenMode=$screenMode"
+                + (if (this.screenMaxW > 0) "，分辨率上限=${this.screenMaxW}x${this.screenMaxH}" else "，分辨率上限=默认(1280x720)"))
         // ★ 2026-08-28 省电：启动"对端已走"存活看门狗（控制端掉线/被杀时自动释放摄像头+编码器+麦克风）
         iceReceiving = false
         lastInboundActivityTime = 0L
@@ -889,6 +916,16 @@ class WebRtcSessionManager(
      */
     @Synchronized
     fun switchCamera(facingTarget: Int) {
+        // ★★★ 2026-10-04 屏幕高清模式没有"切换镜头"概念：直接回"已就绪"，
+        //   不要走进 Camera2Capturer 强转分支打出误导性的"当前不是Camera2Capturer"告警。
+        if (screenMode) {
+            Log.i(TAG, "switchCamera: 当前是屏幕高清模式（采集屏幕），无摄像头可切换，忽略")
+            try {
+                signalingCallback?.onStatus("camera_switched", "屏幕共享中（无摄像头可切换）")
+            } catch (_: Throwable) {
+            }
+            return
+        }
         val vc = videoCapturer as? Camera2Capturer ?: run {
             Log.w(TAG, "switchCamera: 当前不是Camera2Capturer")
             return
@@ -1287,25 +1324,38 @@ class WebRtcSessionManager(
             return
         }
 
-        val enumerator = Camera2Enumerator(appContext)
-        val deviceNames = enumerator.deviceNames
-        Log.i(TAG, "$tag [v1] 摄像头枚举: 共${deviceNames.size}台 ${deviceNames.joinToString()}")
-        if (deviceNames.isEmpty()) {
-            throw RuntimeException("无可用摄像头（Camera2枚举为空）")
+        // ★★★ 2026-10-04 屏幕高清模式：跳过摄像头枚举/打开（不需要相机权限，也不占相机 HAL）
+        var enumerator: Camera2Enumerator? = null
+        var camName: String? = null
+        if (screenMode) {
+            Log.i(TAG, "$tag [v1] ★ 屏幕高清模式：跳过摄像头枚举（采集源=MediaProjection 屏幕）")
+            try {
+                signalingCallback?.onStatus("camera_opened", "屏幕共享中（采集手机屏幕）")
+            } catch (_: Throwable) {
+            }
+        } else {
+            val en = Camera2Enumerator(appContext)
+            enumerator = en
+            val deviceNames = en.deviceNames
+            Log.i(TAG, "$tag [v1] 摄像头枚举: 共${deviceNames.size}台 ${deviceNames.joinToString()}")
+            if (deviceNames.isEmpty()) {
+                throw RuntimeException("无可用摄像头（Camera2枚举为空）")
+            }
+            // ★ 2026-08-29 按"朝向意图"选镜头（0=后置/1=前置；越界值退化为数组下标 = 旧行为）
+            val (selected, actualFacing) = resolveCameraNameByFacing(en, deviceNames, facingTarget)
+            camName = selected
+            currentFacing = actualFacing
+            currentCameraName = selected
+            currentCameraIndex = deviceNames.indexOf(selected)
+            Log.i(TAG, "$tag [v2] 意图朝向=$facingTarget → 选中摄像头 #${currentCameraIndex}=$selected " +
+                    "实际朝向=${if (actualFacing == CameraStreamManager.FACING_FRONT) "前置" else "后置"} 回退=$facingFellBack")
+            try {
+                signalingCallback?.onStatus(
+                    "camera_opened",
+                    "已打开${if (actualFacing == CameraStreamManager.FACING_FRONT) "前置" else "后置"}摄像头 $selected" + facingSuffix()
+                )
+            } catch (_: Throwable) {}
         }
-        // ★ 2026-08-29 按"朝向意图"选镜头（0=后置/1=前置；越界值退化为数组下标 = 旧行为）
-        val (camName, actualFacing) = resolveCameraNameByFacing(enumerator, deviceNames, facingTarget)
-        currentFacing = actualFacing
-        currentCameraName = camName
-        currentCameraIndex = deviceNames.indexOf(camName)
-        Log.i(TAG, "$tag [v2] 意图朝向=$facingTarget → 选中摄像头 #${currentCameraIndex}=$camName " +
-                "实际朝向=${if (actualFacing == CameraStreamManager.FACING_FRONT) "前置" else "后置"} 回退=$facingFellBack")
-        try {
-            signalingCallback?.onStatus(
-                "camera_opened",
-                "已打开${if (actualFacing == CameraStreamManager.FACING_FRONT) "前置" else "后置"}摄像头 $camName" + facingSuffix()
-            )
-        } catch (_: Throwable) {}
 
         Log.i(TAG, "$tag [v3] SurfaceTextureHelper.create 开始...")
         surfaceTextureHelper = try {
@@ -1322,15 +1372,34 @@ class WebRtcSessionManager(
         }
         Log.i(TAG, "$tag [v4] createVideoSource 开始...")
         videoSource = try {
-            f.createVideoSource(false)
+            // ★ 屏幕模式必须 isScreencast=true：编码器据此按"屏幕内容"优化（静态画面显著降码率）
+            f.createVideoSource(screenMode)
         } catch (t: Throwable) {
             Log.e(TAG, "$tag [v4] createVideoSource 失败 type=${t.javaClass.name} msg=${t.message}", t)
             throw t
         }
-        Log.i(TAG, "$tag [v5] createCapturer($camName) 开始...")
-        val capturer = enumerator.createCapturer(camName, null)
-            ?: throw RuntimeException("Camera2 createCapturer failed for $camName")
-        Log.i(TAG, "$tag [v5] createCapturer 成功 ✓ capturer=$capturer")
+        val capturer: org.webrtc.VideoCapturer = if (screenMode) {
+            Log.i(TAG, "$tag [v5] ★ 屏幕采集：ScreenWebRtcCapturer（借用已授权的 MediaProjection）")
+            if (!ScreenStreamManager.isReady()) {
+                // ★ 未授权 → 必须显式报错，让控制端回退到 JPEG 老通道并提示用户授权，
+                //   绝不能"静默黑屏"（JPEG 通道的黑屏史就是靠"报错+回退"治好的）。
+                val reason = "被控端屏幕捕获未授权（需先在 App 内授权屏幕预览）"
+                Log.e(TAG, "$tag [v5] $reason")
+                try { signalingCallback?.onError(reason) } catch (_: Throwable) {}
+                throw RuntimeException(reason)
+            }
+            // ★ 2026-10-05【画面质量】把档位的分辨率上限交给采集器（0 已在上游被规范化，
+            //   这里再兜一层默认值，确保绝不会出现 maxW=0 导致采集尺寸被压到最小）
+            ScreenWebRtcCapturer(appContext,
+                    if (screenMaxW in 160..4096) screenMaxW else 1280,
+                    if (screenMaxH in 120..4096) screenMaxH else 720)
+        } else {
+            Log.i(TAG, "$tag [v5] createCapturer($camName) 开始...")
+            val cam = enumerator?.createCapturer(camName, null)
+                ?: throw RuntimeException("Camera2 createCapturer failed for $camName")
+            Log.i(TAG, "$tag [v5] createCapturer 成功 ✓ capturer=$cam")
+            cam
+        }
         videoCapturer = capturer
         Log.i(TAG, "$tag [v6] capturer.initialize 开始...")
         try {
@@ -1387,9 +1456,15 @@ class WebRtcSessionManager(
             Log.e(TAG, "$tag [v6] capturer.initialize 失败 type=${t.javaClass.name} msg=${t.message}", t)
             throw t
         }
-        Log.i(TAG, "$tag [v7] capturer.startCapture(640x480@10) 开始...（★★★ 2026-08-12 饥饿修复：20fps→10fps降低相机HAL+编码CPU负载）")
+        // ★ 屏幕高清模式：1280x720 @（控制端指定帧率）；摄像头模式保持 640x480@10
+        //   （摄像头那一档是 2026-08-12"饥饿修复"定下来的：降低相机 HAL + 编码 CPU 负载）
+        val capW = if (screenMode) 1280 else 640
+        val capH = if (screenMode) 720 else 480
+        val capFps = if (screenMode) screenFps else 10
+        Log.i(TAG, "$tag [v7] capturer.startCapture(${capW}x${capH}@${capFps}) 开始..."
+                + "（摄像头档 640x480@10 为 2026-08-12 饥饿修复口径）")
         try {
-            capturer.startCapture(640, 480, 10)
+            capturer.startCapture(capW, capH, capFps)
         } catch (t: Throwable) {
             Log.e(TAG, "$tag [v7] startCapture 失败 type=${t.javaClass.name} msg=${t.message}", t)
             throw t

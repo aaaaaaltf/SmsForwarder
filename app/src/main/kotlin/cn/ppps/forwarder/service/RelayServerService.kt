@@ -58,9 +58,20 @@ class RelayServerService : Service() {
     // ★ Tailscale直连扫描器（中继关闭时自动发现控制端，与PC被控端扫描兜底一致）
     private var tsScanner: TailscaleDirectScanner? = null
 
+    // ★★★ 2026-10-04【中继/直连 严格互斥】直连任务的启动闭包。
+    //   用户要求：中继模式开启时被控端不得运行任何直连任务（直连监听56786 / TS扫描56789 / TS直连客户端）。
+    //   该闭包在 start() 内组装（需要 onDirectCommand 等局部量），只有确认"中继模式未开启"时才被调用；
+    //   运行中由中继切到直连时，applyModeExclusivity() 再次调用它（内部有判空守卫，幂等）。
+    private var startDirectTasks: (() -> Unit)? = null
+
     companion object {
         /** ★ 省电：忙时设备状态上报间隔（与历史行为一致） */
         private const val STATE_REPORT_BUSY_MS = 5000L
+
+        /** ★★★ 2026-10-04【模式互斥】直连任务启动前的"中继确认宽限"：
+         *  中继连接是异步的（约1~3秒），若在服务启动瞬间同步判断，会漏跑一段直连任务
+         *  （用户实测"中继模式下仍看到直连任务"）。宽限 6 秒后仍非中继模式，才启用直连兜底。 */
+        private const val DIRECT_TASK_GRACE_MS = 6000L
 
         /** ★ 省电：灭屏且无控制端连接时的状态上报间隔 */
         private const val STATE_REPORT_IDLE_MS = 30000L
@@ -300,6 +311,8 @@ class RelayServerService : Service() {
                 // ★ 2026-08-16 中继联动：中继正常 → 关闭 Tailscale VPN（节省资源，Go 后端保留）
                 cn.ppps.forwarder.tailscale.TailscaleManager.setRelayConnected(this, true)
             }
+            // ★★★ 2026-10-04【模式互斥】中继连上 → 立即停掉直连监听/TS扫描（幂等）
+            applyModeExclusivity("中继已连接")
         }
         val onDisconnected: () -> Unit = {
             isConnected = false
@@ -313,6 +326,9 @@ class RelayServerService : Service() {
                 // ★ 2026-08-16 中继联动：中继不可用 → 自动开启 Tailscale 直连
                 cn.ppps.forwarder.tailscale.TailscaleManager.setRelayConnected(this, false)
             }
+            // ★★★ 2026-10-04【模式互斥】断开后按"当前模式"重新裁决：
+            //   权威状态仍为"中继开"→ 直连任务继续保持关闭（等中继自己重连）；否则启用直连兜底。
+            applyModeExclusivity("中继断开")
             // ★ 中继断开后由 TailscaleDirectScanner 自动探测并建立 TS 直连（扫描器每15秒探测56789），
             //   不再自动操作 Tailscale 开关（2026-08-13 取消：避免无障碍窗口出现在被控端；Tailscale 无公开API可编程开关）
         }
@@ -351,6 +367,9 @@ class RelayServerService : Service() {
                         System.currentTimeMillis() + 180_000L
                     cn.ppps.forwarder.tailscale.TailscaleManager.serverRelayStateValue = on
                     cn.ppps.forwarder.tailscale.TailscaleManager.setRelayConnected(this, on)
+                    // ★★★ 2026-10-04【模式互斥】总闸变化 → 立即启停直连任务
+                    //   （on：停 56786 监听 + 56789 扫描；off：启用直连兜底）
+                    applyModeExclusivity("relayst=$st")
                 } else {
                     Log.w(TAG, "中继状态推送负载异常: ${payload.size}字节，忽略")
                 }
@@ -423,6 +442,11 @@ class RelayServerService : Service() {
         // 摄像头推流复用中继连接发送视频帧（直连预览时被控端视频仍经中继56788推流）
         cn.ppps.forwarder.relay.CameraStreamManager.setClient(c)
 
+        // ★★★ 2026-10-04【模式互斥·直连任务只在"中继模式未开启"时才启动】
+        //   把下面"直连监听(56786) + TS扫描(56789)"整段收进本地函数：
+        //   · 现在不直接调用，而是存入字段 startDirectTasks，由 applyModeExclusivity() 裁决后调用；
+        //   · 启动后有 DIRECT_TASK_GRACE_MS 宽限（等中继握手结果），避免漏跑。
+        fun startDirectTasksLocal() {
         // ★ 同时启动直连监听(56786)：接受控制端 TS/局域网直连（中继关闭时仍可被控制，恢复原直连能力）
         if (listener == null) {
             // 回调里要用到"正在构造的这个监听器"，构造参数里自引用无法编译，
@@ -464,12 +488,19 @@ class RelayServerService : Service() {
             cn.ppps.forwarder.relay.CameraStreamManager.addSender(l)
         }
         // ★ Tailscale直连：设置启动器（收到ztdirect0000时触发主动连接控制端56789，兜底通道）
+        //   ★ 2026-10-04【模式互斥】再兜一层：万一在"中继模式"下被调用也直接忽略，绝不建立直连。
         RelayServerHandler.tsDirectLauncher = { phoneIp, port ->
-            startTailscaleDirect(phoneIp, port)
+            if (isRelayModeOn()) {
+                Log.i(TAG, "★ 模式互斥：中继模式 → 忽略 ztdirect 直连触发 ($phoneIp:$port)")
+            } else {
+                startTailscaleDirect(phoneIp, port)
+            }
         }
         // ★ Tailscale直连扫描兜底：中继关闭时自动发现手机控制端并主动连接（与PC被控端一致）
         // ★ 2026-08-16 修复：多控制端场景下持续扫描所有未连接的控制端（华为+红米控制端并存），
         //   每台控制端各自建立独立直连。已连接的控制端IP由 connectedIps 提供，扫描时跳过。
+        // ★ 2026-10-04【模式互斥】判空守卫：本函数可能被 applyModeExclusivity() 多次调用（切模式时）
+        if (tsScanner == null) {
         tsScanner = TailscaleDirectScanner(
             isDirectActive = { tsDirectClients.values.any { it.isConnected() } },
             onDirectFound = { phoneIp, port -> startTailscaleDirect(phoneIp, port) },
@@ -482,6 +513,18 @@ class RelayServerService : Service() {
             // ★ 2026-08-27 省电：灭屏且无人连接时直连扫描自动降频（详见 TailscaleDirectScanner）
             isBusy = { isBusyNow() },
         ).also { it.start() }
+        }   // ← 结束 if (tsScanner == null)
+        }   // ← 结束本地函数 startDirectTasksLocal()
+        // ★ 存入字段：运行中"由中继切到直连"时由 applyModeExclusivity() 再次调用（幂等）
+        startDirectTasks = { startDirectTasksLocal() }
+        // ★★★ 2026-10-04【模式互斥】宽限 DIRECT_TASK_GRACE_MS 后再裁决：
+        //   中继连接是异步的（约1~3秒），立即判断会在中继模式下的启动瞬间漏跑一段直连任务
+        //   （用户实测现象）。宽限后仍非中继模式 → 启用直连兜底。
+        Timer("ModeExclusivityGrace", true).schedule(object : TimerTask() {
+            override fun run() {
+                applyModeExclusivity("启动宽限${DIRECT_TASK_GRACE_MS / 1000}秒")
+            }
+        }, DIRECT_TASK_GRACE_MS)
         // ★ 启动设备状态周期上报（忙时5秒，待机30秒）
         startStateReport()
     }
@@ -610,6 +653,86 @@ class RelayServerService : Service() {
         return p[1].toIntOrNull()?.let { it in 64..127 } ?: false
     }
 
+    // ============================================================
+    // ★★★ 2026-10-04【中继/直连 严格互斥】
+    // ------------------------------------------------------------
+    // 用户要求：中继模式开启时，被控端不得运行任何直连任务；直连模式下不得运行中继任务。
+    // 真源优先级：① 服务器 relayst 推送/同机广播的权威状态（180s 窗口内）
+    //             ② 无权威信号时回落到"中继真的连着"的传输层事实
+    // 现场缺陷（用户实测）：中继模式下 56786 直连监听 + TS 扫描器仍在跑。
+    // ============================================================
+
+    /**
+     * ★ 当前是否"中继模式开启"（★ 只看**开关/权威状态**，绝不看可达性）。
+     *
+     * 用户 2026-09-28 拍板（记忆 feedback_channel_by_switch）：中继开关是最高优先级指令，
+     * 可达性只作显示、不得参与"走哪条通道"的决策 ⇒ 中继模式开启时即使中继暂时不可达，
+     * 也只等待重试，**不得**启用任何直连任务。
+     * 取值优先级：① 服务器总闸（唯一权威，粘性值，不因 180s 窗口过期而翻转）
+     *            ② 同机控制端广播的权威值
+     *            ③ 从未收到任何权威状态（全新安装/服务端未推送）→ 用"中继通道是否连着"兜底
+     */
+    private fun isRelayModeOn(): Boolean = try {
+        val tm = cn.ppps.forwarder.tailscale.TailscaleManager
+        when {
+            tm.serverRelayStateFreshUntil != 0L -> tm.serverRelayStateValue
+            tm.externalRelayStateUntil != 0L -> tm.externalRelayStateOn
+            else -> tm.isRelayConnected() || (client?.isConnected() == true)
+        }
+    } catch (e: Throwable) {
+        client?.isConnected() == true
+    }
+
+    /**
+     * ★ 按当前模式裁决直连任务的存亡（幂等，可高频调用）。
+     *
+     * · 中继模式开启 → 停掉：直连监听(56786) + TS扫描器(56789) + 全部 TS 直连客户端；
+     * · 否则（直连模式/中继不可达）→ 启用直连任务（startDirectTasks 闭包，内部判空守卫）。
+     */
+    private fun applyModeExclusivity(reason: String) {
+        val relayOn = isRelayModeOn()
+        if (relayOn) {
+            listener?.let {
+                Log.i(TAG, "★ 模式互斥($reason)：中继模式 → 停止直连监听(56786)")
+                try {
+                    it.stop()
+                } catch (e: Exception) {
+                    Log.w(TAG, "停止直连监听异常: ${e.message}")
+                }
+                try {
+                    cn.ppps.forwarder.relay.CameraStreamManager.removeSender(it)
+                } catch (_: Exception) {
+                }
+            }
+            listener = null
+            tsScanner?.let {
+                Log.i(TAG, "★ 模式互斥($reason)：中继模式 → 停止TS直连扫描(56789)")
+                try {
+                    it.stop()
+                } catch (e: Exception) {
+                    Log.w(TAG, "停止TS扫描异常: ${e.message}")
+                }
+            }
+            tsScanner = null
+            if (tsDirectClients.isNotEmpty()) {
+                Log.i(TAG, "★ 模式互斥($reason)：中继模式 → 断开 ${tsDirectClients.size} 条TS直连")
+                tsDirectClients.values.forEach {
+                    try {
+                        cn.ppps.forwarder.relay.CameraStreamManager.removeSender(it)
+                        it.stop()
+                    } catch (_: Exception) {
+                    }
+                }
+                tsDirectClients.clear()
+            }
+        } else {
+            if (listener == null && tsScanner == null) {
+                Log.i(TAG, "★ 模式互斥($reason)：非中继模式 → 启用直连任务（监听56786 + TS扫描56789）")
+            }
+            startDirectTasks?.invoke()
+        }
+    }
+
     /** 启动设备状态周期上报定时器：忙时每5秒，待机时每30秒发送 devstate0000（名称|锁屏|屏幕|电量|充电） */
     private fun startStateReport() {
         if (stateTimer != null) return
@@ -631,6 +754,9 @@ class RelayServerService : Service() {
             t.schedule(object : TimerTask() {
                 override fun run() {
                     try {
+                        // ★★★ 2026-10-04【模式互斥·兜底裁决】每轮状态上报都重新对齐一次（幂等、零额外开销），
+                        //   覆盖"同机控制端广播 RELAY_STATE_CHANGED"等不经本服务回调的状态来源。
+                        applyModeExclusivity("状态节拍")
                         val state = buildDeviceState()
                         // ★ 设备状态上报：中继连接 + 直连监听（广播所有已接入控制端）+ TS直连（广播所有控制端）
                         client?.send(RelayCommands.CMD_DEV_STATE, state)

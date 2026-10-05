@@ -33,9 +33,15 @@ object ScreenStreamManager {
 
     private const val TAG = "ScreenStreamManager"
 
-    /** 推流分辨率上限（★ 2026-08-06修复：原代码定义了但未使用，全屏1080x2400推流在弱网下帧过大TCP写阻塞→黑屏） */
-    private const val MAX_WIDTH = 1280
-    private const val MAX_HEIGHT = 720
+    /** 推流分辨率上限的**默认值**（★ 2026-08-06修复：原代码定义了但未使用，全屏1080x2400推流在弱网下帧过大TCP写阻塞→黑屏）
+     *
+     *  ★★★ 2026-10-05【画面质量】改为"默认值"而非唯一值：控制端设置页的
+     *    「手机被控端屏幕预览」档位会随 rdstrt 负载下发 `w=`/`h=`（见
+     *    android_controller 的 core/QualityProfile.java 与这里 startStream 的
+     *    maxWidth/maxHeight 参数）。控制端不带（旧版本）⇒ 用这两个默认值，
+     *    行为与改造前逐字节一致。 */
+    private const val DEFAULT_MAX_WIDTH = 1280
+    private const val DEFAULT_MAX_HEIGHT = 720
 
     /**
      * ★ 2026-08-28 省电：帧节拍等待上限。
@@ -52,6 +58,20 @@ object ScreenStreamManager {
 
     /** 写阻塞看门狗阈值：超过该时间未成功发完一帧则强制断开，允许控制端重试重建推流（★ 2026-08-06新增） */
     private const val WRITE_WATCHDOG_MS = 10000L
+
+    // ===== ★★★ 2026-10-05【自适应码率】常量（对照 rustdesk video_qos.rs）=====
+    /** 评估周期（同 ADJUST_RATIO_INTERVAL=3s） */
+    private const val QOS_ADJUST_INTERVAL_MS = 3000L
+    /** 质量下限：再低画面不可用（类比 BR_MIN=0.2 的下界思想） */
+    private const val QUALITY_MIN = 25
+    /** 拥塞判据：写出耗时 EMA 超过此值（ms）——对应 DELAY_THRESHOLD_150MS=150，JPEG 写出更快故取 90 */
+    private const val QOS_CONGEST_EMA_MS = 90.0
+    /** 宽裕判据：低于此值才有资格升档，留滞回带防抖 */
+    private const val QOS_SMOOTH_EMA_MS = 35.0
+    /** 连续 N 次拥塞才降档（对应 consecutive_bad_samples>=2） */
+    private const val QOS_CONGEST_GUARD = 2
+    /** 连续 N 次宽裕才升档（对应 RESTORE_GUARD_SAMPLES=5，取 3 更快恢复） */
+    private const val QOS_RESTORE_GUARD = 3
 
     /** 最近一次成功发送帧的时间戳（看门狗用） */
     @Volatile
@@ -85,6 +105,17 @@ object ScreenStreamManager {
     /** 是否已完成屏幕捕获授权 */
     fun isReady(): Boolean = projection != null
 
+    /**
+     * ★★★ 2026-10-04 屏幕 WebRTC 高清模式用：把【已授权的 MediaProjection 实例】借给
+     * `ScreenWebRtcCapturer`。
+     *
+     * 为什么不让它自己用保存的 resultCode/Intent 再 `getMediaProjection` 一次：
+     * Android 14+ 对同一个授权 token 调 `getMediaProjection` 会抛异常（"只能用一次"），
+     * 而且这里本来就已有一个活着的实例。借用方**只建 VirtualDisplay/ImageReader**，
+     * 停止时只释放自己建的这些，绝不动投影实例本身（JPEG 预览还要继续用它）。
+     */
+    fun currentProjection(): android.media.projection.MediaProjection? = projection
+
     /** 由 ScreenProjectionService 设置已授权的 MediaProjection */
     fun setProjection(p: MediaProjection?) {
         if (p != null) {
@@ -98,6 +129,84 @@ object ScreenStreamManager {
 
     fun isStreaming(): Boolean = running
 
+    // ==================== ★★★ 2026-10-05【自适应码率】====================
+    //  对照 rustdesk/src/server/video_qos.rs：
+    //    · BR_MIN=0.2/BR_MIN_HIGH_RESOLUTION=0.1（码率下界）、ADJUST_RATIO_INTERVAL=3s（调整冷却）
+    //    · ratio_reduction() 分档 ×0.85/0.8/0.7…（:227-248），要求 consecutive_bad_samples>=2 才动作
+    //    · 升档保守：延迟 <50ms 才 ×1.15、<100ms 才 ×1.1（:775-785），RESTORE_GUARD_SAMPLES=5 防抖动
+    //  本项目没有可调码率的编码器（纯 JPEG 字节流），**把 ratio 语义映射为 JPEG 质量**：
+    //    质量 ↓ ⇒ 每帧字节数 ↓ ⇒ 码率 ↓（分辨率与帧率不动，避免观众侧画面尺寸跳变）。
+    //  拥塞信号取**本端写出耗时**（write+flush 的 EMA）——它直接反映"链路堵不堵"，
+    //  与 RustDesk 用 TestDelay 往返测 RTT 同源，但**零协议改动**（不需要控制端配合）。
+    /** 控制端下发的原始质量（作为自适应上限参考，不被修改） */
+    @Volatile private var startQuality: Int = 50
+    /** 当前实际用于编码的 JPEG 质量（由自适应调整） */
+    @Volatile private var qosQuality: Int = 50
+    private var qosBadSamples = 0
+    private var qosGoodSamples = 0
+    private var qosEmaMs = 0.0
+    private var qosLastAdjustAt = 0L
+
+    // ★★★ 2026-10-05【软编降分辨率 half-scale（对照 RustDesk `enable-android-software-encoding-half-scale`）】
+    //   为什么需要：上方的自适应只有"质量"这一维，而 JPEG 质量有实用下限（QUALITY_MIN=25，
+    //   再低画面就不可用了）。一旦**质量已触底但链路仍拥塞**，自适应就彻底失去手段 ——
+    //   而这条链路是纯软编（Bitmap.compress，单线程 libjpeg-turbo），
+    //   **编码耗时与本帧像素数近似成正比** ⇒ 分辨率减半 = 像素数减到 1/4 ⇒
+    //   编码耗时和后端写出字节数同时大幅下降。这是"质量已无路可退"之后的最后一档。
+    //   ★ 只在触底后启用、且优先于升质量恢复（分辨率对观感的影响大于质量档位）。
+    @Volatile private var qosHalfScale: Boolean = false
+
+    /**
+     * 自适应质量：每 [QOS_ADJUST_INTERVAL_MS] 评估一次，拥塞降档、持续宽裕升档。
+     * @param writeMs 本次写出的真实耗时（毫秒）
+     */
+    private fun updateQos(writeMs: Long) {
+        // 发送耗时 EMA（0.8/0.2，与 PC 侧 rd_stream_hub._Sink 同口径）
+        qosEmaMs = if (qosEmaMs <= 0.0) writeMs.toDouble()
+                   else qosEmaMs * 0.8 + writeMs * 0.2
+        val now = System.currentTimeMillis()
+        if (now - qosLastAdjustAt < QOS_ADJUST_INTERVAL_MS) return
+        qosLastAdjustAt = now
+        val congested = qosEmaMs > QOS_CONGEST_EMA_MS
+        val relaxed = qosEmaMs < QOS_SMOOTH_EMA_MS
+        if (congested) {
+            qosBadSamples++; qosGoodSamples = 0
+        } else if (relaxed) {
+            qosGoodSamples++; qosBadSamples = 0
+        } else {
+            // 中间地带：保持现状，不消耗降/升档预算（同 video_qos.rs:747-752）
+            qosBadSamples = 0; qosGoodSamples = 0
+            return
+        }
+        if (qosBadSamples >= QOS_CONGEST_GUARD) {
+            qosBadSamples = 0
+            val old = qosQuality
+            val new = maxOf(QUALITY_MIN, (old * 0.85).toInt())
+            if (new < old) {
+                qosQuality = new
+                Log.i(TAG, "自适应码率↓ 拥塞(ema=${"%.0f".format(qosEmaMs)}ms) 质量 $old→$new")
+            } else if (!qosHalfScale) {
+                // ★ 质量已触底仍拥塞 → 启用半分辨率（最后一档手段，见 qosHalfScale 注释）
+                qosHalfScale = true
+                Log.i(TAG, "自适应码率↓ 质量已触底($QUALITY_MIN)仍拥塞(ema=${"%.0f".format(qosEmaMs)}ms) → 启用半分辨率")
+            }
+        } else if (qosGoodSamples >= QOS_RESTORE_GUARD) {
+            qosGoodSamples = 0
+            if (qosHalfScale) {
+                // ★ 恢复顺序：先还原分辨率，再升质量（分辨率对观感的权重更高）
+                qosHalfScale = false
+                Log.i(TAG, "自适应码率↑ 宽裕(ema=${"%.0f".format(qosEmaMs)}ms) → 先恢复全分辨率")
+            } else {
+                val old = qosQuality
+                val new = minOf(startQuality, (old * 1.08).toInt() + 1)
+                if (new > old) {
+                    qosQuality = new
+                    Log.i(TAG, "自适应码率↑ 宽裕(ema=${"%.0f".format(qosEmaMs)}ms) 质量 $old→$new")
+                }
+            }
+        }
+    }
+
     /**
      * 启动屏幕推流
      * @param relayHost 中继服务器地址
@@ -109,7 +218,8 @@ object ScreenStreamManager {
      */
     @Synchronized
     fun startStream(relayHost: String, clientId: Int, fps: Int, quality: Int,
-                    channel: Int = cn.ppps.forwarder.relay.RelayServerHandler.CHANNEL_RELAY): Boolean {
+                    channel: Int = cn.ppps.forwarder.relay.RelayServerHandler.CHANNEL_RELAY,
+                    maxWidth: Int = 0, maxHeight: Int = 0): Boolean {
         val proj = projection
         if (proj == null) {
             Log.w(TAG, "屏幕捕获未授权，无法推流")
@@ -121,6 +231,25 @@ object ScreenStreamManager {
         }
         val safeFps = fps.coerceIn(1, 30)
         val safeQuality = quality.coerceIn(10, 90)
+        // ★★★ 2026-10-05【画面质量】分辨率上限来自控制端设置页的档位（rdstrt 负载的 `w=`/`h=`）。
+        //   合法性夹取与三端口径一致（160..4096 / 120..4096，越界即视为"未指定"）；
+        //   未指定 ⇒ 用 DEFAULT_*（= 改造前写死的 1280×720），行为不变。
+        val safeMaxW = if (maxWidth in 160..4096) maxWidth else DEFAULT_MAX_WIDTH
+        val safeMaxH = if (maxHeight in 120..4096) maxHeight else DEFAULT_MAX_HEIGHT
+        Log.i(TAG, "★ 画面质量: fps=$safeFps 质量=$safeQuality 分辨率上限=${safeMaxW}x${safeMaxH}" +
+                if (maxWidth in 160..4096) "（控制端指定）" else "（控制端未指定，用默认）")
+        // ★★★ 2026-10-05【自适应码率】把质量控制权从"启动时定死"改为"运行期自适应"：
+        //   `qosQuality` 是**当前实际用于编码的质量**，由推流循环按发送耗时/丢帧周期调整；
+        //   `startQuality` 保留控制端下发的原始目标值作为上限参考。
+        //   对照 rustdesk/src/server/video_qos.rs:731-815（adjust_ratio 降码率、775-785 分档升档）。
+        startQuality = safeQuality
+        qosQuality = safeQuality
+        qosBadSamples = 0
+        qosGoodSamples = 0
+        qosEmaMs = 0.0
+        qosLastAdjustAt = 0L
+        // ★ 新会话必须复位半分辨率开关，否则上一段的降级会莫名其妙地延续到新会话
+        qosHalfScale = false
         val safeClientId = if (clientId >= 0) clientId else 0
         // ★ 2026-08-05修复：推流模式由命令来源通道决定（而非本机中继连接状态）——
         //   命令经中继到达 → 主动连中继56788(PUSHER认证)；
@@ -135,7 +264,8 @@ object ScreenStreamManager {
         running = true
         val t = Thread({
             try {
-                runStreamSession(relayHost, safeClientId, safeFps, safeQuality)
+                runStreamSession(relayHost, safeClientId, safeFps, safeQuality, channel,
+                        safeMaxW, safeMaxH)
             } finally {
                 // ★ 走到这里说明本线程的建流+采集已彻底结束（正常断开，或所有失败路径都走完）。
                 //   CAS 成功 = 所有权仍在本线程 → 归位 running 并释放 VirtualDisplay/ImageReader，
@@ -159,53 +289,65 @@ object ScreenStreamManager {
      * 建流线程体：中继 PUSHER 优先，连不上再回退本机监听等待控制端直连收流。
      * 由 [startStream] 创建的 ScreenStreamThread 调用，返回后由该线程的 finally 统一收尾。
      */
-    private fun runStreamSession(relayHost: String, safeClientId: Int, safeFps: Int, safeQuality: Int) {
-            // ★★★ 2026-08-15 屏幕预览"无图像"修复（v2 智能模式）：
-            //   【根因】控制端(华为)请求走TS直连通道 → 本端按channel监听56888等直连；但控制端实际
-            //     连的是中继服务器56888（getVideoHostForDevice对TS设备取被控端Tailscale IP）→ 两端通道不匹配 → 控制端永远收不到帧（无图像）。
-            //   【修复·智能模式】优先中继PUSHER（控制端中继优先必配对成功）；仅当中继连接失败
-            //     （端口不通/超时）才回退直连监听——两端主/兜底通道对应，无闲置线程。
-            var usedRelay = false
-            try {
-                val cs = Socket()
-                cs.tcpNoDelay = true
-                cs.connect(InetSocketAddress(relayHost, RelayCommands.RELAY_VIDEO_PORT), 8000)
-                if (!running) {
-                    try { cs.close() } catch (_: Exception) {}
-                    return
-                }
-                usedRelay = true
-                socket = cs
-                Log.i(TAG, "中继通道已建立 $relayHost:${RelayCommands.RELAY_VIDEO_PORT}，发送PUSHER认证")
-                val out = cs.getOutputStream()
-                out.write("PUSHER:$safeClientId\n".toByteArray(Charsets.UTF_8))
-                out.flush()
-                startCapture(cs, out, safeFps, safeQuality)
-            } catch (e: Exception) {
-                if (usedRelay) {
-                    // 中继已连但推流中断（写阻塞看门狗/断流）：仅记录，不重复回退
-                    if (running) Log.e(TAG, "中继推流中断: ${e.message}")
-                } else {
-                    // 中继连接失败 → 智能回退直连监听（等待控制端直接接入）
-                    Log.e(TAG, "中继通道不可用(${e.message})，回退直连监听")
-                    try {
-                        val ss = ServerSocket()
-                        ss.reuseAddress = true
-                        ss.bind(InetSocketAddress("0.0.0.0", RelayCommands.RELAY_VIDEO_PORT))
-                        serverSocket = ss
-                        Log.i(TAG, "直连通道已监听 ${RelayCommands.RELAY_VIDEO_PORT}，等待控制端接入...")
-                        val accepted = if (running) ss.accept() else null
-                        if (accepted != null) {
-                            accepted.tcpNoDelay = true
-                            socket = accepted
-                            Log.i(TAG, "控制端已直连接入屏幕推流: ${accepted.inetAddress.hostAddress}")
-                            val out = accepted.getOutputStream()
-                            startCapture(accepted, out, safeFps, safeQuality)
-                        }
-                    } catch (e2: Exception) {
-                        if (running) Log.e(TAG, "屏幕推流启动失败: ${e2.message}")
+    private fun runStreamSession(relayHost: String, safeClientId: Int, safeFps: Int, safeQuality: Int,
+                                 channel: Int,
+                                 safeMaxW: Int, safeMaxH: Int) {
+            // ★★★ 2026-10-04【根因修复·控制端直连时"屏幕预览没有图像"】
+            //   现场（2026-10-04 19:12 华为→红米，直连模式）：控制端连 **红米 TailscaleIP:56783**
+            //   报 `ECONNREFUSED`，红米侧 19:12:14.983 建了 VirtualDisplay("ScreenPreview")、
+            //   0.7 秒后又被移除。
+            //   原因：**本方法无视命令来源通道，永远先 `connect(中继:56783)`**；而控制端在直连模式
+            //   下按 `getVideoHostForDevice` 取的是**被控端 Tailscale IP**、等着本端 **listen**。
+            //   ⇒ 本端连完中继就不监听 → 控制端必然被拒；随后建流线程因无配对方结束 → display 移除。
+            //   （`startStream` 的 `channel` 入参此前完全未被使用，第 141-143 行注释甚至断言
+            //     "channel 不决定推流模式" —— 那正是 2026-08-05 撤销旧逻辑时留下的坑。）
+            //   ★ 修法：**推流模式由命令来源通道决定**（恢复 2026-08-05 的设计）：
+            //       channel==CHANNEL_RELAY（命令经中继到达） → 本端 PUSHER 连中继 56783；
+            //       channel!=CHANNEL_RELAY（直连 56786 / TS直连 56789 到达） → 本端 listen 56783 等控制端连入；
+            //     各自保留"另一条路兜底"，避免单边失败就彻底无画面。
+            val viaRelay = (channel == cn.ppps.forwarder.relay.RelayServerHandler.CHANNEL_RELAY)
+            Log.i(TAG, "★ 屏幕推流通道决策：命令来源=${if (viaRelay) "中继" else "直连/TS直连"} → "
+                    + (if (viaRelay) "本端PUSHER连中继$relayHost:${RelayCommands.RELAY_VIDEO_PORT}"
+                       else "本端监听0.0.0.0:${RelayCommands.RELAY_VIDEO_PORT}等控制端连入"))
+            if (viaRelay) {
+                // —— A. 命令来自中继 → 本端主动连中继（PUSHER）
+                try {
+                    val cs = Socket()
+                    cs.tcpNoDelay = true
+                    cs.connect(InetSocketAddress(relayHost, RelayCommands.RELAY_VIDEO_PORT), 8000)
+                    if (!running) {
+                        try { cs.close() } catch (_: Exception) {}
+                        return
                     }
+                    socket = cs
+                    Log.i(TAG, "中继通道已建立 $relayHost:${RelayCommands.RELAY_VIDEO_PORT}，发送PUSHER认证")
+                    val out = cs.getOutputStream()
+                    out.write("PUSHER:$safeClientId\n".toByteArray(Charsets.UTF_8))
+                    out.flush()
+                    startCapture(cs, out, safeFps, safeQuality, safeMaxW, safeMaxH)
+                    return
+                } catch (e: Exception) {
+                    if (!running) return
+                    Log.e(TAG, "中继通道不可用(${e.message})，回退本机监听等待控制端直连")
                 }
+            }
+            // —— B. 直连/TS直连（本端监听），或 A 失败后的兜底
+            try {
+                val ss = ServerSocket()
+                ss.reuseAddress = true
+                ss.bind(InetSocketAddress("0.0.0.0", RelayCommands.RELAY_VIDEO_PORT))
+                serverSocket = ss
+                Log.i(TAG, "直连通道已监听 ${RelayCommands.RELAY_VIDEO_PORT}，等待控制端接入...")
+                val accepted = if (running) ss.accept() else null
+                if (accepted != null) {
+                    accepted.tcpNoDelay = true
+                    socket = accepted
+                    Log.i(TAG, "控制端已直连接入屏幕推流: ${accepted.inetAddress.hostAddress}")
+                    val out = accepted.getOutputStream()
+                    startCapture(accepted, out, safeFps, safeQuality, safeMaxW, safeMaxH)
+                }
+            } catch (e2: Exception) {
+                if (running) Log.e(TAG, "屏幕推流启动失败: ${e2.message}")
             }
     }
 
@@ -259,15 +401,18 @@ object ScreenStreamManager {
         projection = null
     }
 
-    private fun startCapture(s: Socket, out: OutputStream, fps: Int, quality: Int) {
+    private fun startCapture(s: Socket, out: OutputStream, fps: Int, quality: Int,
+                             maxW: Int, maxH: Int) {
         val proj = projection ?: return
         val metrics = cn.ppps.forwarder.App.context.resources.displayMetrics
         // ★ 2026-08-06修复：限制推流分辨率（原代码直接用全屏尺寸1080x2400，每帧JPEG 200KB+，
         //   弱网（TS隧道丢包/高延迟）下TCP写阻塞帧传不出去→黑屏）。
-        //   按比例缩放到 MAX_WIDTH/MAX_HEIGHT 以内，帧体积缩小数倍，弱网传输成功率大增。
+        //   按比例缩放到上限以内，帧体积缩小数倍，弱网传输成功率大增。
+        // ★★★ 2026-10-05【画面质量】上限改为**控制端下发**（原为写死的 DEFAULT_MAX_WIDTH/HEIGHT），
+        //   仍只做"上限"用（scale 取 min(...,1f)，只缩不放）⇒ 给小尺寸永远安全。
         var width = metrics.widthPixels
         var height = metrics.heightPixels
-        val scale = minOf(MAX_WIDTH.toFloat() / width, MAX_HEIGHT.toFloat() / height, 1f)
+        val scale = minOf(maxW.toFloat() / width, maxH.toFloat() / height, 1f)
         if (scale < 1f) {
             width = (width * scale).toInt().coerceAtLeast(320)
             height = (height * scale).toInt().coerceAtLeast(320)
@@ -356,16 +501,23 @@ object ScreenStreamManager {
                     continue
                 }
                 noImageWaits = NO_IMAGE_WAIT_MS
-                val jpeg = imageToJpeg(image, quality)
+                // ★ 2026-10-05【自适应码率】用运行期自适应质量编码（而非启动时定死的 quality）
+                val jpeg = imageToJpeg(image, qosQuality)
                 image.close()
                 if (jpeg == null || jpeg.isEmpty()) continue
+                // ★ 2026-10-05【借鉴点④】冻结/退化帧检测（与 PC 侧 rd_stream_hub._check_degenerate 同口径）
+                checkDegenerate(jpeg.size)
                 // 帧格式: [4字节大端长度][JPEG]
                 val header = ByteBuffer.allocate(4).putInt(jpeg.size).array()
+                // ★ 测量"写出真实耗时"作为拥塞信号（write+flush，含 TCP 背压等待）
+                val t0 = System.currentTimeMillis()
                 synchronized(s) {
                     out.write(header)
                     out.write(jpeg)
                     out.flush()
                 }
+                val writeMs = System.currentTimeMillis() - t0
+                updateQos(writeMs)
                 lastSend = now
                 lastSendTime = now
             }
@@ -395,7 +547,45 @@ object ScreenStreamManager {
         }
     }
 
-    /** RGBA_8888 图像转 JPEG */
+    // ============================================================
+    // ★★★ 2026-10-05【借鉴点④：冻结/退化帧检测】
+    //   对齐 RustDesk src/server/vram.rs:120-142（AMF 连续 30 帧编码长度 <100 且**恒定** → 判卡死）。
+    //   价值在于**发现"不报错的故障"**：采集/编码管线退化时既不抛异常也不超时、
+    //   socket 依旧通畅，从常规指标看一切正常，只有"输出退化成常数"这一个可观测迹象。
+    //   ★ 与"静止画面"不冲突：纯色 720p JPEG 也有数 KB，<100 字节且长度完全一致
+    //     在正常编码下几乎不可能出现。
+    // ============================================================
+    // ★ 注意：本文件是 `object`（单例），**不能再声明 companion object**（Kotlin 禁止），
+    //   常量直接写在对象体内即可（原写法会导致 "Object cannot have companion object" 编译失败）。
+    /** 视为"退化输出"的字节上限 */
+    private const val DEGENERATE_MAX_BYTES = 100
+    /** 连续多少帧命中才告警 */
+    private const val DEGENERATE_TRIGGER = 30
+
+    private var degenerateRun = 0
+    private var degenerateLastLen = -1
+
+    /** ★ 2026-10-05【④】检测"编码/采集管线退化成常数输出"（不报错的故障）。 */
+    private fun checkDegenerate(size: Int) {
+        if (size < DEGENERATE_MAX_BYTES && size == degenerateLastLen) {
+            degenerateRun++
+            if (degenerateRun >= DEGENERATE_TRIGGER) {
+                degenerateRun = 0
+                Log.w(TAG, "[冻结检测] 连续 $DEGENERATE_TRIGGER 帧输出 $size 字节且长度恒定"
+                        + " —— 疑似采集/编码管线卡死（画面可能已僵死但无异常抛出）")
+            }
+        } else {
+            degenerateRun = 0
+        }
+        degenerateLastLen = size
+    }
+
+    /** RGBA_8888 图像转 JPEG
+     *
+     * ★ 2026-10-05【软编降分辨率】当 [qosHalfScale] 为真时先缩放一半再编码：
+     *   像素数降到 1/4 ⇒ JPEG 编码耗时（libjpeg-turbo，成本 ∝ 像素数）与输出字节数同时大降。
+     *   ★ 失败一律忽略并按原尺寸编码：降分辨率是"改善手段"，绝不能因为它把推流搞断。
+     */
     private fun imageToJpeg(image: Image, quality: Int): ByteArray? {
         val plane = image.planes[0]
         val buffer = plane.buffer
@@ -404,8 +594,20 @@ object ScreenStreamManager {
         val rowPadding = rowStride - pixelStride * image.width
         val bitmap = Bitmap.createBitmap(image.width + rowPadding / pixelStride, image.height, Bitmap.Config.ARGB_8888)
         bitmap.copyPixelsFromBuffer(buffer)
-        val crop = Bitmap.createBitmap(bitmap, 0, 0, image.width, image.height)
+        var crop = Bitmap.createBitmap(bitmap, 0, 0, image.width, image.height)
         if (bitmap != crop) bitmap.recycle()
+        if (qosHalfScale) {
+            try {
+                val half = Bitmap.createScaledBitmap(
+                    crop, maxOf(1, crop.width / 2), maxOf(1, crop.height / 2), true)
+                if (half != crop) {
+                    crop.recycle()
+                    crop = half
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "半分辨率缩放失败(按原尺寸继续编码): ${t.message}")
+            }
+        }
         val bos = ByteArrayOutputStream()
         crop.compress(Bitmap.CompressFormat.JPEG, quality, bos)
         crop.recycle()

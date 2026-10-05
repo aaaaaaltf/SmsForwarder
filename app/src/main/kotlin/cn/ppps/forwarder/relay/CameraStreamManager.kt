@@ -32,6 +32,67 @@ object CameraStreamManager {
     /** 默认帧间隔(ms)，约10fps */
     private const val FRAME_INTERVAL_MS = 100L
 
+    // ===== ★★★ 2026-10-05【自适应码率】常量（对照 rustdesk video_qos.rs）=====
+    /** 评估周期（同 ADJUST_RATIO_INTERVAL=3s） */
+    private const val QOS_ADJUST_INTERVAL_MS = 3000L
+    /** 质量下限（类比 BR_MIN 下界思想） */
+    private const val QUALITY_MIN = 25
+    /** 拥塞判据：发送耗时 EMA 上限（ms）——摄像头帧更大，阈值比屏幕略宽 */
+    private const val QOS_CONGEST_EMA_MS = 120.0
+    /** 宽裕判据（留滞回带防抖） */
+    private const val QOS_SMOOTH_EMA_MS = 45.0
+    /** 连续 N 次拥塞才降档（同 consecutive_bad_samples>=2） */
+    private const val QOS_CONGEST_GUARD = 2
+    /** 连续 N 次宽裕才升档（同 RESTORE_GUARD_SAMPLES，取 3） */
+    private const val QOS_RESTORE_GUARD = 3
+    /** 摄像头原始质量（原来的硬编码 70 改为可变字段的初始值） */
+    @Volatile private var qosQuality: Int = 70
+    private var qosBadSamples = 0
+    private var qosGoodSamples = 0
+    private var qosEmaMs = 0.0
+    private var qosLastAdjustAt = 0L
+
+    /**
+     * 自适应质量：拥塞降档、持续宽裕升档（与 ScreenStreamManager.updateQos 同口径）。
+     *
+     * ★ 为什么摄像头也要做：摄像头 JPEG 帧（640x480@质量70）在弱网下同样会写阻塞，
+     *   旧实现只有 60 秒空闲看门狗（`NO_CONSUMER_IDLE_MS`）——网络拥堵时既不停也不降质，
+     *   而写阻塞会把采集回调拖住 → 画面越卡越滞后。降质能让同样的链路跑得更顺。
+     */
+    private fun updateQos(writeMs: Long) {
+        qosEmaMs = if (qosEmaMs <= 0.0) writeMs.toDouble() else qosEmaMs * 0.8 + writeMs * 0.2
+        val now = System.currentTimeMillis()
+        if (now - qosLastAdjustAt < QOS_ADJUST_INTERVAL_MS) return
+        qosLastAdjustAt = now
+        val congested = qosEmaMs > QOS_CONGEST_EMA_MS
+        val relaxed = qosEmaMs < QOS_SMOOTH_EMA_MS
+        if (congested) {
+            qosBadSamples++; qosGoodSamples = 0
+        } else if (relaxed) {
+            qosGoodSamples++; qosBadSamples = 0
+        } else {
+            qosBadSamples = 0; qosGoodSamples = 0
+            return
+        }
+        if (qosBadSamples >= QOS_CONGEST_GUARD) {
+            qosBadSamples = 0
+            val old = qosQuality
+            val new = maxOf(QUALITY_MIN, (old * 0.85).toInt())
+            if (new < old) {
+                qosQuality = new
+                Log.i(TAG, "自适应码率↓ 拥塞(ema=${"%.0f".format(qosEmaMs)}ms) 质量 $old→$new")
+            }
+        } else if (qosGoodSamples >= QOS_RESTORE_GUARD) {
+            qosGoodSamples = 0
+            val old = qosQuality
+            val new = minOf(85, (old * 1.08).toInt() + 1)
+            if (new > old) {
+                qosQuality = new
+                Log.i(TAG, "自适应码率↑ 宽裕(ema=${"%.0f".format(qosEmaMs)}ms) 质量 $old→$new")
+            }
+        }
+    }
+
     @Volatile
     private var client: RelaySender? = null
 
@@ -495,6 +556,8 @@ object CameraStreamManager {
                         val data = header + jpeg
                         try {
                             // ★ 2026-08-05：逐通道发送——中继/直连监听/TS直连，只要有连接就推（直连模式下摄像头仍可用）
+                            // ★ 2026-10-05【自适应码率】包住计时：发送耗时是本模块唯一的拥塞信号
+                            val t0 = System.currentTimeMillis()
                             var sent = false
                             synchronized(senders) {
                                 for (s in senders) {
@@ -508,6 +571,7 @@ object CameraStreamManager {
                                 }
                             }
                             if (!sent) client?.send(RelayCommands.CMD_CAMERA_STREAM_FRAME, data)
+                            updateQos(System.currentTimeMillis() - t0)
                             // ★ 省电：本帧确实送达了至少一条已连接通道 → 记为"有人在收流"
                             if (sent) touchConsumer()
                         } catch (_: Exception) {
@@ -707,7 +771,8 @@ object CameraStreamManager {
 
             val yuvImage = android.graphics.YuvImage(nv21, android.graphics.ImageFormat.NV21, width, height, null)
             val out = java.io.ByteArrayOutputStream()
-            yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 70, out)
+            // ★ 2026-10-05【自适应码率】原来硬编码 70；改用运行期自适应质量（qosQuality）
+            yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), qosQuality, out)
             val jpegBytes = out.toByteArray()
 
             // ★ 根据传感器方向旋转图像：前置摄像头通常270度，后置通常90度

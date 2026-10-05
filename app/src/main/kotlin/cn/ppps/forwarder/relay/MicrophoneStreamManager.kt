@@ -93,6 +93,35 @@ object MicrophoneStreamManager {
     @Volatile
     private var idleStopTriggered = false
 
+    /**
+     * ★★★ 2026-10-05 本次会话在【数据通道】上已成功推送的帧数。
+     *   用途（修复"控制端接收方消失后本端仍持续推流"）：数据通道写入失败后的原有行为是
+     *   "回退命令通道继续推流"，而命令通道 s.send 是异步投递、socket 失效也不抛异常 →
+     *   采集循环 while(running) 永不退出，实测红米被控端在控制端早已断开后仍连续推流 7 小时
+     *   （约 4 亿字节）白耗电。现在区分两种情况：
+     *     ① 从未成功推送过（frameCount=0）= LISTENER 还没接入 → 保留原"回退命令通道"行为；
+     *     ② 曾成功推送过（frameCount>0）后写入失败 = 接收方已断开 → 直接停止采集，不回退。
+     */
+    @Volatile
+    private var dataChannelFramesSent = 0
+
+    /**
+     * ★★★ 2026-10-05 B2 补强：数据通道"接收方已消失"的**独立判据**（不再依赖"写入失败"）。
+     *
+     * 依据（链路层事实，与 write 是否报错无关）：
+     *   中继在 LISTENER 断开时会走 _mic_relay 的 finally，**同时关闭** src/dst 两条 socket，
+     *   其中 dst 就是本端(PUSHER)的这条连接；直连模式下控制端断开同理。
+     *   所以本端只要在数据通道上读到 EOF(-1) 或入站异常，就等价于"接收方已消失"。
+     *
+     * 为什么必须独立于 write 报错（2026-10-05 实测）：
+     *   ① 数据通道未配对时，中继侧根本不读这条 socket，write 直到内核缓冲写满才阻塞（不报错）；
+     *   ② 命令通道回退路径的 s.send() 是异步投递到 sendExecutor，socket 已失效也不抛异常；
+     *   两条都导致 dataChannelFramesSent==0、永远走不到"写入失败→停止"那个分支，
+     *   被控端会一直白推流（实测控制端离网后仍以 ~16000 字节/秒推了约 7 小时/4 亿字节）。
+     */
+    @Volatile
+    private var consumerGone = false
+
     private var idleWatchdog: Thread? = null
 
     fun lastError(): String = lastErrMsg ?: "未知错误"
@@ -300,6 +329,8 @@ object MicrophoneStreamManager {
             acquireWakeLock()
             // ★ 2026-08-28 省电：挂上"无人收流"看门狗（控制端掉线导致 STOP 丢失时自动释放麦克风与WakeLock）
             startIdleWatchdog()
+            // ★ 2026-10-05 B2 补强：新会话开始时清掉上一轮"接收方已消失"标记（随后由入站监视置位）
+            consumerGone = false
 
             // ★ 生成会话ID并连接数据通道
             val sessionId = "mic_${clientId}_${System.currentTimeMillis()}"
@@ -359,6 +390,8 @@ object MicrophoneStreamManager {
                         dataSocket = accepted
                         out = accepted.getOutputStream()
                         Log.i(TAG, "控制端已接入麦克风数据通道")
+                        // ★ 2026-10-05 B2 补强：挂上入站监视，控制端断开即由 EOF 独立判定"无接收方"
+                        startConsumerWatch(accepted)
                     } else {
                         // 中继模式：连接中继数据端口，PUSHER认证
                         val cs = Socket()
@@ -395,6 +428,9 @@ object MicrophoneStreamManager {
                         out.write("PUSHER:$sessionId\n".toByteArray(Charsets.UTF_8))
                         out.flush()
                         Log.i(TAG, "★ 已连接中继麦克风数据通道 $relayHost:${RelayCommands.MIC_DATA_PORT} session=$sessionId")
+                        // ★ 2026-10-05 B2 补强：中继在 LISTENER 断开时会同时关闭本端 socket，
+                        //   入站监视读到 EOF 即判定"接收方已消失"（不依赖 write 报错）
+                        startConsumerWatch(cs)
 
                         // ★ 中继模式下也通知控制端数据通道就绪
                         try {
@@ -412,6 +448,15 @@ object MicrophoneStreamManager {
                         // ★ 2026-08-10 修复：如果captureLoop因写入失败退出（LISTENER未连接/relay未配对），
                         // 且running仍为true，回退到命令通道模式继续推流，避免完全无数据发送
                         if (!success && running && ownsSession() && audioRecord != null) {
+                            // ★★★ 2026-10-05 区分"LISTENER 还没接入"与"接收方已断开"（见 dataChannelFramesSent 注释）：
+                            //   曾成功推送过数据后写入失败 = 控制端接收方已消失 → 直接停止采集，
+                            //   绝不回退命令通道继续空推（否则会像实测那样在无人接收时白推流数小时）。
+                            if (dataChannelFramesSent > 0) {
+                                val why = if (consumerGone) "入站EOF/断开（数据通道接收方已消失）" else "写入失败"
+                                Log.i(TAG, "★ 数据通道曾成功推流 ${dataChannelFramesSent} 帧后$why → 判定接收方已断开，停止麦克风采集（不回退命令通道）")
+                                try { s.send(RelayCommands.CMD_MIC_STOP, "") } catch (_: Exception) {}
+                                return@Thread
+                            }
                             Log.i(TAG, "★ 数据通道写入失败（LISTENER未连接?），回退命令通道模式继续推流")
                             captureLoopCommandChannel()
                         }
@@ -422,6 +467,12 @@ object MicrophoneStreamManager {
                     // ★ 修复：如果异常时还在running状态，尝试回退命令通道（最后的兜底）
                     if (running && ownsSession() && audioRecord != null) {
                         try {
+                            // ★★★ 2026-10-05 同上层判据：曾成功推流后异常 = 接收方已断开 → 停止，不回退空推
+                            if (dataChannelFramesSent > 0) {
+                                Log.i(TAG, "★ 已成功推流 ${dataChannelFramesSent} 帧后异常 → 判定接收方已断开，停止麦克风采集（不回退命令通道）")
+                                try { s.send(RelayCommands.CMD_MIC_STOP, "") } catch (_: Exception) {}
+                                return@Thread
+                            }
                             Log.i(TAG, "★ 异常兜底：回退命令通道模式继续采集")
                             captureLoopCommandChannel()
                         } catch (_: Exception) {}
@@ -548,6 +599,37 @@ object MicrophoneStreamManager {
     /** ★ 当前线程是否仍是本会话属主（被 STOP 或新会话顶替后返回 false） */
     private fun ownsSession(): Boolean = Thread.currentThread() === ownerThread
 
+    /**
+     * ★★★ 2026-10-05 B2 补强：数据通道入站监视线程。
+     *   本端只写不读这条 socket，所以"接收方消失"在入站方向表现为 EOF(-1)——
+     *   中继/控制端关闭连接后本端才会读到，属于链路层确证，不依赖 write 报错。
+     *   读到 EOF 或异常即置 consumerGone，由 captureLoop 在下一帧收尾（不回退命令通道）。
+     *   只有"当前会话的这条 socket"才允许置位：被新会话顶替后旧线程一律不动作。
+     */
+    private fun startConsumerWatch(sock: Socket) {
+        Thread({
+            try {
+                val ins = sock.getInputStream()
+                val buf = ByteArray(256)
+                while (running && !sock.isClosed) {
+                    val n = ins.read(buf)
+                    if (n < 0) {
+                        if (dataSocket === sock && running) {
+                            consumerGone = true
+                            Log.i(TAG, "★ 数据通道读到EOF（中继/控制端已关闭本端socket）→ 判定接收方已消失")
+                        }
+                        return@Thread
+                    }
+                }
+            } catch (t: Throwable) {
+                if (dataSocket === sock && running) {
+                    consumerGone = true
+                    Log.i(TAG, "★ 数据通道入站异常(${t.message}) → 判定接收方已消失")
+                }
+            }
+        }, "MicConsumerWatch").apply { isDaemon = true }.start()
+    }
+
     private fun cleanup() {
         // ★ 被顶替的旧采集线程不能清理公共字段：它一视会把**新**会话的
         //   AudioRecord 停掉、running 置回 false，控制端从此只听不到声音。
@@ -581,9 +663,19 @@ object MicrophoneStreamManager {
         var totalBytes = 0L
         var writeFailed = false  // ★ 2026-08-10 标记写入失败，用于回退判断
         val startTime = System.currentTimeMillis()
+        // ★★★ 2026-10-05 本次会话数据通道成功推送计数清零（供"接收方消失即停推"判定，见字段注释）
+        dataChannelFramesSent = 0
         Log.i(TAG, "★ 麦克风采集循环启动: 采样率=$SAMPLE_RATE Hz, 帧大小=${FRAME_SAMPLES * 2}字节/帧, 期望速率=${FRAME_SAMPLES * 8}字节/秒")
         try {
             while (running && !Thread.interrupted()) {
+                // ★★★ 2026-10-05 B2 补强：入站监视已证实"接收方消失"（EOF/断开）→ 立即结束推流。
+                //   标 writeFailed=true 让上层走"曾成功推流→停止采集(不回退命令通道)"分支，
+                //   不再依赖 write 是否报错（实测该条件在异步发送/未配对时根本不成立）。
+                if (consumerGone) {
+                    Log.i(TAG, "★ 数据通道接收方已消失（入站EOF/断开）→ 结束推流")
+                    writeFailed = true
+                    break
+                }
                 val rec = audioRecord ?: break
                 val shortsRead = try {
                     rec.read(buffer, 0, FRAME_SAMPLES)
@@ -613,6 +705,7 @@ object MicrophoneStreamManager {
                     out.write(frame)
                     out.flush()
                     frameCount++
+                    dataChannelFramesSent = frameCount   // ★ 2026-10-05 成功推送计数（接收方消失判定用）
                     totalBytes += frameLen
                     // ★ 每50帧打印详细调试信息（约2秒@8kHz/320samples）
                     if (frameCount % 50 == 0) {

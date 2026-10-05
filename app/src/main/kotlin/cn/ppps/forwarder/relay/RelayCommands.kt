@@ -19,18 +19,25 @@ object RelayCommands {
     /** 中继服务器地址（硬编码优先） */
     const val RELAY_HOST = "106.12.48.88"
 
-    /** 被控端连接中继的端口（本项目专用，原56784） */
-    const val RELAY_SERVER_PORT = 56786
+    /** 被控端连接中继的端口（本项目专用）
+     *  ★★★ 2026-10-03【协议单一真源】数值改为引用 RelayProtocol（真源 protocol/relay_protocol.json）：
+     *   三端各自维护端口、且没有任何一致性校验，本文件就曾长期写着 RELAY_CONTROLLER_PORT=56787
+     *   —— 而中继服务器**从不监听该端口**（死值），另有屏幕预览端口 56888 vs 服务器 56783 的黑屏事故。
+     *   现在改协议只改 JSON 并运行 tools/gen_relay_protocol.py，提交前用 --check 校验漂移。 */
+    const val RELAY_SERVER_PORT = RelayProtocol.PORT_PHONE_CONTROLLED
 
-    /** 控制端连接中继的端口（本项目专用，原56782） */
-    const val RELAY_CONTROLLER_PORT = 56787
+    /** 控制端连接中继的端口（★ 原为 56787，服务器从不监听该端口＝死值；真源里控制端通道是 56782） */
+    const val RELAY_CONTROLLER_PORT = RelayProtocol.PORT_CONTROLLER
 
     /** 中继视频流端口（屏幕预览推流/收流）
      *  ★★★ 2026-10-03 修复"手机屏幕预览黑屏 / 控制端提示'中继视频流端口未开放'"：
      *  原值 56888 **服务器从未监听**（core/relay_server.py 只 bind VIDEO_PORT=56783，
      *  线上 ss 实测只有 56783）→ 两端连 56888 都 ECONNREFUSED。
      *  改回 56783：与服务器、与 PC 屏幕预览一致（中继视频通道按 PUSHER/LISTENER 的 clientId 配对）。 */
-    const val RELAY_VIDEO_PORT = 56783
+    const val RELAY_VIDEO_PORT = RelayProtocol.PORT_VIDEO
+
+    /** ★ 新增 v2：服务器远端握手推送"协议状态"的命令（负载 ver/caps/ports） */
+    const val CMD_PROTO_STATE = RelayProtocol.CMD_PROTO_STATE
 
     /** 控制端类型标识：手机控制端 */
     const val CTRL_TYPE_PHONE: Byte = 0x01
@@ -41,13 +48,17 @@ object RelayCommands {
     // ==================== 2026-09-23 手机被控端注册与中继状态联动 ====================
 
     /** 连上中继56786后发送的注册命令（服务器校验令牌后才登记，防裸端口） */
-    const val CMD_PHONE_REG = "regsms000000"
+    const val CMD_PHONE_REG = RelayProtocol.CMD_PHONE_REG
+
+    /** ★★★ 2026-10-04【C批次】服务器→手机被控端：注册 challenge（32 字符随机 hex）。
+     *  客户端须以共享令牌为 HMAC-SHA256 密钥签名后放入注册帧第一段（令牌永不上线）。 */
+    const val CMD_REG_CHALLENGE = "regchal00000"
 
     /** 注册共享令牌（须与中继服务器 relay_server.py 的 PHONE_REG_TOKEN 一致） */
-    const val RELAY_REG_TOKEN = "RCPH-2026-56786"
+    const val RELAY_REG_TOKEN = RelayProtocol.LABEL_PHONE_REG_TOKEN
 
     /** 服务器→手机被控端：中继总闸当前状态（负载 on/off）。收到即联动开/关VPN（被动响应） */
-    const val CMD_RELAY_STATE_SERVER = "relayst00000"
+    const val CMD_RELAY_STATE_SERVER = RelayProtocol.CMD_RELAY_STATE_SERVER
 
     // ==================== 屏幕预览（远程桌面，被控端屏幕推流到中继56788） ====================
     /** 启动屏幕推流（负载: host|port|FPS|色深|质量|clientId，clientId=被控端pc_id用于56788配对） */
@@ -94,7 +105,7 @@ object RelayCommands {
     const val CMD_TS_DIRECT_CONNECT = "ztdirect0000"
 
     /** 手机控制端TS直连监听端口（DirectHostServer） */
-    const val TS_DIRECT_PORT = 56789
+    const val TS_DIRECT_PORT = RelayProtocol.PORT_TS_DIRECT
 
     /** PC协议版本查询（控制端用于确认被控端在线，兼容PC被控端协议） */
     const val CMD_GET_VERSION = "ver000000000"
@@ -123,8 +134,8 @@ object RelayCommands {
     const val CMD_MIC_STOP = "sfmicstp0000"
     /** 麦克风音频帧（二进制=PCM 16bit/单声道/8000Hz）——命令通道回退用 */
     const val CMD_MIC_FRAME = "sfmicfrm0000"
-    /** ★ 2026-08-09 麦克风数据通道端口（独立于命令通道56786和视频流56788，避开relay_control的56790） */
-    const val MIC_DATA_PORT = 56791
+    /** ★ 2026-08-09 麦克风数据通道端口（独立于命令通道和视频流，避开relay_control的56790） */
+    const val MIC_DATA_PORT = RelayProtocol.PORT_MIC_DATA
     /** ★ 2026-08-09 麦克风数据通道就绪通知（负载: host|port），控制端收到后连接数据通道 */
     const val CMD_MIC_DATA_READY = "sfmicdr00000"
 
