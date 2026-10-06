@@ -811,10 +811,17 @@ object TailscaleManager {
                     }
                     Thread.sleep(sleepMs)
                     if (!vpnWatchdogRunning) break
-                    // ★ 修复：中继模式(relay已连)时原本 break 会直接杀死看门狗线程，导致此后中继一旦掉线，
-                    //   再无周期性兜底层去拉起直连VPN。改为 continue：本轮跳过，线程保持存活，
-                    //   中继掉线(setRelayConnected(false))后下一轮即重新拉起VPN。
-                    if (isRelayConnected()) continue              // 中继模式：本轮跳过，保持看门狗存活
+                    // ★★★ 2026-10-06【整改：看门狗也不得按"中继是否连着"决定拉 VPN】
+                    //   原实现用 `isRelayConnected()`（**传输层**）跳过，且注释明写
+                    //   "中继掉线(setRelayConnected(false))后下一轮即重新拉起VPN" ——
+                    //   这就是一条明确的"中继不可达就退直连"回退，与用户铁律冲突
+                    //   （feedback_channel_by_switch："中继开关是最高优先级指令"）。
+                    //   ✗ 更糟的是它形成自持振荡：中继瞬时断（常由本机 VPN establish 重建路由打断）
+                    //     → 看门狗拉起 VPN → establish 又打断中继 TCP → 再断 → 再拉……
+                    //     （真机 logcat 实测 `START_VPN` 每 10~70 秒一次、控制端看到"断开后重连"）。
+                    //   ⇒ 改为按**开关**跳过：开关=开时看门狗只做"保持线程存活"，绝不建立隧道；
+                    //     线程仍不退出，这样开关一旦切到"关"，下一轮即可接管（直连能力不丢）。
+                    if (isRelaySwitchOn()) continue               // 中继开关=开：本轮跳过，绝不建 VPN
                     if (TailscaleVpnService.vpnEstablished) continue  // VPN在，保持
                     // ★ 2026-09-23：另一方已建起真实 tun → 让位复用，本轮不再抢（先启动者持有隧道；
                     //   僵尸防护见 shouldYieldVpnToExternalTun）。中继关闭后由中继联动/看门狗自动接管。
@@ -951,6 +958,33 @@ object TailscaleManager {
     fun isRelayConnected(): Boolean = relayConnected == true
 
     /**
+     * ★★★ 2026-10-06【被控端唯一权威：中继开关 —— 可达性一律不参与】
+     *
+     * 用户铁律（2026-09-28 拍板 / 2026-10-06 重申）："中继开关是用户的指令，是最高优先级，
+     * 不要存在什么'中继不可达才找直连'……**中继和直连是互斥，不存在回退的情况**。"
+     * （记忆 `feedback_channel_by_switch` + `project_relay_direct_exclusion`）
+     *
+     * 取值优先级（全部是"开关"信号，**没有一个是可达性**）：
+     *   ① 服务器总闸（`serverRelayStateFreshUntil != 0L` ⇒ 曾收到过 ⇒ 粘性值，不因 180s 窗口过期翻转）
+     *   ② 同机控制端广播（`externalRelayStateUntil != 0L` ⇒ 曾收到过 ⇒ 粘性值）
+     *   ③ 两者都从未收到过（全新安装 / 服务端尚未推送）⇒ **视为中继开**
+     *
+     * ★★ ③ 为什么是"中继开"而不是"看中继通不通"（这正是本次整改删掉的那条回退）：
+     *   旧实现在无权威状态时用 `isRelayConnected() || client.isConnected()` 兜底，等价于
+     *   "中继能连上就算中继模式" ⇒ 一旦中继 TCP 瞬时断开（**往往正是本机 VPN establish
+     *   重建路由造成的**），立刻判为"直连模式" ⇒ 开 VPN ⇒ establish 又打断中继 TCP
+     *   ⇒ **自持振荡**（真机 logcat：`START_VPN` 每 10~70 秒一次，控制端看到"断开后重连"）。
+     *   选"中继开"则**不启任何直连任务**：绝不凭空产生"本该没有的直连活动"；
+     *   代价仅是"首次收到权威状态前"（服务注册即推送，实测 1~3 秒）直连任务不起 ——
+     *   这与控制端侧"开关未知时视为中继"的口径完全一致。
+     */
+    fun isRelaySwitchOn(): Boolean = when {
+        serverRelayStateFreshUntil != 0L -> serverRelayStateValue
+        externalRelayStateUntil != 0L -> externalRelayStateOn
+        else -> true
+    }
+
+    /**
      * ★ VPN 通道建立后回调：若中继已连接则关闭 VPN（避免"中继已正常但VPN仍在启动"的竞态）
      *
      * ★ 2026-08-27 修复被控端启动崩溃（Go panic: ipnlocal: watchdog timeout → SIGABRT）：
@@ -993,27 +1027,42 @@ object TailscaleManager {
                     + TailscaleVpnService.vpnEstablished + "）→ 仍执行联动（修复切换直连后迟迟不开 VPN）")
         }
         relayConnected = connected
-        // ★★★ 2026-09-28 传输层"中继已连上"也是"用户在用中继"的强证据 → 置粘性判据；
-        //   注意：**只置 true，绝不因传输层断连置 false**（那正是自持振荡的来源）；
-        //   置 false 只由权威信号 relayst=off 负责（见 RelayServerService 的 relayst 处理）。
-        if (connected) externalRelayStateOn = true
+        // ★★★ 2026-10-06【删除"传输层连上 ⇒ 判为在中继"的污染】
+        //   原代码：`if (connected) externalRelayStateOn = true`（注释称"传输层连上也是用户在用中继的强证据"）。
+        //   ✗ 它把**可达性**写进了权威值：同机广播曾判 off 之后，本机中继 client 偶然连上就会把
+        //     externalRelayStateOn 翻回 true ⇒ 模式被可达性改写 —— 正是本次整改明令禁止的。
+        //   ⇒ 权威值只由真正知道开关的两条路写入：服务器 relayst（RelayServerService）
+        //     与同机控制端广播（App.relayStateReceiver）。本方法只作执行器，不再写权威值。
         try {
             if (connected) {
+                // ★ 关 VPN 方向同样必须先过开关闸门：开关=关（直连模式）时**不得**关掉 VPN，
+                //   否则直连模式会把自己的隧道关掉（现场就是"直连模式下 tun 消失 ⇒ 直连全超时"）。
+                if (!isRelaySwitchOn()) {
+                    Log.i(TAG, "★ [VPN闸门] 中继开关=关（直连模式）→ 忽略 setRelayConnected(true)（不关 VPN）")
+                    return
+                }
                 // 中继正常 → 关闭直连 VPN 通道（Go 后端保留，随时可快速重建）
                 if (TailscaleVpnService.vpnEstablished) {
                     Log.i(TAG, "★ 中继正常，关闭 Tailscale VPN 通道（节省资源）")
                     TailscaleVpnService.shutdown()
                 }
             } else {
-                // ★★★ 2026-09-28 中继模式闸门：权威状态显示"用户在用中继"时，即使本 client 暂时连不上
-                //   （往往正是本机 VPN establish 自己造成的瞬时断连），也**不建 VPN**，只等中继重连。
-                //   否则就会"建 VPN → 打断中继 TCP → 判定中继不可用 → 再建 VPN"自持振荡。
-                if (externalRelayStateOn) {
-                    Log.i(TAG, "★ [VPN闸门] 中继暂时不可用但权威状态=开 → 不建 VPN，等中继自动重连")
+                // ★★★ 2026-10-06【唯一闸门：中继开关=开 ⇒ 任何情况下都不建 VPN】
+                //   这是本次整改最关键的收敛点：全项目所有"中继断了/不可达 → 开 VPN 走直连"的路径
+                //   （RelayServerService.onDisconnected 的兜底、VPN 看门狗"中继掉线后下一轮拉起 VPN"、
+                //    启动时的传输层判定……）最终都汇到本方法这一个执行器。
+                //   在此拦一次 = 把同族回退一次全部消灭，而不是逐个调用点打补丁
+                //   ——（过去"修一处、漏一处"的根源正是逐点打补丁）。
+                //   ★ 判据用 isRelaySwitchOn()（**开关**）而不是旧的 externalRelayStateOn（只看②分支）：
+                //     旧判据在"①服务器总闸=开、②从未收到过"时 externalRelayStateOn 默认 false
+                //     ⇒ 闸门形同虚设 ⇒ 中继一断就建 VPN（自持振荡的直接成因）。
+                if (isRelaySwitchOn()) {
+                    Log.i(TAG, "★ [VPN闸门] 中继开关=开 → 不因\"中继不可达/已断开\"建 VPN，只等中继重连"
+                            + "（用户铁律：不存在回退到直连）")
                     return
                 }
-                // 中继不可用 → 自动开启 Tailscale 直连
-                Log.i(TAG, "★ 中继不可用，自动开启 Tailscale 直连")
+                // 中继开关=关 ⇒ 用户要直连 → 建 VPN 走直连
+                Log.i(TAG, "★ 中继开关=关（直连模式）→ 建立 Tailscale 隧道走直连")
                 ensureStarted(ctx)
                 startVpnService(ctx)
             }

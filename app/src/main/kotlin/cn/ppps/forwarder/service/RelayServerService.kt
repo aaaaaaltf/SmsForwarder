@@ -68,9 +68,13 @@ class RelayServerService : Service() {
         /** ★ 省电：忙时设备状态上报间隔（与历史行为一致） */
         private const val STATE_REPORT_BUSY_MS = 5000L
 
-        /** ★★★ 2026-10-04【模式互斥】直连任务启动前的"中继确认宽限"：
-         *  中继连接是异步的（约1~3秒），若在服务启动瞬间同步判断，会漏跑一段直连任务
-         *  （用户实测"中继模式下仍看到直连任务"）。宽限 6 秒后仍非中继模式，才启用直连兜底。 */
+        /** ★★★ 2026-10-04【模式互斥】直连任务启动前的"权威状态等待宽限"：
+         *  权威开关状态（服务器 relayst / 同机广播）到达是异步的，若在服务启动瞬间同步判断，
+         *  就会在"尚未收到权威状态"的窗口里漏跑一段直连任务（用户实测"中继模式下仍看到直连任务"）。
+         *  ★ 2026-10-06 语义修正（重要）：宽限期过后**仍然只以开关为准**（isRelayModeOn()，
+         *    未知 ⇒ 视为中继开），**不再**有"中继连不上就按直连兜底"的含义 ——
+         *    宽限是为了**等权威状态**，不是为了**等可达性**（用户铁律：不存在回退，见
+         *    feedback_channel_by_switch）。 */
         private const val DIRECT_TASK_GRACE_MS = 6000L
 
         /** ★ 省电：灭屏且无控制端连接时的状态上报间隔 */
@@ -301,15 +305,16 @@ class RelayServerService : Service() {
         val onConnected: () -> Unit = {
             isConnected = true
             Log.i(TAG, "被控端已连接中继 ${RelaySettings.relayHost}:${RelaySettings.relayServerPort}")
-            // ★★★ 2026-09-23 防振荡（与 onDisconnected 同一窗口）：本client"连上"只说明
-            //   命令通道可达，不代表总闸开着——总闸 off 时命令通道仍然连得上（设计如此），
-            //   若此时按 onConnected 强制 setRelayConnected(true) 关VPN，就会与服务器推送的
-            //   relayst=off（开VPN）打架。权威窗口内一律以 relayst/同机广播为准。
-            if (cn.ppps.forwarder.tailscale.TailscaleManager.isExternalRelayStateFresh()) {
-                Log.i(TAG, "★ 权威中继状态窗口内 → 忽略本次 onConnected 关VPN（防振荡，以relayst为准）")
-            } else {
+            // ★★★ 2026-10-06【整改：关 VPN 方向也只看开关，不看到达性】
+            //   本 client"连上"只是**传输层**事实 —— 总闸 off 时命令通道照样连得上（设计如此），
+            //   所以"连上"并不能证明用户在中继模式。旧实现在无权威窗口时就据此关 VPN，
+            //   直连模式下会把用户自己的隧道关掉（现场即"直连全超时"）。
+            //   ⇒ 判据改为开关：开关=开才关 VPN；开关=关（直连）时保持隧道不动。
+            if (cn.ppps.forwarder.tailscale.TailscaleManager.isRelaySwitchOn()) {
                 // ★ 2026-08-16 中继联动：中继正常 → 关闭 Tailscale VPN（节省资源，Go 后端保留）
                 cn.ppps.forwarder.tailscale.TailscaleManager.setRelayConnected(this, true)
+            } else {
+                Log.i(TAG, "★ [模式互斥] 中继开关=关（直连模式）→ 不因中继通道连上而关 VPN")
             }
             // ★★★ 2026-10-04【模式互斥】中继连上 → 立即停掉直连监听/TS扫描（幂等）
             applyModeExclusivity("中继已连接")
@@ -317,17 +322,19 @@ class RelayServerService : Service() {
         val onDisconnected: () -> Unit = {
             isConnected = false
             Log.i(TAG, "被控端连接已断开")
-            // ★★★ 2026-09-23 防振荡：若 180 秒内收到过权威中继状态（relayst 推送/同机广播），
-            //   忽略本次"本client连不上→开VPN"（真机实测：两者打架导致 VPN 反复开关、
-            //   系统同时出现 tun0+tun1）。窗口过后自动回落本信号，直连能力不丢。
-            if (cn.ppps.forwarder.tailscale.TailscaleManager.isExternalRelayStateFresh()) {
-                Log.i(TAG, "★ 权威中继状态窗口内 → 忽略本次断连开VPN（防振荡）")
-            } else {
-                // ★ 2026-08-16 中继联动：中继不可用 → 自动开启 Tailscale 直连
-                cn.ppps.forwarder.tailscale.TailscaleManager.setRelayConnected(this, false)
-            }
-            // ★★★ 2026-10-04【模式互斥】断开后按"当前模式"重新裁决：
-            //   权威状态仍为"中继开"→ 直连任务继续保持关闭（等中继自己重连）；否则启用直连兜底。
+            // ★★★ 2026-10-06【整改：删除"中继断开 → 开 VPN 走直连"的整条回退】
+            //   原实现：不在权威窗口内就调 `setRelayConnected(this, false)` ⇒ 建立 Tailscale 隧道，
+            //   即"中继不可达就退直连"（旧注释自己都写着"中继不可用 → 自动开启 Tailscale 直连"）。
+            //   ✗ 违反用户铁律：中继开关是最高指令，中继不可达只等待重连，**不得**改走直连。
+            //   ✗ 且它是自持振荡的起点：断开 → 建 VPN → establish 重建路由 → 打断中继 TCP → 再断开
+            //     （真机 logcat：`START_VPN` 每 10~70 秒一次，控制端看到"断开后重连"）。
+            //   ⇒ 现在这里**不做任何通道动作**：中继断开只意味着"等它重连"（服务自带重连）。
+            //     VPN 是否建立只由权威状态（relayst / 同机广播）驱动，
+            //     唯一的执行闸门在 TailscaleManager.setRelayConnected（开关=开 ⇒ 一律不建 VPN）。
+            Log.i(TAG, "★ [模式互斥] 中继断开 → 只等待中继重连（不建 VPN、不改走直连）")
+            // ★★★ 2026-10-04 保留【模式互斥】断开后按"当前模式"重新裁决（幂等）：
+            //   权威状态=中继开 → 直连任务继续保持关闭（等中继自己重连）；
+            //   权威状态=中继关 → 启用直连任务（那才是用户明确要的直连模式）。
             applyModeExclusivity("中继断开")
             // ★ 中继断开后由 TailscaleDirectScanner 自动探测并建立 TS 直连（扫描器每15秒探测56789），
             //   不再自动操作 Tailscale 开关（2026-08-13 取消：避免无障碍窗口出现在被控端；Tailscale 无公开API可编程开关）
@@ -673,14 +680,17 @@ class RelayServerService : Service() {
      *            ③ 从未收到任何权威状态（全新安装/服务端未推送）→ 用"中继通道是否连着"兜底
      */
     private fun isRelayModeOn(): Boolean = try {
-        val tm = cn.ppps.forwarder.tailscale.TailscaleManager
-        when {
-            tm.serverRelayStateFreshUntil != 0L -> tm.serverRelayStateValue
-            tm.externalRelayStateUntil != 0L -> tm.externalRelayStateOn
-            else -> tm.isRelayConnected() || (client?.isConnected() == true)
-        }
+        // ★★★ 2026-10-06【整改：真源收敛到 TailscaleManager.isRelaySwitchOn()，删除可达性兜底】
+        //   原实现第 ③ 分支 `tm.isRelayConnected() || client?.isConnected() == true` 是
+        //   **可达性兜底**：没有任何权威状态时按"中继通道通不通"判模式 ⇒ 中继瞬断即被当成
+        //   直连模式 ⇒ 启用直连任务（正是用户实测"中继模式下仍看到直连任务"的成因之一）。
+        //   ⇒ 现在唯一判据是**开关**（未知 ⇒ 视为中继开，不启任何直连任务），
+        //     与控制端侧 isDeviceRoutedViaRelay 的口径完全一致（同一真源、零回退）。
+        cn.ppps.forwarder.tailscale.TailscaleManager.isRelaySwitchOn()
     } catch (e: Throwable) {
-        client?.isConnected() == true
+        // ★ 异常时同样**不得**用可达性猜方向 ⇒ 视为中继开（不启直连任务）
+        Log.w(TAG, "读取中继开关异常 → 视为中继模式（不启直连任务）: ${e.message}")
+        true
     }
 
     /**
