@@ -1473,6 +1473,10 @@ class WebRtcSessionManager(
                 }
                 override fun onCapturerStopped() { realObserver.onCapturerStopped() }
                 override fun onFrameCaptured(frame: VideoFrame) {
+                    // ★★★ 2026-10-07【摄像头不做静止抑制（用户决定）】——此处原来会按"画面未变"丢帧，
+                    //   已删除：摄像头价值在于实时（PC 侧实测降帧率后 20fps 档位只跑到 9.7fps、观感卡顿）；
+                    //   且该路取像素需 toI420() GL 回读（手机上几十毫秒），属于"没实测基线不放重活"。
+                    //   静止抑制只保留在**屏幕**路（ScreenWebRtcCapturer，直接读 RGBA 平面，便宜）。
                     try {
                         val nowNs = System.nanoTime()
                         if (baseNs == 0L) baseNs = nowNs

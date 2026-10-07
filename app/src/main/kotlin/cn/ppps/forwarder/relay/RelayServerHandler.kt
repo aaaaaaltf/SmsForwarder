@@ -765,6 +765,19 @@ object RelayServerHandler {
                             "q" -> camQ = n
                         }
                     }
+                    // ★★★ 2026-10-07【互斥（摄像头分支）—— 对齐屏幕分支 :573-578】
+                    //   控制端从"摄像头 WebRTC 高清"回退到 JPEG 前会发本命令，而原实现**直接 start**，
+                    //   没有关掉正在跑的摄像头 WebRTC 会话 ⇒ **摄像头是独占设备**（Camera2 同一时刻
+                    //   只能被一个客户端打开），它占着设备时 JPEG 打不开 ⇒ 用户看到"回退后仍然黑屏"。
+                    //   ★ 只关**视频**会话：`webrtcAudioOnly`（纯语音，JPEG 视频期间用于双向对讲）
+                    //     必须保留 —— 否则回退会把对讲一起弄没（这是与屏幕分支唯一的差别）。
+                    val camSess = sessionOf(peerKey)
+                    if (camSess.webrtc != null && !camSess.webrtcScreenMode && !camSess.webrtcAudioOnly) {
+                        Log.i(TAG, "★ 收到 JPEG 摄像头推流请求 → 关闭摄像头 WebRTC 视频会话（摄像头设备独占）")
+                        try { camSess.webrtc?.close() } catch (_: Throwable) {}
+                        camSess.webrtc = null
+                        camSess.webrtcCameraIndex = -1
+                    }
                     val ok = CameraStreamManager.start(facingTarget, camW, camH, camFps, camQ)
                     // 回报：首字段=实际打开的朝向（与帧头一致）；成功时末尾追加契约字段 |facing=<0|1>[|fallback=1]
                     // 失败分支保持旧格式 "<target>|failed|原因"，旧控制端无需改动即可解析

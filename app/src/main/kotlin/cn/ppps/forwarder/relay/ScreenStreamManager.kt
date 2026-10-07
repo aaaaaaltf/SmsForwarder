@@ -493,6 +493,25 @@ object ScreenStreamManager {
                     null
                 }
                 if (image == null) {
+                    // ★★★ 2026-10-07【静止不传输 · 保活】ImageReader 在静止/灭屏时常拿不到新镜像，
+                    //   原实现此时什么都不做 ⇒ 既白等，又会让**本模块自己的** WRITE_WATCHDOG_MS(10s)
+                    //   判成"10 秒没成功发帧"而强拆流（现网既有风险，审计已指出）。
+                    //   ⇒ 静止时按保活周期（2s）重发**上一帧缓存**：不重新采集/编码，代价极小；
+                    //     既实现"没有变化不传新数据"，又让本端写看门狗与控制端的停滞检测都看到"链路活着"。
+                    val cached = FrameChangeDetector.screen.lastSentBytes
+                    if (cached != null && FrameChangeDetector.screen.shouldSendBytes(cached)) {
+                        try {
+                            // ★ 保活帧也走同一帧格式（4 字节大端长度 + JPEG），控制端解析无需改动
+                            synchronized(s) {
+                                out.write(ByteBuffer.allocate(4).putInt(cached.size).array())
+                                out.write(cached)
+                                out.flush()
+                            }
+                            lastSend = System.currentTimeMillis()
+                            lastSendTime = lastSend
+                        } catch (_: Exception) {
+                        }
+                    }
                     // 无新帧：按 5ms → 25ms → 50ms（封顶）退避，避免灭屏/静止画面时 200次/秒空转
                     Thread.sleep(noImageWaits)
                     if (noImageWaits < NO_IMAGE_BACKOFF_MS) {
@@ -507,6 +526,12 @@ object ScreenStreamManager {
                 if (jpeg == null || jpeg.isEmpty()) continue
                 // ★ 2026-10-05【借鉴点④】冻结/退化帧检测（与 PC 侧 rd_stream_hub._check_degenerate 同口径）
                 checkDegenerate(jpeg.size)
+                // ★★★ 2026-10-07【静止不传输（自动变化检测）】与上一帧字节一致 ⇒ **不写 socket**，
+                //   静止桌面/静止手机屏幕的带宽直接降到 ~0（到保活周期 2s 才发一帧）。
+                //   ★ 位置在 checkDegenerate 之后、写 socket 之前：冻结帧检测仍然每帧都做（它靠"帧在流"判断）。
+                if (!FrameChangeDetector.screen.shouldSendBytes(jpeg)) {
+                    continue
+                }
                 // 帧格式: [4字节大端长度][JPEG]
                 val header = ByteBuffer.allocate(4).putInt(jpeg.size).array()
                 // ★ 测量"写出真实耗时"作为拥塞信号（write+flush，含 TCP 背压等待）

@@ -582,6 +582,9 @@ object CameraStreamManager {
                         // ★ 2026-08-29 帧负载格式: "实际facing语义|流ID|" + JPEG
                         //   之前写 cameraIndex（数组下标），多摄手机上下标1可能等于超广角，控制端无法按帧头还原前后置
                         val header = "$currentFacing|$streamId|".toByteArray(Charsets.UTF_8)
+                        // ★★★ 2026-10-07【摄像头不做静止抑制（用户决定）】——原来的"画面未变不发"
+                        //   已**删除**：摄像头价值在于实时（PC 侧实测降帧率后 20fps 档位只跑到 9.7fps，
+                        //   观感卡顿）。静止抑制只保留在**屏幕**路（ScreenStreamManager）。
                         val data = header + jpeg
                         try {
                             // ★ 2026-08-05：逐通道发送——中继/直连监听/TS直连，只要有连接就推（直连模式下摄像头仍可用）

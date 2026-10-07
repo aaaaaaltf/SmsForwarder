@@ -264,6 +264,19 @@ class ScreenWebRtcCapturer(private val appContext: Context,
             val nowNs = System.nanoTime()
             if (nowNs - lastPushedNs < frameIntervalNs) return
             lastPushedNs = nowNs
+            // ★★★ 2026-10-07【屏幕 WebRTC 的"静止不传数据"= 静止时降帧率】
+            //   策略与 PC 侧 screen_webrtc.py **完全一致**，判据也用**同一份** FrameChangeDetector：
+            //     画面未变 ⇒ 丢帧，直到 ~1fps 的保活节拍才发一帧；有变化 ⇒ 立刻恢复满帧率。
+            //   ★ 位置在 RGBA→I420 转换**之前**：静止时连最贵的整屏转换都省掉（省 CPU 又省带宽）。
+            //   ★ 为什么不整个不发：控制端有"8 秒零帧 → 回退"和 15 秒停滞检测；1fps 保活让它们
+            //     都看到链路活着，用户看到的是"画面停住"而不是"断流"。
+            if (!FrameChangeDetector.screen.shouldSendRgba(image, nowNs / 1_000_000L)) {
+                try {
+                    image.close()
+                } catch (_: Throwable) {
+                }
+                return
+            }
             val obs = observer ?: return
             val w = width
             val h = height
