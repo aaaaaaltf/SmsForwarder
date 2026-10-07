@@ -76,6 +76,17 @@ object RelayProtocol {
      * ★ 新增：屏幕可走 WebRTC（ScreenCapturerAndroid + VP8/H264）。只有宣告该位的被控端才会被控制端用 WebRTC 看屏；未宣告（旧 APK）继续走 JPEG。
      */
     const val CAP_SCREEN_WEBRTC = 2
+    /**
+     * ★ 2026-10-07 新增：被控端回程的**信号帧**（wrxanswer/wrxcand/wrxstatus/wrxhangup 等）带 `|cid=<n>`，中继据此**精确回投**（见 
+     * core/relay_server.py 的 CID_TAGGED_CMDS）。★ 缺省（旧端/未宣告）= 不支持 ⇒ 中继退回 stream_owner/last_sender 兜底（多路同看时可能投错人）
+     * ；因此**只有宣告该位的被控端才允许与之做多路同看**。
+     */
+    const val CAP_CID_ROUTE_ALL_SIGNALING = 3
+    /**
+     * ★ 2026-10-07 新增：摄像头采集**进程内共享**（modules/camera_shared.py：按 index 单例 + 引用计数，多路复用同一份 VideoCapture，每路各自缩放/编码）
+     * 。★ 缺省（旧端）= 每个会话各开一份设备 ⇒ 多台控制端同看同一摄像头会互相抢设备、画面交替冻结；因此**只有宣告该位的被控端才能保证摄像头多路同看**。
+     */
+    const val CAP_CAM_SHARED_CAPTURE = 4
 
     // ==================== timeouts ====================
     /**
@@ -248,13 +259,15 @@ object RelayProtocol {
     const val TURN_PASSWORD = "NtSWZlU4IoW3SLqPKfva"
 
     /** 当前 v2 协议支持的屏幕能力全集 */
-    const val CAP_ALL = CAP_SCREEN_JPEG or CAP_SCREEN_WEBRTC
+    const val CAP_ALL = CAP_SCREEN_JPEG or CAP_SCREEN_WEBRTC or CAP_CID_ROUTE_ALL_SIGNALING or CAP_CAM_SHARED_CAPTURE
 
     /** 能力位 -> 可读文本（日志用） */
     fun capsText(caps: Int): String {
         val names = ArrayList<String>()
         if (caps and 1 != 0) names.add("SCREEN_JPEG")
         if (caps and 2 != 0) names.add("SCREEN_WEBRTC")
+        if (caps and 3 != 0) names.add("CID_ROUTE_ALL_SIGNALING")
+        if (caps and 4 != 0) names.add("CAM_SHARED_CAPTURE")
         return if (names.isEmpty()) "0" else names.joinToString("+")
     }
 }
