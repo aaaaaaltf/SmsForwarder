@@ -76,6 +76,9 @@ object RelayServerHandler {
     // 装箱后同样随连接结束而回收）。
     private class PeerSession {
         @Volatile var webrtc: WebRtcSessionManager? = null
+        /** ★★★ 2026-10-09 修复：控制端候选早于本会话 webrtc 就绪到达时不再静默丢弃，先缓冲，
+         *  OFFER 分支建立会话后补投（中继模式下控制端只发 1 个 relay 候选，丢了就 ICE 永远无候选对）。 */
+        val pendingIceCandidates = mutableListOf<Triple<String, Int, String>>()
         /** WebRTC 启动时请求的摄像头索引，用于失败回退到老 JPEG+PCM 模式 */
         @Volatile var webrtcCameraIndex: Int = 0
         /** 当前 WebRTC 会话是否纯音频模式（麦克风）：回退时只启老麦克风，不启摄像头 */
@@ -971,6 +974,18 @@ object RelayServerHandler {
                     // —— 初始化新 WebRTC 会话
                     val mgr = WebRtcSessionManager(App.context)
                     sessionOf(peerKey).webrtc = mgr
+                    // ★★★ 2026-10-09 修复：会话建立 → 补投此前缓冲的远端候选（候选早于 OFFER 到达）。
+                    //   此处 mgr 的 PeerConnection 仍为空，mgr.addRemoteIceCandidate 会自行再缓冲，
+                    //   并在 setRemoteDescription(OFFER) 成功后统一补投，故此处直接转交即可。
+                    val sess = sessionOf(peerKey)
+                    if (sess.pendingIceCandidates.isNotEmpty()) {
+                        val buffered = sess.pendingIceCandidates.toList()
+                        sess.pendingIceCandidates.clear()
+                        Log.i(TAG, "★ [WebRTC OFFER IN] 补投缓冲候选 count=${buffered.size}")
+                        for ((mid, idx, b64) in buffered) {
+                            mgr.addRemoteIceCandidate(mid, idx, b64)
+                        }
+                    }
                     val cb = makeWebrtcSignalingCallback(s, peerKey)
                     // ★★★ 2026-08-12 中继优先模式：OFFER经中继到达(CHANNEL_RELAY)→relayPreferred=true
                     //   （媒体走TURN中继转发）；经TS直连/直连监听到达(CHANNEL_TS/DIRECT)→relayPreferred=false
@@ -1003,7 +1018,17 @@ object RelayServerHandler {
                     val sdpMid = parts[1]
                     val lineIdx = parts[2].toIntOrNull() ?: 0
                     val candB64 = parts[3]
-                    sessionOf(peerKey).webrtc?.addRemoteIceCandidate(sdpMid, lineIdx, candB64)
+                    // ★★★ 2026-10-09 修复：原为 null-safe 静默丢弃（连日志都没有）→ 会话未就绪时缓冲，
+                    //   就绪时（OFFER 分支）补投；并加可观测日志，便于下次实机确认候选是否到达。
+                    val sess = sessionOf(peerKey)
+                    val mgr = sess.webrtc
+                    if (mgr == null) {
+                        sess.pendingIceCandidates.add(Triple(sdpMid, lineIdx, candB64))
+                        Log.i(TAG, "★ [ICE-CAND IN] 会话未就绪，已缓冲候选（pending=${sess.pendingIceCandidates.size}）mid=$sdpMid idx=$lineIdx")
+                    } else {
+                        Log.i(TAG, "★ [ICE-CAND IN] 收到远端候选 → 注入 WebRTC mid=$sdpMid idx=$lineIdx len=${candB64.length}")
+                        mgr.addRemoteIceCandidate(sdpMid, lineIdx, candB64)
+                    }
                     null
                 }
 
@@ -1017,6 +1042,7 @@ object RelayServerHandler {
                     Log.i(TAG, "★ WebRTC 挂断")
                     try { sessionOf(peerKey).webrtc?.close() } catch (_: Throwable) {}
                     sessionOf(peerKey).webrtc = null
+                    sessionOf(peerKey).pendingIceCandidates.clear()   // ★ 2026-10-09 会话结束清掉缓冲候选
                     sessionOf(peerKey).webrtcAudioOnly = false
                     // 控制端挂断时，老模式也可能残留（如回退过），一并清理
                     try { CameraStreamManager.stop() } catch (_: Throwable) {}

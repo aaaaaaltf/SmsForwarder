@@ -96,6 +96,30 @@ class WebRtcSessionManager(
 
     @Volatile private var factory: PeerConnectionFactory? = null
     @Volatile private var peerConnection: PeerConnection? = null
+    /** ★★★ 2026-10-09 修复【控制端 relay 候选早到被丢弃 → ICE 永远无候选对 → 回退 JPEG】：
+     *   中继模式下控制端在 OFFER 后约 190ms 就 trickle 出它**唯一**的 relay 候选，而本端
+     *   createPeerConnection（~60ms）与 setRemoteDescription(OFFER) 仍是异步进行中。
+     *   原实现在 peerConnection==null 时**直接丢弃**该候选（日志 "addRemoteIceCandidate: PC未初始化"，
+     *   红米 18:44:13.486 实证：候选比 PC 创建早 39ms），控制端只发这一个候选，丢了就再也没有
+     *   → 本端 ICE 永远停在 NEW（日志里只看到 CLOSED）→ 控制端 20s 超时 → 回退 JPEG
+     *   （现象：华为对红米摄像头预览启动不了高清模式）。
+     *   现改为：早到的远端候选全部缓冲，setRemoteDescription(OFFER) 成功后一次性补投。
+     *
+     *   ★★★★ 2026-10-09【死锁修复·关键】候选缓冲**必须用独立小锁 candidateLock**，
+     *     绝不可用 @Synchronized 复用类监视器：
+     *     · startWithOffer() 带 @Synchronized，**持类锁**调用原生 pc.setRemoteDescription()，
+     *       而该原生调用内部会阻塞等待 WebRTC 信令线程；
+     *     · 信令线程执行到 setRemoteDescription 的 onSetSuccess 时会回调本类 → 若在此处
+     *       （flushPendingRemoteCandidates）再去抢**同一把类锁** → AB-BA 死锁。
+     *     真机铁证（红米 gojni 原生日志，20:01:33 起每 28ms 重复）：
+     *       `Probable deadlock:` + 栈帧 `#05 ... Java_org_webrtc_PeerConnection_nativeSetRemoteDescription`
+     *       + 同屏 `nativeNewGetStats` 同样卡住 ⇒ setRemoteDescription 永不返回、onSetSuccess/
+     *       onSetFailure 都不回调 ⇒ 永不发 ANSWER ⇒ 华为 12 秒超时回退 JPEG。 */
+    private val pendingRemoteCandidates = mutableListOf<Triple<String, Int, String>>()
+    /** 候选缓冲专用锁（仅保护 pendingRemoteCandidates 列表，绝不在此锁内调用原生/阻塞方法） */
+    private val candidateLock = Any()
+    /** 远端描述(OFFER/ANSWER)是否已设置 —— addIceCandidate 必须在其之后，否则会被 WebRTC 拒绝 */
+    @Volatile private var remoteDescriptionSet = false
     @Volatile private var videoCapturer: VideoCapturer? = null
     @Volatile private var videoSource: VideoSource? = null
     @Volatile private var surfaceTextureHelper: SurfaceTextureHelper? = null
@@ -280,6 +304,9 @@ class WebRtcSessionManager(
             closeInternal(false)
         }
         running = true
+        // ★★★ 2026-10-09 新会话重置候选缓冲/远端描述标志（防止上一会话残留候选被误补投）
+        remoteDescriptionSet = false
+        synchronized(candidateLock) { pendingRemoteCandidates.clear() }
         this.relayPreferred = relayPreferred
         // ★★★ 2026-10-04 屏幕高清模式：只换"采集源"，其余（信令/回退/看门狗/时间戳矫正）全部复用
         this.screenMode = screenMode
@@ -794,6 +821,10 @@ class WebRtcSessionManager(
         pc.setRemoteDescription(object : SdpObserverAdapter() {
             override fun onSetSuccess() {
                 Log.i(TAG, "$stepTag [8/8] setRemoteDescription(OFFER) 成功 ✓，开始 createAnswer")
+                // ★★★ 2026-10-09 修复：远端描述就绪 → 补投此前缓冲的远端候选（控制端 relay 候选早到被丢弃的根因）
+                try { flushPendingRemoteCandidates() } catch (t: Throwable) {
+                    Log.w(TAG, "$stepTag ★ [ICE-CAND] 补投缓冲候选异常: ${t.message}")
+                }
                 cb.onStatus("creating_answer", "生成本地ANSWER SDP")
                 val mediaConstraints = MediaConstraints().apply {
                     mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveAudio", "false"))
@@ -923,28 +954,76 @@ class WebRtcSessionManager(
         Log.i(TAG, "$stepTag ★★ 全部 8 步异步初始化启动完成（ANSWER 发送后见回调日志） ★★")
     }
 
-    /** 收到控制端发来的 ICE Candidate：addIceCandidate 入 PeerConnection */
-    @Synchronized
+    /** 收到控制端发来的 ICE Candidate：addIceCandidate 入 PeerConnection。
+     *  ★★★ 2026-10-09 修复：PC/远端描述未就绪时**不再丢弃**，改为缓冲，setRemoteDescription 成功后补投。
+     *  ★ 2026-10-09【死锁修复】去掉 @Synchronized：本方法可能在持类锁的 startWithOffer 阻塞期间被
+     *    中继线程调用，若再抢类锁会与信令线程形成锁反转；改用**独立 candidateLock** 保护列表。 */
     fun addRemoteIceCandidate(sdpMid: String, sdpMLineIndex: Int, candidateSdpBase64: String) {
-        val pc = peerConnection ?: run { Log.w(TAG, "addRemoteIceCandidate: PC未初始化"); return }
+        val pc = peerConnection
+        if (pc == null || !remoteDescriptionSet) {
+            val n = synchronized(candidateLock) {
+                pendingRemoteCandidates.add(Triple(sdpMid, sdpMLineIndex, candidateSdpBase64))
+                pendingRemoteCandidates.size
+            }
+            Log.i(TAG, "★ [ICE-CAND] 远端候选早到，已缓冲（pending=$n"
+                    + " pcReady=${pc != null} remoteDescSet=$remoteDescriptionSet）mid=$sdpMid idx=$sdpMLineIndex")
+            return
+        }
+        doAddIceCandidate(pc, sdpMid, sdpMLineIndex, candidateSdpBase64)
+    }
+
+    /** 真正调用 addIceCandidate（含 WebRTC 114.x 反射兼容），成功/失败都打日志便于实机定位 */
+    private fun doAddIceCandidate(pc: PeerConnection, sdpMid: String, sdpMLineIndex: Int, candidateSdpBase64: String) {
         try {
             val sdp = String(Base64.getDecoder().decode(candidateSdpBase64), StandardCharsets.UTF_8)
-            // ★ WebRTC 114.x：优先单参 addIceCandidate(IceCandidate)，反射兼容带 AddIceObserver 双参版本
             val candidate = IceCandidate(sdpMid, sdpMLineIndex, sdp)
             try {
                 val singleM = pc.javaClass.getMethod("addIceCandidate", IceCandidate::class.java)
                 singleM.invoke(pc, candidate)
+                Log.i(TAG, "★ [ICE-CAND] 远端候选已注入 ✓ mid=$sdpMid idx=$sdpMLineIndex cand=${sdp.take(90)}")
             } catch (_: Throwable) {
                 val addIceObserverClass = Class.forName("org.webrtc.AddIceObserver")
                 val dualM = pc.javaClass.getMethod("addIceCandidate", IceCandidate::class.java, addIceObserverClass)
-                val emptyObs = java.lang.reflect.Proxy.newProxyInstance(
+                // ★ 2026-10-09：原空代理会吞掉注入错误（addIceCandidate 失败时静默）→ 改为记录错误，便于定位
+                val loggingObs = java.lang.reflect.Proxy.newProxyInstance(
                     addIceObserverClass.classLoader, arrayOf(addIceObserverClass)
-                ) { _, _, _ -> null }
-                dualM.invoke(pc, candidate, emptyObs)
+                ) { _, method, args ->
+                    when (method?.name) {
+                        "onAddIceCandidateError" ->
+                            Log.w(TAG, "★ [ICE-CAND] 远端候选注入失败 mid=$sdpMid idx=$sdpMLineIndex err=${args?.getOrNull(0)}")
+                        "onAddIceCandidateSuccess" ->
+                            Log.i(TAG, "★ [ICE-CAND] 远端候选已注入 ✓ mid=$sdpMid idx=$sdpMLineIndex cand=${sdp.take(90)}")
+                    }
+                    null
+                }
+                dualM.invoke(pc, candidate, loggingObs)
             }
         } catch (t: Throwable) {
             Log.w(TAG, "addRemoteIceCandidate failed: ${t.message}")
         }
+    }
+
+    /** ★★★ 2026-10-09 远端描述就绪后，补投此前缓冲的远端候选（候选早于 PC/远端描述到达）。
+     *  ★★★★ 2026-10-09【死锁修复·关键】本方法由 **WebRTC 信令线程**执行（setRemoteDescription 的
+     *    onSetSuccess 回调），因此**绝不能 @Synchronized / 抢类监视器**：startWithOffer 正持类锁
+     *    阻塞在该原生调用上等信令线程，信令线程再来抢同一把锁即 AB-BA 死锁（真机表现为
+     *    `Probable deadlock` 刷屏、setRemoteDescription 永不返回、华为收不到 ANSWER 回退 JPEG）。
+     *    这里只用独立 candidateLock 取快照，随后在**锁外**逐个注入原生。 */
+    private fun flushPendingRemoteCandidates() {
+        remoteDescriptionSet = true
+        val pc = peerConnection
+        val list = synchronized(candidateLock) {
+            if (pendingRemoteCandidates.isEmpty()) emptyList()
+            else pendingRemoteCandidates.toList().also { pendingRemoteCandidates.clear() }
+        }
+        if (pc == null) {
+            Log.w(TAG, "★ [ICE-CAND] flush：PC 仍为 null，丢弃缓冲候选 ${list.size} 个")
+            return
+        }
+        if (list.isEmpty()) return
+        Log.i(TAG, "★ [ICE-CAND] 远端描述已就绪 → 开始补投缓冲候选 count=${list.size}")
+        for ((mid, idx, b64) in list) doAddIceCandidate(pc, mid, idx, b64)
+        Log.i(TAG, "★ [ICE-CAND] 缓冲候选补投完成 count=${list.size}")
     }
 
     /**
@@ -1202,6 +1281,9 @@ class WebRtcSessionManager(
     @Synchronized
     private fun closeInternal(notifyCb: Boolean) {
         running = false
+        // ★★★ 2026-10-09 会话关闭：清空候选缓冲/远端描述标志（防止残留候选影响下一个会话）
+        remoteDescriptionSet = false
+        synchronized(candidateLock) { pendingRemoteCandidates.clear() }
         // ★★★ 2026-08-14 停止周期关键帧线程
         try { keyFrameTimer?.interrupt() } catch (_: Throwable) {}
         // ★ 2026-08-28 省电：会话结束一并收掉对端存活看门狗（防止残留线程误关下一个会话）
