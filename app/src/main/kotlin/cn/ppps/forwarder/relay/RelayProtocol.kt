@@ -242,6 +242,12 @@ object RelayProtocol {
      * 麦克风数据通道就绪通知（负载 host|port）
      */
     const val CMD_MIC_DATA_READY = "sfmicdr00000"
+    /**
+     * 服务器→控制端: PC被控端正忙，拒绝新的流式操作请求（负载=原因文案：谁占着/什么操作/已挂多久）。★ 2026-10-09 收编入真源：此前该命令字只以行内字面量存在于 core/relay_server.py 
+     * 两处发送点，与 Android 控制端 Commands.CMD_PC_BUSY 各自维护、无一致性校验；收编后中继发送侧改用生成常量 CMD_PC_BUSY_STR，消费侧 Commands.java 
+     * 的 CMD_PC_BUSY 由别名扫描持续校验。
+     */
+    const val CMD_PC_BUSY = "busy00000000"
 
     // ==================== ice ====================
     /**
