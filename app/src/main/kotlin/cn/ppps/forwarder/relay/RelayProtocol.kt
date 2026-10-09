@@ -53,8 +53,9 @@ object RelayProtocol {
     /**
      * 中继服务器公网地址（三端共用：手机控制端/手机被控端连接中继；同时是 PC 控制端的公网入口与 TURN 主机）。★ 2026-10-09 收编：此前该地址散在 3 种语言约 15 处常量里、无任何一致性校验，
      * 改一处即漏改多端。★ 别名全部限定作用域，避免与端口别名互相误报；SERVER_IP（config/network_config.py）刻意不登记——它是可被用户改成内网 IP 以进入内网模式的开关，
-     * 不是中继地址语义。★ android_controller/::RELAY_HOST_IP 是同值第二份（P2 收敛为引用 RelayCommands.RELAY_HOST 后，本别名一并移除）
-     * 。
+     * 不是中继地址语义。★ 2026-10-09 P1：PC 侧 network_config.RELAY_IP 已改为从生成常量派生（导入期解析 client.relay_host 覆盖），原别名 
+     * config/::RELAY_IP 随之改为 config/::_RELAY_HOST_TRUTH——它盯住的是生成物缺失时的 except 兜底字面量。★ android_controller/::RELAY_HOST_IP 
+     * 是同值第二份（P2 收敛为引用 RelayCommands.RELAY_HOST 后，本别名一并移除）。
      */
     const val RELAY_HOST = "106.12.48.88"
     /**
