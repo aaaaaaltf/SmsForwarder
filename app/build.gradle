@@ -31,6 +31,14 @@ if (keyPropsFile.exists()) {
     keyProps.load(new FileInputStream(keyPropsFile))
 }
 
+// ★★★ 2026-10-09（配置中心 P3）【ABI 单旋钮】：ndk.abiFilters 与 splits.include 都读此处，
+//   缺省 = 4 ABI（与改动前完全一致，产物清单不变）；单 ABI 调试：
+//     gradlew assembleDebug -PappAbis=arm64-v8a
+//   旋钮本体在 gradle.properties 的 appAbis=（-P 优先于 gradle.properties，Gradle 标准语义）。
+//   （与父仓库 android_controller/app/build.gradle 同约定。）
+def appAbis = (findProperty('appAbis') ?: 'armeabi-v7a,arm64-v8a,x86,x86_64')
+        .toString().split(',').collect { it.trim() }.findAll { !it.isEmpty() }
+
 //打包时，记得设置true启用
 if (isNeedPackage.toBoolean() && isUseBooster.toBoolean()) {
     apply plugin: 'com.didiglobal.booster'
@@ -107,8 +115,9 @@ android {
         // AGP 8.x: annotationProcessor arguments
         // (原来的 javaCompileOptions.annotationProcessorOptions 已废弃)
 
+        // ★ 2026-10-09（配置中心 P3）：ABI 列表读"单旋钮" appAbis（文件头定义），不再手写两份
         ndk {
-            abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64'
+            abiFilters(*appAbis)
         }
     }
 
@@ -184,11 +193,12 @@ android {
     }
 
     //ABI配置——按CPU架构分别打包
+    // ★ 2026-10-09（配置中心 P3）：include 与上面的 ndk.abiFilters 同读 appAbis 单旋钮
     splits {
         abi {
             enable true
             reset()
-            include 'armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64'
+            include(*appAbis)
             universalApk true
         }
     }
