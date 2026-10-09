@@ -49,6 +49,20 @@ object RelayProtocol {
      */
     const val PORT_MIC_DATA = 56791
 
+    // ==================== hosts ====================
+    /**
+     * 中继服务器公网地址（三端共用：手机控制端/手机被控端连接中继；同时是 PC 控制端的公网入口与 TURN 主机）。★ 2026-10-09 收编：此前该地址散在 3 种语言约 15 处常量里、无任何一致性校验，
+     * 改一处即漏改多端。★ 别名全部限定作用域，避免与端口别名互相误报；SERVER_IP（config/network_config.py）刻意不登记——它是可被用户改成内网 IP 以进入内网模式的开关，
+     * 不是中继地址语义。★ android_controller/::RELAY_HOST_IP 是同值第二份（P2 收敛为引用 RelayCommands.RELAY_HOST 后，本别名一并移除）
+     * 。
+     */
+    const val RELAY_HOST = "106.12.48.88"
+    /**
+     * 内网模式标识 IP（= config/network_config.py 的 LAN_MODE_IP；SERVER_IP 等于此值时自动进入内网模式）。即 PC 控制端的内网地址，与中继地址语义不同，
+     * 故作独立条目。
+     */
+    const val LAN_HOST = "47.247.40.7"
+
     // ==================== labels ====================
     /**
      * 手机被控端注册共享令牌（服务器校验后才登记，不裸开端口）
