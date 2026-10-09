@@ -862,6 +862,11 @@ object RelayServerHandler {
                     var camFps = 0
                     var camMaxW = 0
                     var camMaxH = 0
+                    // ★★★ 2026-10-09【独立对讲】首段为字面量 "intercom" 时表示"独立对讲"会话：
+                    //   仍是纯音频(SDP 无 m=video)，但控制端会上行说话 ⇒ 被控端**不静音扬声器**
+                    //   （与"开麦克风"相反，见 WebRtcSessionManager.setSpeakerMute(audioOnly && !intercom)）。
+                    //   格式 = intercom|<SDP_BASE64>（无参数段；兼容中继改写 intercom:<ctrlId>）。
+                    var intercom = false
                     if (firstPipeIdx > 0) {
                         val headToken = payloadText.substring(0, firstPipeIdx).trim()
                         // ★★★ 2026-10-05 用 startswith 而不是 equals("screen")：
@@ -869,7 +874,13 @@ object RelayServerHandler {
                         //   （relay_server `_tag_offer_with_ctrl`），旧写法会把带标记的屏幕 OFFER
                         //   误判成"摄像头会话 idx=0" ⇒ 多路看手机屏幕时拿到的是摄像头画面/黑屏。
                         //   （与 PC 侧 `_cmd_screen_webrtc_offer` 的修法同源。）
-                        if (headToken.startsWith("screen", ignoreCase = true)) {
+                        // ★★★ 2026-10-09【独立对讲】"intercom" 分支：同款兼容中继改写 intercom:<ctrlId>
+                        //   （取冒号前判断）。格式 = intercom|<SDP_BASE64>，无参数段。
+                        if (headToken.substringBefore(':').equals("intercom", ignoreCase = true)) {
+                            intercom = true
+                            idx = 0
+                            offerB64 = payloadText.substring(firstPipeIdx + 1)
+                        } else if (headToken.startsWith("screen", ignoreCase = true)) {
                             screenMode = true
                             val rest = payloadText.substring(firstPipeIdx + 1)
                             val segs = rest.split("|")
@@ -919,7 +930,8 @@ object RelayServerHandler {
                             val sdpRaw = String(Base64.getDecoder().decode(offerB64), Charsets.UTF_8)
                             audioOnly = !sdpRaw.contains("m=video")
                             Log.i(TAG, "★ [WebRTC OFFER IN] 解析: screenMode=$screenMode cameraIndex=$idx"
-                                    + " screenFps=$screenFps, offerB64Len=${offerB64.length}, audioOnly(纯音频麦克风)=$audioOnly")
+                                    + " screenFps=$screenFps, offerB64Len=${offerB64.length}, audioOnly(纯音频麦克风)=$audioOnly"
+                                    + ", intercom(独立对讲)=$intercom")
                         } catch (_: Throwable) {}
                     }
                     // 先权限检查（摄像头+麦克风；纯音频模式只要求麦克风）
@@ -998,7 +1010,7 @@ object RelayServerHandler {
                     Thread {
                         try {
                             mgr.startWithOffer(idx, offerB64, cb, relayPreferred, screenMode, screenFps,
-                                    screenMaxW, screenMaxH, camFps, camMaxW, camMaxH)
+                                    screenMaxW, screenMaxH, camFps, camMaxW, camMaxH, intercom)
                             Log.i(TAG, "★ [WebRTC OFFER IN] startWithOffer 线程执行完毕（ANSWER 将由 signaling callback 异步发送）")
                         } catch (t: Throwable) {
                             Log.e(TAG, "★ [WebRTC OFFER IN] startWithOffer 异常: type=${t.javaClass.name} msg=${t.message}", t)

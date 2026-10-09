@@ -297,7 +297,8 @@ class WebRtcSessionManager(
                        relayPreferred: Boolean = true,
                        screenMode: Boolean = false, screenFps: Int = 12,
                        screenMaxW: Int = 0, screenMaxH: Int = 0,
-                       camFps: Int = 0, camMaxW: Int = 0, camMaxH: Int = 0) {
+                       camFps: Int = 0, camMaxW: Int = 0, camMaxH: Int = 0,
+                       intercom: Boolean = false) {
         val stepTag = "[WebRTC-INIT]"
         if (running) {
             Log.w(TAG, "$stepTag 已在运行中，先关闭旧会话")
@@ -390,7 +391,10 @@ class WebRtcSessionManager(
             val rawSdp = Base64.getDecoder().decode(offerSdpBase64)
             val sdpStr = String(rawSdp, StandardCharsets.UTF_8)
             val isAudioOnly = !sdpStr.contains("m=video")
-            Log.i(TAG, "$stepTag [3/8] ★ 提前解析OFFER: audioOnly=$isAudioOnly（${if (isAudioOnly) "纯音频麦克风会话→被控端扬声器静音防啸叫" else "摄像头会话→扬声器正常"}）")
+            Log.i(TAG, "$stepTag [3/8] ★ 提前解析OFFER: audioOnly=$isAudioOnly intercom=$intercom"
+                    + "（${if (isAudioOnly && !intercom) "纯音频麦克风会话→被控端扬声器静音防啸叫"
+                         else if (isAudioOnly) "独立对讲→扬声器不静音（控制端会上行说话）"
+                         else "摄像头/屏幕会话→扬声器正常"}）")
             isAudioOnly
         } catch (t: Throwable) {
             Log.w(TAG, "$stepTag [3/8] OFFER提前解析失败(按非纯音频处理): ${t.message}")
@@ -430,9 +434,14 @@ class WebRtcSessionManager(
             Log.i(TAG, "$stepTag [3/8] createAudioDeviceModule 成功 ✓（音频源=原始MIC，硬件AEC/NS已关闭→原声修复）")
             // ★★★ 2026-08-12 啸叫(呼啸声)修复：纯音频(麦克风)会话中被控端是纯采集端，扬声器必须静音，
             //   否则扬声器→麦克风声学反馈 → 啸叫。摄像头会话(可能双向对讲)保留扬声器。
-            builtAdm.setSpeakerMute(audioOnly)
+            // ★★★ 2026-10-09【独立对讲】但"对讲"是纯音频会话里的例外：控制端会上行说话，
+            //   被控端必须出声（否则控制端说话被控端听不见=对讲变聋）。由 OFFER 首段 "intercom"
+            //   标记解除静音；啸叫风险改由控制端侧"对讲上行"开关的 AEC 兜底（控制端扬声器与
+            //   被控端扬声器物理远距离，声学回路风险远小于被控端自身扬声器→麦克风）。
+            builtAdm.setSpeakerMute(audioOnly && !intercom)
             builtAdm.setMicrophoneMute(false)
-            Log.i(TAG, "$stepTag [3/8] 静音标志已设置 ✓ speakerMute=$audioOnly(纯音频防啸叫) micMute=false")
+            Log.i(TAG, "$stepTag [3/8] 静音标志已设置 ✓ speakerMute=${audioOnly && !intercom}"
+                    + (if (intercom) "(独立对讲→不静音)" else "(纯音频防啸叫)") + " intercom=$intercom micMute=false")
             builtAdm
         } catch (t: Throwable) {
             Log.e(TAG, "$stepTag [3/8] AudioDeviceModule 失败 type=${t.javaClass.name} msg=${t.message}", t)
