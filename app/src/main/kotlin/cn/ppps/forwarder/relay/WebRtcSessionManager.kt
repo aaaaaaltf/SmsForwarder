@@ -721,13 +721,29 @@ class WebRtcSessionManager(
         //     → FrameBuffer 帧播放调度失败 → 控制端只渲染2帧（decode_fps=0, frames_dropped=16）。
         //   【修复】被控端不再强制 iceTransportsType=RELAY，统一 ALL：
         //     host/srflx 直连候选全参与（真实网络路径 arrival time 正常→15fps），relay 仍作为兜底候选。
+        // ★★★ 2026-10-10【方案 A：本端 ICE 策略跟随 relayPreferred，与控制端对称】
+        //   真机取证（华为控制端 → 红米被控端，中继模式，2026-10-10）：
+        //     两端各自建了 TURN allocation（40978/40480、40651/40905、40958/40247…），
+        //     但**服务端抓包显示华为的 relay 端口零收包**、红米侧 `getStats` 收发全 0，
+        //     ICE 检查包未能在 relay↔relay 之间闭环 ⇒ 15 秒后 ICE FAILED ⇒ 回退 JPEG。
+        //   根因（三端不对称）：
+        //     · 控制端（WebRtcSession.java:1627）= `relayPreferred ? RELAY : ALL`；
+        //     · PC 被控端（screen_webrtc.py）= **relay-only**（实测可用 ⇒ relay↔relay 本身可行）；
+        //     · 本端原来是**无条件 ALL**（2026-08-14 为规避"relay 路径 arrival time=-inf"而改的）
+        //       ⇒ 中继模式下两端策略相反，唯一被控制端接受的通路恰是本端刻意规避的那条。
+        //   ⇒ 现在**跟随 relayPreferred**（判据与控制端逐字一致）：
+        //       中继模式(relayPreferred=true)  ⇒ RELAY（两端都只用 relay 候选，与 PC 被控端对称）；
+        //       直连模式(relayPreferred=false) ⇒ ALL（host/srflx 直连，**保持既有行为、不回归**）。
+        val iceType = if (relayPreferred) PeerConnection.IceTransportsType.RELAY
+                      else PeerConnection.IceTransportsType.ALL
         val rtcConfig = PeerConnection.RTCConfiguration(buildIceServers(relayPreferred)).apply {
             bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE
             rtcpMuxPolicy = PeerConnection.RtcpMuxPolicy.REQUIRE
             continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
-            // ★★★ 2026-08-14 修复中继-2帧：不再 RELAY-only（relay路径arrival time=-inf → 视频只解2帧）
-            iceTransportsType = PeerConnection.IceTransportsType.ALL
-            Log.i(TAG, "$stepTag ★★★ [6/8] 2026-08-14 修复中继-2帧：iceTransportsType=ALL（直连优先，relay兜底；规避TURN relay路径arrival time=-inf）")
+            iceTransportsType = iceType
+            // ★ 必须留痕：本端到底用了哪种策略（真机排查看这一行，并与控制端 [STEP-F] 那行对照）
+            Log.i(TAG, "$stepTag ★★★ [6/8] iceTransportsType=$iceType "
+                    + "(relayPreferred=$relayPreferred；中继=RELAY 与控制端/PC被控端对称，直连=ALL 走 host/srflx)")
         }
         val pc = try {
             Log.i(TAG, "$stepTag [6/8] createPeerConnection 开始...")
