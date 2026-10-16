@@ -8,6 +8,9 @@
         android:required="false" />
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- ★ 2026-10-16 手机被控端自升级：允许本应用发起"安装未知来源应用"
+         （Android 8+ 还须用户在系统设置里对本应用开启"安装未知应用"，见 UpgradeManager.install） -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
@@ -257,6 +260,19 @@
                 tools:node="remove" />
         </provider>
 
+        <!-- ★ 2026-10-16 手机被控端自升级：把自己下载的 APK 通过 FileProvider 交给系统安装器。
+             Android 7+ 直接传 file:// 会抛 FileUriExposedException ⇒ 必须走 content://；
+             authorities 用 ${applicationId}.fileprovider，与 UpgradeManager.install 里
+             `packageName + ".fileprovider"` 一致（被控端/控制端两种 applicationId 都自洽）。 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 
 </manifest>

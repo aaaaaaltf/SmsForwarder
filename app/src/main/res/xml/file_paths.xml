@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  FileProvider 授权路径（2026-10-16 手机被控端自升级）：
+  ★ 只授权应用**私有目录** filesDir/apk —— 自动下载的 APK 就放这里，
+    这也是"检查更新时先看本地是否已有更高版本安装包"的扫描目录（UpgradeManager.apkDir）。
+  ★ 刻意**不**授权外部存储：一是不需要（下载走私有目录），二是避免把整个存储暴露给
+    第三方安装器（Android 7+ 传 file:// 给安装器会 FileUriExposedException）。
+-->
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <files-path name="apk" path="apk/" />
+</paths>

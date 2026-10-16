@@ -33,6 +33,7 @@ import com.hjq.permissions.permission.base.IPermission
 import com.xuexiang.xaop.annotation.SingleClick
 import com.xuexiang.xpage.annotation.Page
 import com.xuexiang.xui.widget.actionbar.TitleBar
+import cn.ppps.forwarder.relay.UpgradeManager
 
 @Page(name = "主动控制·服务端")
 class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListener {
@@ -379,6 +380,73 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         }
     }
 
+    // ==================== 手机被控端自升级（2026-10-16） ====================
+
+    /**
+     * 「检查更新」按钮（用户口径）：
+     *  ① 先看手机上是否已有"自动下载的、高于当前版本的 APK" ⇒ 有则确认后直接安装；
+     *  ② 否则取清单（中继模式→中继云 56790 / 直连模式→NAS，双地址）比对 ⇒ 有新版**自动下载**；
+     *  ③ 下载完成弹确认 → 调起系统安装界面（普通应用无静默安装权限）。
+     * ★ 只由按钮触发，不做自动检查（用户明确要求）。
+     */
+    private fun checkUpdate() {
+        val ctx = context ?: return
+        val act = activity
+        val relay = detectRelayMode()
+        binding?.tvUpdateStatus?.text = "正在检查更新…"
+        Thread {
+            val result = try {
+                UpgradeManager.checkUpdate(ctx, relay) { st ->
+                    act?.runOnUiThread { binding?.tvUpdateStatus?.text = st.text }
+                }
+            } catch (e: Exception) {
+                null to ("检查失败: " + (e.message ?: e.javaClass.simpleName))
+            }
+            val file = result.first
+            val msg = result.second
+            act?.runOnUiThread {
+                binding?.tvUpdateStatus?.text = msg
+                if (file == null) {
+                    android.widget.Toast.makeText(ctx, msg,
+                        android.widget.Toast.LENGTH_LONG).show()
+                    return@runOnUiThread
+                }
+                android.app.AlertDialog.Builder(ctx)
+                    .setTitle("发现新版本")
+                    .setMessage(msg + "\n\n现在就安装吗？")
+                    .setPositiveButton("安装") { _, _ ->
+                        val tip = UpgradeManager.install(ctx, file)
+                        binding?.tvUpdateStatus?.text = tip
+                    }
+                    .setNegativeButton("稍后") { _, _ ->
+                        binding?.tvUpdateStatus?.text =
+                            "已下载到手机，稍后点「检查更新」可直接安装"
+                    }
+                    .show()
+            }
+        }.start()
+    }
+
+    /**
+     * 是否"中继模式"（决定升级来源：中继云 vs NAS）。
+     * ★ 用反射取 TailscaleManager.isRelayConnected，避免与它的内部实现/包名耦合；
+     *   取不到就按直连（NAS）处理 —— UpgradeManager 在首选源失败时会自动回退另一源，
+     *   所以即使判定错，升级依然可用（只是首选顺序不同）。
+     */
+    private fun detectRelayMode(): Boolean {
+        for (cls in listOf("cn.ppps.forwarder.utils.TailscaleManager",
+                           "cn.ppps.forwarder.relay.TailscaleManager")) {
+            try {
+                val m = Class.forName(cls).getMethod("isRelayConnected")
+                val v = m.invoke(null)
+                if (v is Boolean) return v
+            } catch (e: Exception) {
+                // 换下一个候选
+            }
+        }
+        return false
+    }
+
     @SingleClick
     override fun onClick(v: View) {
         when (v.id) {
@@ -396,6 +464,10 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
 
             R.id.btn_one_click_auth -> {
                 oneClickAuthorize()
+            }
+
+            R.id.btn_check_update -> {
+                checkUpdate()
             }
 
             else -> {}
