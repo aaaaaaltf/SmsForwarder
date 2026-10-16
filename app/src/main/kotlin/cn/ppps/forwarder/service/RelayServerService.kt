@@ -293,11 +293,17 @@ class RelayServerService : Service() {
             t.schedule(object : TimerTask() {
                 override fun run() {
                     try {
-                        if (SettingUtils.autoDownloadUpdate) {
+                        if (!SettingUtils.autoDownloadUpdate) {
+                            Log.i(TAG, "自动升级：已在设置中关闭，跳过本轮")
+                        } else if (!cn.ppps.forwarder.relay.UpgradeManager
+                                .isOnWifi(this@RelayServerService)) {
+                            // ★ 2026-10-16 用户要求：**只在 WiFi 下自动下载**，
+                            //   移动网络「不下载也不提示」⇒ 整轮跳过（连清单都不查），
+                            //   界面上不会出现任何打扰；等下次连上 WiFi 的那一轮自然继续。
+                            Log.i(TAG, "自动升级：当前非 WiFi，本轮跳过（不下载/不提示）")
+                        } else {
                             cn.ppps.forwarder.relay.UpgradeManager
                                 .autoCheckAndDownload(this@RelayServerService)
-                        } else {
-                            Log.i(TAG, "自动升级：已在设置中关闭，跳过本轮")
                         }
                     } catch (e: Exception) {
                         Log.w(TAG, "自动升级检测异常: ${e.message}")

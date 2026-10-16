@@ -111,6 +111,17 @@ object UpgradeManager {
         var best: File? = null
         var bestVer = ""
         for (f in files) {
+            // ★★ 2026-10-16【真机踩坑】必须跳过**半截/空包**：服务端拒收时（如白名单不认 .apk）
+            //   会留下 0 字节同名文件，而这里只按文件名解析版本 ⇒ 会被当成"已下载的新版本"
+            //   直接返回 ⇒ 用户点安装必然失败，且**再也不会去联网重下**（短路）。
+            //   安装包至少几 MB，低于 1MB 一律视为坏包并删掉。
+            if (f.length() < 1024L * 1024L) {
+                try {
+                    f.delete()
+                } catch (e: Exception) {
+                }
+                continue
+            }
             val ver = versionFromFileName(f.name)
             if (ver.isEmpty()) continue
             if (!isNewer(ver, local)) continue
@@ -232,6 +243,10 @@ object UpgradeManager {
             conn.disconnect()
             verify(dst, entry)
         } catch (ex: Exception) {
+            try {
+                dst.delete()        // 同上：失败不留半截包
+            } catch (e: Exception) {
+            }
             null to ("下载失败: " + (ex.message ?: ex.javaClass.simpleName))
         }
     }
@@ -239,57 +254,68 @@ object UpgradeManager {
     private fun downloadViaRelay(entry: Entry, onStage: (Stage) -> Unit): Pair<File?, String> {
         val ctx = cn.ppps.forwarder.App.context ?: return null to "无上下文"
         val dst = File(apkDir(ctx), entry.file)
-        var sock: Socket? = null
+        var off = 0L
+        var total = entry.size
         try {
-            sock = Socket()
-            sock.connect(InetSocketAddress(RELAY_HOST, RELAY_PORT), RELAY_TIMEOUT_MS)
-            sock.soTimeout = 30000
-            val input = BufferedInputStream(sock.getInputStream())
-            val out = BufferedOutputStream(sock.getOutputStream())
-            var off = 0L
-            val buf = ByteArray(CHUNK)
             FileOutputStream(dst).use { fos ->
                 while (true) {
-                    val req = "UPGET|${entry.file}|$off|$CHUNK\n"          // 中继云未启令牌（仓库无 token 文件）
-                    out.write(req.toByteArray(Charsets.UTF_8))
-                    out.flush()
-                    val head = readLineUtf8(input) ?: break
-                    val ps = head.split('|')
-                    if (ps.size < 5 || ps[0] != "UPGET") {
-                        return null to ("UPGET 应答异常: " + head.take(80))
+                    // ★★ 2026-10-16【真机踩坑】**每个分片开一个新连接**。
+                    //   服务端 serve_upget 是"一次连接服务一个分片"的语义（PC 侧
+                    //   upgrade_fetch._upget_once 也是每片新连接）；原来复用一个连接连续
+                    //   请求下一片 ⇒ 第二片永远等不到应答，表现为**文件停在 1MB 不动**
+                    //   （第一片 1MB 写完后一直阻塞在 readLine）。
+                    val sock = Socket()
+                    try {
+                        sock.connect(InetSocketAddress(RELAY_HOST, RELAY_PORT), RELAY_TIMEOUT_MS)
+                        sock.soTimeout = 30000
+                        val input = BufferedInputStream(sock.getInputStream())
+                        val out = sock.getOutputStream()
+                        out.write("UPGET|${entry.file}|$off|$CHUNK\n".toByteArray(Charsets.UTF_8))
+                        out.flush()
+                        val head = readLineUtf8(input) ?: break
+                        val ps = head.split('|')
+                        // ★ ERROR 必须先判：`UPGET|ERROR|bad_name` 只有 3 段，先判段数会把
+                        //   真实原因吞成"应答异常"（真机排查时被这条误导过）。
+                        if (ps.size > 1 && ps[1].startsWith("ERROR")) {
+                            return null to ("UPGET 错误: " + ps[1])
+                        }
+                        if (ps.size < 5 || ps[0] != "UPGET") {
+                            return null to ("UPGET 应答异常: " + head.take(80))
+                        }
+                        val real = ps[3].toIntOrNull() ?: 0
+                        ps[4].toLongOrNull()?.let { if (it > 0) total = it }
+                        if (real <= 0) break
+                        var got = 0
+                        val buf = ByteArray(64 * 1024)
+                        while (got < real) {
+                            val n = input.read(buf, 0, Math.min(real - got, buf.size))
+                            if (n <= 0) break
+                            fos.write(buf, 0, n)
+                            got += n
+                            off += n
+                        }
+                        if (total > 0) {
+                            val pct = ((off * 100) / Math.max(1L, total)).toInt()
+                            onStage(Stage("正在下载 $pct%（中继云）", pct))
+                        }
+                        if (real < CHUNK) break      // 最后一片
+                    } finally {
+                        try {
+                            sock.close()
+                        } catch (e: Exception) {
+                        }
                     }
-                    if (ps[1].startsWith("ERROR")) {
-                        return null to ("UPGET 错误: " + ps[1])
-                    }
-                    val real = ps[3].toIntOrNull() ?: 0
-                    val total = ps[4].toLongOrNull() ?: entry.size
-                    if (real <= 0) break
-                    var got = 0
-                    while (got < real) {
-                        val n = input.read(buf, 0, Math.min(real - got, buf.size))
-                        if (n <= 0) break
-                        fos.write(buf, 0, n)
-                        got += n
-                        off += n
-                    }
-                    if (total > 0) {
-                        val pct = ((off * 100) / Math.max(1L, total)).toInt()
-                        onStage(Stage("正在下载 " + pct + "%（中继云）", pct))
-                    }
-                    if (real < CHUNK) break
                 }
             }
             return verify(dst, entry)
         } catch (ex: Exception) {
-            return null to ("中继下载失败: " + (ex.message ?: ex.javaClass.simpleName))
-        } finally {
             try {
-                sock?.close()
+                dst.delete()        // ★ 失败不留半截包（半截包会被 findDownloadedNewer 认成"已下载"）
             } catch (e: Exception) {
             }
+            return null to ("中继下载失败: " + (ex.message ?: ex.javaClass.simpleName))
         }
     }
-
     private fun copyWithProgress(input: InputStream, output: OutputStream, total: Long,
                                  onStage: (Stage) -> Unit) {
         val buf = ByteArray(64 * 1024)
@@ -384,6 +410,24 @@ object UpgradeManager {
         cn.ppps.forwarder.tailscale.TailscaleManager.isRelayConnected()
     } catch (e: Exception) {
         false
+    }
+
+    /**
+     * 当前是否通过 **WiFi** 联网（用户要求：只在 WiFi 下自动下载）。
+     *
+     * ★ minSdk=26 ⇒ 直接用 NetworkCapabilities.TRANSPORT_WIFI，无需旧 NetworkInfo 兼容分支。
+     * ★ 取不到网络信息时**按"非 WiFi"处理**（宁可不下载，也不在用户不知情时走移动数据）。
+     */
+    fun isOnWifi(ctx: Context): Boolean {
+        return try {
+            val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE)
+                    as android.net.ConnectivityManager
+            val net = cm.activeNetwork ?: return false
+            val caps = cm.getNetworkCapabilities(net) ?: return false
+            caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)
+        } catch (e: Exception) {
+            false
+        }
     }
 
     /**
