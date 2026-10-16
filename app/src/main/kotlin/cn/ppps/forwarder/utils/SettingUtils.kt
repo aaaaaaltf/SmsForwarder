@@ -10,6 +10,10 @@ class SettingUtils private constructor() {
         //是否启动时检查更新
         var autoCheckUpdate: Boolean by SharedPreference(AUTO_CHECK_UPDATE, true)
 
+        //★★★ 2026-10-16 自动升级：后台自动检测中继云/NAS 版本并自动下载（默认开）；
+        //   安装不由它触发 —— 仍要用户点「检查更新」确认后才装。
+        var autoDownloadUpdate: Boolean by SharedPreference(SP_AUTO_DOWNLOAD_UPDATE, true)
+
         //是否加入SmsF预览体验计划
         var joinPreviewProgram: Boolean by SharedPreference(JOIN_PREVIEW_PROGRAM, false)
 

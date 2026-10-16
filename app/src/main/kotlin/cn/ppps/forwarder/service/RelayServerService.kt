@@ -45,6 +45,12 @@ import java.util.concurrent.Executors
  *   忙时（亮屏或有控制端连接/推流中）每 5 秒一次，纯待机时降为每 30 秒一次（省电，见 scheduleStateReport）。
  */
 class RelayServerService : Service() {
+    /** 自动升级检测定时器（daemon；服务停止时在 onDestroy 取消）。 */
+    private var upgradeTimer: Timer? = null
+    /** 首轮延迟：服务起来先让中继/直连稳定，再查版本。 */
+    private val AUTO_UPGRADE_FIRST_MS = 60_000L
+    /** 检测周期：6 小时（安装包几十 MB，不宜过密）。 */
+    private val AUTO_UPGRADE_PERIOD_MS = 6 * 3600_000L
 
     private val TAG = "RelayServerService"
     private var client: RelayServerClient? = null
@@ -262,7 +268,48 @@ class RelayServerService : Service() {
         } catch (e: Throwable) {
             Log.w(TAG, "权限保活静默自检失败: ${e.message}")
         }
+        // ★★★ 2026-10-16 自动升级：常驻服务启动后定时检测云端版本并**自动下载**
+        //   （安装仍由用户在界面上点「检查更新」确认，服务不碰安装流程）
+        startAutoUpgrade()
     }
+
+    // ==================== 自动升级检测（2026-10-16） ====================
+
+    /** 后台自动检测云端版本并自动下载（不安装）。首轮延迟 60 秒让连接先稳定。 */
+    private fun startAutoUpgrade() {
+        if (upgradeTimer != null) return
+        upgradeTimer = Timer("AutoUpgradeCheck", true)
+        scheduleAutoUpgrade(AUTO_UPGRADE_FIRST_MS)
+    }
+
+    /**
+     * 一轮自动检测 → 排下一轮（一次一排，与 startStateReport 同款：
+     * 便于每轮按当前设置/网络重新决定）。
+     * ★ 只检测 + 下载，**绝不触发安装**（用户口径：安装要在界面上确认）。
+     */
+    private fun scheduleAutoUpgrade(delayMs: Long) {
+        val t = upgradeTimer ?: return
+        try {
+            t.schedule(object : TimerTask() {
+                override fun run() {
+                    try {
+                        if (SettingUtils.autoDownloadUpdate) {
+                            cn.ppps.forwarder.relay.UpgradeManager
+                                .autoCheckAndDownload(this@RelayServerService)
+                        } else {
+                            Log.i(TAG, "自动升级：已在设置中关闭，跳过本轮")
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "自动升级检测异常: ${e.message}")
+                    }
+                    scheduleAutoUpgrade(AUTO_UPGRADE_PERIOD_MS)
+                }
+            }, delayMs)
+        } catch (e: IllegalStateException) {
+            // timer 已 cancel（服务停止），正常退出
+        }
+    }
+
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent == null) return START_STICKY
@@ -873,6 +920,13 @@ class RelayServerService : Service() {
         executor?.shutdownNow()
         executor = null
         super.onDestroy()
+        // ★ 2026-10-16 自动升级定时器随服务停止一起收掉（否则旧 Timer 还在跑）
+        try {
+            upgradeTimer?.cancel()
+        } catch (e: Exception) {
+            // 忽略
+        }
+        upgradeTimer = null
     }
 
     private fun createNotificationChannel() {

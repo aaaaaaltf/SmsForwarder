@@ -362,6 +362,52 @@ object UpgradeManager {
     }
 
     // ------------------------------------------------------------------
+    // 后台自动检测（不安装）
+    // ------------------------------------------------------------------
+    /** 最近一次自动检测的结果与时间（供界面显示；进程内有效）。 */
+    @Volatile
+    var lastAutoResult: String = ""
+        private set
+    @Volatile
+    var lastAutoTime: Long = 0L
+        private set
+
+    /**
+     * 是否"中继模式"（决定升级来源：中继云 / NAS）。
+     *
+     * ★★ 2026-10-16 真机修正：原实现用**反射**调 `TailscaleManager.isRelayConnected()`，
+     *    而它是 Kotlin **object（单例）的实例方法**，`invoke(null)` 抛异常被 catch 吞掉
+     *    ⇒ 永远 false（现象：界面显示"中继已连接"却总走 NAS）。
+     *    现已确认真实路径并改为**直接调用**（编译期校验）。
+     */
+    fun detectRelayMode(): Boolean = try {
+        cn.ppps.forwarder.tailscale.TailscaleManager.isRelayConnected()
+    } catch (e: Exception) {
+        false
+    }
+
+    /**
+     * 后台**自动检测 + 自动下载**（**不安装**）。
+     *
+     * 用户口径：自动检测中继云/NAS 上的版本，发现高于本机就自动把安装包下到手机；
+     * 「安装」这一步必须由用户点「检查更新」再确认 —— 所以这里只做"查到 + 下好"。
+     * 已下好之后：用户点「检查更新」会先命中本地包（findDownloadedNewer）⇒ 直接弹确认。
+     * ★ 走的是与手动同一套 checkUpdate（含首选源失败自动回退、sha256 校验），不重复实现。
+     */
+    fun autoCheckAndDownload(ctx: Context): String {
+        val msg = try {
+            val (_, text) = checkUpdate(ctx, detectRelayMode()) { }
+            text
+        } catch (e: Exception) {
+            "自动检测异常: " + (e.message ?: e.javaClass.simpleName)
+        }
+        lastAutoResult = msg
+        lastAutoTime = System.currentTimeMillis()
+        android.util.Log.i("AutoUpgrade", "自动检测: $msg")
+        return msg
+    }
+
+    // ------------------------------------------------------------------
     // 主流程（按钮调用；后台线程执行，回调在主线程由调用方处理）
     // ------------------------------------------------------------------
     /**

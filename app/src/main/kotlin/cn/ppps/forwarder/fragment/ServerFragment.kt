@@ -340,6 +340,18 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         } catch (e: Exception) {
             Log.w(TAG, "自动授权完成检测异常: ${e.message}")
         }
+        // ★ 2026-10-16：把后台「自动检测/自动下载」的最新结果带出来 —— 否则用户在界面上
+        //   看不到"其实已经自动下好新版了"（安装仍由他点「检查更新」确认）。
+        try {
+            val t = UpgradeManager.lastAutoTime
+            val m = UpgradeManager.lastAutoResult
+            if (m.isNotEmpty() && t > shownAutoTime) {
+                shownAutoTime = t
+                binding?.tvUpdateStatus?.text = "自动检测：$m（点「检查更新」可确认安装）"
+            }
+        } catch (e: Exception) {
+            // 忽略：状态显示失败不影响功能
+        }
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?) {
@@ -393,10 +405,14 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
      *  ③ 下载完成弹确认 → 调起系统安装界面（普通应用无静默安装权限）。
      * ★ 只由按钮触发，不做自动检查（用户明确要求）。
      */
+    /** 已展示过的自动检测时间戳（避免每次 onResume 重复刷同一句）。 */
+    private var shownAutoTime = 0L
+
+
     private fun checkUpdate() {
         val ctx = context ?: return
         val act = activity
-        val relay = detectRelayMode()
+        val relay = UpgradeManager.detectRelayMode()
         binding?.tvUpdateStatus?.text = "正在检查更新…"
         Thread {
             val result = try {
@@ -431,22 +447,6 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         }.start()
     }
 
-    /**
-     * 是否"中继模式"（决定升级来源：中继云 vs NAS）。
-     *
-     * ★★ 2026-10-16 真机修正：原实现用**反射**调 `TailscaleManager.isRelayConnected()`，
-     *    但它是 Kotlin **object（单例）**的**实例方法**，`invoke(null)` 会抛
-     *    IllegalArgumentException 被 catch 吞掉 ⇒ **永远返回 false**
-     *    （真机现象：界面明明显示"被控端 ↔ 中继：已连接"，却总是按直连走 NAS 取清单）。
-     *    现已确认真实路径/API，改为**直接调用**（同模块，编译期即可校验，不再靠猜类名）。
-     */
-    private fun detectRelayMode(): Boolean {
-        return try {
-            cn.ppps.forwarder.tailscale.TailscaleManager.isRelayConnected()
-        } catch (e: Exception) {
-            false
-        }
-    }
 
     @SingleClick
     override fun onClick(v: View) {

@@ -32,6 +32,9 @@ const val AUTO_CHECK_UPDATE = "auto_check_update"
 const val JOIN_PREVIEW_PROGRAM = "join_preview_program"
 const val IS_AGREE_PRIVACY_KEY = "is_agree_privacy_key"
 const val SP_AUTO_AUTHORIZE_DONE = "sp_auto_authorize_done"
+// ★★★ 2026-10-16 手机被控端自动升级：后台自动检测云端版本并**自动下载**安装包
+//   （安装仍需用户点「检查更新」确认后执行；可用此开关关闭自动下载）
+const val SP_AUTO_DOWNLOAD_UPDATE = "sp_auto_download_update"
 // ★★★ 2026-08-15 一键授权防重复弹窗：电池优化引导已提示过（持久化，避免华为等机型API检测不到时每次启动都重复弹窗）
 const val SP_BATTERY_AUTH_GUIDED = "sp_battery_auth_guided"
 // ★★★ 2026-08-15 华为/荣耀"应用启动管理（允许后台活动）"引导已提示过（持久化，只提示一次）
