@@ -806,30 +806,31 @@
 
             </LinearLayout>
 
+            <!-- ★ 2026-10-16 手机被控端自升级：检查更新
+            （中继模式→中继云、直连模式→NAS 取清单；发现新版本自动下载；
+            本地已有更高版本安装包则直接提示安装；安装走系统安装界面） -->
+            <com.xuexiang.xui.widget.button.ButtonView
+                android:id="@+id/btn_check_update"
+                style="@style/ButtonView.Blue"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="5dp"
+                android:layout_marginTop="8dp"
+                android:gravity="center"
+                android:padding="5dp"
+                android:text="检查更新" />
+
+            <TextView
+                android:id="@+id/tv_update_status"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="5dp"
+                android:layout_marginTop="4dp"
+                android:textSize="12sp"
+                android:text="" />
+
         </LinearLayout>
 
-              <!-- ★ 2026-10-16 手机被控端自升级：检查更新
-                   （中继模式→中继云、直连模式→NAS 取清单；发现新版本自动下载；
-                     本地已有更高版本安装包则直接提示安装；安装走系统安装界面） -->
-              <com.xuexiang.xui.widget.button.ButtonView
-                  android:id="@+id/btn_check_update"
-                  style="@style/ButtonView.Blue"
-                  android:layout_width="match_parent"
-                  android:layout_height="wrap_content"
-                  android:layout_marginStart="5dp"
-                  android:layout_marginTop="8dp"
-                  android:gravity="center"
-                  android:padding="5dp"
-                  android:text="检查更新" />
-
-              <TextView
-                  android:id="@+id/tv_update_status"
-                  android:layout_width="match_parent"
-                  android:layout_height="wrap_content"
-                  android:layout_marginStart="5dp"
-                  android:layout_marginTop="4dp"
-                  android:textSize="12sp"
-                  android:text="" />
 
     </androidx.core.widget.NestedScrollView>
 

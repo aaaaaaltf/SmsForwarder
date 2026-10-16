@@ -96,6 +96,10 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
     override fun initListeners() {
         binding!!.btnToggleServer.setOnClickListener(this)
         binding!!.btnOneClickAuth.setOnClickListener(this)
+        // ★ 2026-10-16【真机踩坑】本页的点击是**逐个显式绑定**（不是 @SingleClick 自动生效）：
+        //   漏了这行 ⇒ 按钮能显示、点下去毫无反应（不崩，只是没事件），
+        //   而状态文本永远是空 —— 真机上排查了半天才发现是"没绑 listener"。
+        binding!!.btnCheckUpdate.setOnClickListener(this)
 
         // ★ 2026-08-28 「授权自检报告」：只重跑检测并展示三类清单（不弹任何授权窗，避免打扰）
         binding!!.btnPermReport.setOnClickListener {
@@ -429,22 +433,19 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
 
     /**
      * 是否"中继模式"（决定升级来源：中继云 vs NAS）。
-     * ★ 用反射取 TailscaleManager.isRelayConnected，避免与它的内部实现/包名耦合；
-     *   取不到就按直连（NAS）处理 —— UpgradeManager 在首选源失败时会自动回退另一源，
-     *   所以即使判定错，升级依然可用（只是首选顺序不同）。
+     *
+     * ★★ 2026-10-16 真机修正：原实现用**反射**调 `TailscaleManager.isRelayConnected()`，
+     *    但它是 Kotlin **object（单例）**的**实例方法**，`invoke(null)` 会抛
+     *    IllegalArgumentException 被 catch 吞掉 ⇒ **永远返回 false**
+     *    （真机现象：界面明明显示"被控端 ↔ 中继：已连接"，却总是按直连走 NAS 取清单）。
+     *    现已确认真实路径/API，改为**直接调用**（同模块，编译期即可校验，不再靠猜类名）。
      */
     private fun detectRelayMode(): Boolean {
-        for (cls in listOf("cn.ppps.forwarder.utils.TailscaleManager",
-                           "cn.ppps.forwarder.relay.TailscaleManager")) {
-            try {
-                val m = Class.forName(cls).getMethod("isRelayConnected")
-                val v = m.invoke(null)
-                if (v is Boolean) return v
-            } catch (e: Exception) {
-                // 换下一个候选
-            }
+        return try {
+            cn.ppps.forwarder.tailscale.TailscaleManager.isRelayConnected()
+        } catch (e: Exception) {
+            false
         }
-        return false
     }
 
     @SingleClick

@@ -391,9 +391,11 @@ object UpgradeManager {
         }
         if (entry == null) return null to ("取清单失败：$why")
         if (!isNewer(entry.version, local)) {
-            return null to ("已是最新（云端 ${entry.version}，本机 $local）")
+            // ★ 把**来源**写进结果：用户要验收"中继模式走中继云、直连模式走 NAS"，
+            //   界面上能直接看到这次是从哪取的清单（不然只能靠耗时猜）。
+            return null to ("已是最新（云端 ${entry.version}，本机 $local；来源 ${entry.source}）")
         }
-        onStage(Stage("发现新版本 ${entry.version}，开始自动下载…", 0))
+        onStage(Stage("发现新版本 ${entry.version}（来源 ${entry.source}），开始自动下载…", 0))
         val (f, msg) = download(entry, onStage)
         if (f == null) return null to ("下载失败：$msg　（云端 ${entry.version}）")
         return f to ("已下载新版本 ${entry.version}：$msg")
