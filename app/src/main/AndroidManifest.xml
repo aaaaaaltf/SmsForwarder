@@ -11,6 +11,16 @@
     <!-- ★ 2026-10-16 手机被控端自升级：允许本应用发起"安装未知来源应用"
          （Android 8+ 还须用户在系统设置里对本应用开启"安装未知应用"，见 UpgradeManager.install） -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <!-- ★ 2026-10-17 手机被控端自升级：Android 11+ 的**包可见性**限制 —— 不加这段，
+         queryIntentActivities(ACTION_VIEW + apk mime) 会返回空、startActivity 可能
+         抛 ActivityNotFoundException（真机：点「立即安装」系统界面一闪即退）。 -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:mimeType="application/vnd.android.package-archive" />
+        </intent>
+    </queries>
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />

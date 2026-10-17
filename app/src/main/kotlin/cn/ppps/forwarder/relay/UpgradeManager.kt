@@ -364,27 +364,80 @@ object UpgradeManager {
      * Android 8+ 未授予"安装未知应用"时先跳设置页，返回提示让用户开完再点一次。
      */
     fun install(ctx: Context, apk: File): String {
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                if (!ctx.packageManager.canRequestPackageInstalls()) {
+        // ★★ 2026-10-17【真机】点「立即安装」后系统界面**一闪即退**、版本没变，而且原因被
+        //   后续的"自动检测"提示覆盖 ⇒ 完全看不到失败原因。这里改为**逐层校验 + 双兜底 +
+        //   把每一步的结果写进返回值**，由界面用弹窗显示（不再只写状态栏）。
+        if (!apk.exists()) return "安装包不存在：${apk.absolutePath}"
+        if (apk.length() < 1024 * 1024) {
+            return "安装包不完整（${apk.length()} 字节），请重新下载"
+        }
+        // 1) "安装未知应用"权限（Android 8+）
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val allowed = try {
+                ctx.packageManager.canRequestPackageInstalls()
+            } catch (e: Exception) {
+                true
+            }
+            if (!allowed) {
+                try {
                     val i = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
                                    Uri.parse("package:" + ctx.packageName))
                     i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     ctx.startActivity(i)
-                    return "已跳到「安装未知应用」设置页：请允许本应用安装，然后**再点一次检查更新**完成安装。"
+                    return "尚未允许「安装未知应用」，已跳转到设置页：请打开开关后返回，再点一次「检查更新」"
+                } catch (e: Exception) {
+                    return "需要「安装未知应用」权限，请到 系统设置 → 应用 → 本应用 中开启"
                 }
             }
-            val uri = FileProvider.getUriForFile(ctx, ctx.packageName + ".fileprovider", apk)
-            val it = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(uri, "application/vnd.android.package-archive")
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-            ctx.startActivity(it)
-            return "已调起系统安装界面，请点「安装」完成升级。"
-        } catch (ex: Exception) {
-            return "调起安装失败: " + (ex.message ?: ex.javaClass.simpleName)
         }
+        // 2) FileProvider URI（路径不对会在这里抛明确异常）
+        val uri: Uri = try {
+            FileProvider.getUriForFile(ctx, ctx.packageName + ".fileprovider", apk)
+        } catch (e: Exception) {
+            return "生成安装包 URI 失败（${e.javaClass.simpleName}: ${e.message}）"
+        }
+        // 3) 主方案：ACTION_VIEW + apk MIME，并**先确认有应用能处理**
+        val mime = "application/vnd.android.package-archive"
+        val view = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, mime)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        val handlers = try {
+            ctx.packageManager.queryIntentActivities(view, 0)
+        } catch (e: Exception) {
+            emptyList()
+        }
+        if (handlers.isNotEmpty()) {
+            return try {
+                ctx.startActivity(view)
+                "已调起系统安装界面（${handlers.size} 个可处理应用），请点「安装」完成升级"
+            } catch (e: Exception) {
+                "调起系统安装界面失败（${e.javaClass.simpleName}: ${e.message}）"
+            }
+        }
+        // 4) 兜底：旧版 ACTION_INSTALL_PACKAGE（部分 ROM 只认这个）
+        val legacy = Intent(Intent.ACTION_INSTALL_PACKAGE).apply {
+            data = uri
+            putExtra(Intent.EXTRA_NOT_UNKNOWN_SOURCE, true)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        val legacyHandlers = try {
+            ctx.packageManager.queryIntentActivities(legacy, 0)
+        } catch (e: Exception) {
+            emptyList()
+        }
+        if (legacyHandlers.isNotEmpty()) {
+            return try {
+                ctx.startActivity(legacy)
+                "已通过兼容方式调起安装界面，请点「安装」完成升级"
+            } catch (e: Exception) {
+                "兼容方式调起失败（${e.javaClass.simpleName}: ${e.message}）"
+            }
+        }
+        // 5) 都没有 ⇒ 明确告知（并给出文件位置，便于手动安装）
+        return "系统未找到可用的安装器。请从文件管理器安装：${apk.absolutePath}"
     }
 
     // ------------------------------------------------------------------
@@ -397,6 +450,36 @@ object UpgradeManager {
     @Volatile
     var lastAutoTime: Long = 0L
         private set
+
+    /** 最近一次取到的**云端版本 / 来源**（弹窗与状态栏显示用）。 */
+    @Volatile
+    var lastRemoteVersion: String = ""
+        private set
+    @Volatile
+    var lastRemoteSource: String = ""
+        private set
+
+    /**
+     * **版本对比文案**（用户要求：点「检查更新」要看到"手机已安装版本"和"云端版本"）。
+     * 形如：
+     *   已安装版本：3.5.0.261017
+     *   云端最新版：3.5.1.261016（来源 中继云 106.12.48.88）
+     *   安装包：phone-3.5.1.261016.apk（56.0 MB，已下载并校验通过）
+     */
+    fun versionCompareText(apk: File): String {
+        val local = localVersionName()
+        val remote = lastRemoteVersion.ifEmpty { versionFromFileName(apk.name) }
+        val src2 = lastRemoteSource
+        val mb = apk.length() / 1024.0 / 1024.0
+        return buildString {
+            append("已安装版本：").append(local).append('\n')
+            append("云端最新版：").append(remote)
+            if (src2.isNotEmpty()) append("（来源 ").append(src2).append("）")
+            append("\n\n安装包：").append(apk.name)
+            append(String.format("（%.1f MB，已下载并校验通过）", mb))
+            append("\n\n现在就安装吗？")
+        }
+    }
 
     /**
      * 是否"中继模式"（决定升级来源：中继云 / NAS）。
@@ -429,6 +512,7 @@ object UpgradeManager {
             false
         }
     }
+
 
     /**
      * 后台**自动检测 + 自动下载**（**不安装**）。
@@ -480,12 +564,14 @@ object UpgradeManager {
             }
         }
         if (entry == null) return null to ("取清单失败：$why")
+        lastRemoteVersion = entry.version
+        lastRemoteSource = entry.source
         if (!isNewer(entry.version, local)) {
             // ★ 把**来源**写进结果：用户要验收"中继模式走中继云、直连模式走 NAS"，
             //   界面上能直接看到这次是从哪取的清单（不然只能靠耗时猜）。
-            return null to ("已是最新（云端 ${entry.version}，本机 $local；来源 ${entry.source}）")
+            return null to ("已是最新（已安装 $local ｜ 云端 ${entry.version} ｜ 来源 ${entry.source}）")
         }
-        onStage(Stage("发现新版本 ${entry.version}（来源 ${entry.source}），开始自动下载…", 0))
+        onStage(Stage("发现新版本 ${entry.version}（已安装 $local ｜ 来源 ${entry.source}），开始自动下载…", 0))
         val (f, msg) = download(entry, onStage)
         if (f == null) return null to ("下载失败：$msg　（云端 ${entry.version}）")
         return f to ("已下载新版本 ${entry.version}：$msg")

@@ -345,7 +345,8 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         try {
             val t = UpgradeManager.lastAutoTime
             val m = UpgradeManager.lastAutoResult
-            if (m.isNotEmpty() && t > shownAutoTime) {
+            // ★ 只在"自动结果比手动操作更新"时展示，避免把"安装失败原因"等手动反馈盖掉
+            if (m.isNotEmpty() && t > shownAutoTime && t > lastManualTime) {
                 shownAutoTime = t
                 binding?.tvUpdateStatus?.text = "自动检测：$m（点「检查更新」可确认安装）"
             }
@@ -407,13 +408,18 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
      */
     /** 已展示过的自动检测时间戳（避免每次 onResume 重复刷同一句）。 */
     private var shownAutoTime = 0L
+    /** 最近一次手动操作（检查更新/点安装）的时间，用来防止自动结果覆盖手动反馈。 */
+    private var lastManualTime = 0L
 
 
     private fun checkUpdate() {
         val ctx = context ?: return
         val act = activity
         val relay = UpgradeManager.detectRelayMode()
-        binding?.tvUpdateStatus?.text = "正在检查更新…"
+        // ★ 用户要求：点「检查更新」时先显示"手机上已安装的版本"，随后补上云端版本
+        lastManualTime = System.currentTimeMillis()
+        binding?.tvUpdateStatus?.text =
+            "已安装版本 ${UpgradeManager.localVersionName()}，正在检查云端版本…"
         Thread {
             val result = try {
                 UpgradeManager.checkUpdate(ctx, relay) { st ->
@@ -431,12 +437,31 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                         android.widget.Toast.LENGTH_LONG).show()
                     return@runOnUiThread
                 }
-                android.app.AlertDialog.Builder(ctx)
+                // ★★ 2026-10-17【真机踩坑】这里原来用的是 android.app.AlertDialog（平台原生
+                //   Holo 风格），在本项目的 Material 主题下**按钮整块不可见** —— 真机截图里
+                //   弹窗只有标题和正文，"安装/稍后"根本看不到也点不到。
+                //   改用项目统一的 XUI MaterialDialog（SplashActivity / CommonUtils /
+                //   KeepAliveGuardian 用的都是它），并把"已安装版本 ↔ 云端版本"写进正文。
+                // ★★ 2026-10-17【真机踩坑二连】
+                //   ① 原来用 android.app.AlertDialog（平台原生 Holo 风格），在本项目 Material
+                //      主题下按钮文字与背景同色 ⇒ 截图里"根本没有安装按钮"。
+                //   ② 换成 XUI MaterialDialog 后，Kotlin 对它的 onPositive/onNegative SAM
+                //      推断失败（Cannot infer a type for this parameter）。
+                //   ⇒ 最终用 **androidx.appcompat.app.AlertDialog**：在任何 AppCompat/Material
+                //      主题下按钮配色正常，且 setPositiveButton 的 lambda 是标准 OnClickListener。
+                androidx.appcompat.app.AlertDialog.Builder(ctx)
                     .setTitle("发现新版本")
-                    .setMessage(msg + "\n\n现在就安装吗？")
-                    .setPositiveButton("安装") { _, _ ->
+                    .setMessage(UpgradeManager.versionCompareText(file))
+                    .setPositiveButton("立即安装") { _, _ ->
+                        lastManualTime = System.currentTimeMillis()
                         val tip = UpgradeManager.install(ctx, file)
                         binding?.tvUpdateStatus?.text = tip
+                        // 结果再用一个弹窗显示（安装界面一闪即退时，用户仍能看到原因）
+                        androidx.appcompat.app.AlertDialog.Builder(ctx)
+                            .setTitle("安装")
+                            .setMessage(tip)
+                            .setPositiveButton("知道了", null)
+                            .show()
                     }
                     .setNegativeButton("稍后") { _, _ ->
                         binding?.tvUpdateStatus?.text =

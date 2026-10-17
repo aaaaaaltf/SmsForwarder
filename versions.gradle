@@ -2,9 +2,9 @@ import java.util.regex.Matcher
 import java.util.regex.Pattern
 
 def build_versions = [:]
-build_versions.version_code = 57  // ★ 2026-10-16 随 3.5.1 递增（覆盖安装需单调递增）
+build_versions.version_code = 57  // 閳?2026-10-17 闂?3.5.1 闁帒顤冮敍鍫ｎ洬閻╂牕鐣ㄧ憗鍛存付閸楁洝鐨熼柅鎺戭杻閿?
 build_versions.version_name = "3.5.1"
-build_versions.min_sdk = 26  // ★ 2026-08-16 Tailscale 集成：libtailscale.aar(Go 内核)要求 minSdk>=26（Android 8.0）；红米/华为均满足（Android 11/12+）
+build_versions.min_sdk = 26  // 閳?2026-08-16 Tailscale 闂嗗棙鍨氶敍姝璱btailscale.aar(Go 閸愬懏鐗?鐟曚焦鐪?minSdk>=26閿涘湏ndroid 8.0閿涘绱辩痪銏㈣儗/閸楀簼璐熼崸鍥ㄥ姬鐡掔绱橝ndroid 11/12+閿?
 build_versions.target_sdk = 33
 build_versions.build_tools = "33.0.1"
 ext.build_versions = build_versions
@@ -31,7 +31,7 @@ versions.rxbinding = "2.2.0"
 versions.butterknife = "10.2.3"
 versions.runner = "1.4.0"
 versions.gson = "2.10.1" //https://github.com/google/gson
-versions.okhttp3 = "3.12.13" //不可升级，为了支持 API 19
+versions.okhttp3 = "3.12.13" //娑撳秴褰查崡鍥╅獓閿涘奔璐熸禍鍡樻暜閹?API 19
 versions.leakcanary = "2.14" //https://github.com/square/leakcanary
 versions.lifecycle = "2.2.0"
 versions.kotlin = '1.9.22'
@@ -74,31 +74,28 @@ def booster = [:]
 booster.gradle_plugin = "com.didiglobal.booster:booster-gradle-plugin:$versions.booster"
 booster.task_all = "com.didiglobal.booster:booster-task-all:$versions.booster_all"
 booster.transform_all = "com.didiglobal.booster:booster-transform-all:$versions.booster_all"
-//采用 cwebp 对资源进行压缩
+//闁插洨鏁?cwebp 鐎电绁┃鎰箻鐞涘苯甯囩紓?
 booster.task_compression_cwebp = "com.didiglobal.booster:booster-task-compression-cwebp:$versions.booster"
-//采用 pngquant 对资源进行压缩
+//闁插洨鏁?pngquant 鐎电绁┃鎰箻鐞涘苯甯囩紓?
 booster.task_compression_pngquant = "com.didiglobal.booster:booster-task-compression-pngquant:$versions.booster"
-//ap_ 文件压缩
+//ap_ 閺傚洣娆㈤崢瀣級
 booster.task_processed_res = "com.didiglobal.booster:booster-task-compression-processed-res:$versions.booster"
-//去冗余资源
+//閸樿鍟戞担娆掔カ濠?
 booster.task_resource_deredundancy = "com.didiglobal.booster:booster-task-resource-deredundancy:$versions.booster"
-//检查 SNAPSHOT 版本
-booster.task_check_snapshot = "com.didiglobal.booster:booster-task-check-snapshot:$versions.booster"
-//性能瓶颈检测
+//濡偓閺?SNAPSHOT 閻楀牊婀?booster.task_check_snapshot = "com.didiglobal.booster:booster-task-check-snapshot:$versions.booster"
+//閹嗗厴閻″爼顣Λ鈧ù?
 booster.transform_lint = "com.didiglobal.booster:booster-transform-lint:$versions.booster"
-//多线程优化
+//婢舵氨鍤庣粙瀣╃喘閸?
 booster.transform_thread = "com.didiglobal.booster:booster-transform-thread:$versions.booster"
-//资源索引内联
-booster.transform_r_inline = "com.didiglobal.booster:booster-transform-r-inline:$versions.booster"
-//WebView 预加载
+//鐠у嫭绨槐銏犵穿閸愬懓浠?booster.transform_r_inline = "com.didiglobal.booster:booster-transform-r-inline:$versions.booster"
+//WebView 妫板嫬濮炴潪?
 booster.transform_webview = "com.didiglobal.booster:booster-transform-webview:$versions.booster"
-//SharedPreferences 优化
-booster.transform_shared_preferences = "com.didiglobal.booster:booster-transform-shared-preferences:$versions.booster"
-//检查覆盖安装导致的 Resources 和 Assets 未加载的 Bug
+//SharedPreferences 娴兼ê瀵?booster.transform_shared_preferences = "com.didiglobal.booster:booster-transform-shared-preferences:$versions.booster"
+//濡偓閺屻儴顩惄鏍х暔鐟佸懎顕遍懛瀵告畱 Resources 閸?Assets 閺堫亜濮炴潪鐣屾畱 Bug
 booster.transform_res_check = "com.didiglobal.booster:booster-transform-res-check:$versions.booster"
-//修复 Toast 在 Android 7.1 上的 Bug
+//娣囶喖顦?Toast 閸?Android 7.1 娑撳﹦娈?Bug
 booster.transform_toast = "com.didiglobal.booster:booster-transform-toast:$versions.booster"
-//处理系统 Crash
+//婢跺嫮鎮婄化鑽ょ埠 Crash
 booster.transform_activity_thread = "com.didiglobal.booster:booster-transform-activity-thread:$versions.booster"
 deps.booster = booster
 
@@ -160,7 +157,7 @@ deps.lifecycle = lifecycle
 ext.deps = deps
 
 /**
- * @return 是否为release
+ * @return 閺勵垰鎯佹稉绨塭lease
  */
 def isRelease() {
     Gradle gradle = getGradle()
@@ -187,8 +184,7 @@ def isRelease() {
 
 ext.isRelease = this.&isRelease
 
-//默认添加代码仓库路径
-static def addRepos(RepositoryHandler handler) {
+//姒涙顓诲ǎ璇插娴狅絿鐖滄禒鎾崇氨鐠侯垰绶?static def addRepos(RepositoryHandler handler) {
     handler.mavenLocal()
     //handler.google { url 'https://maven.aliyun.com/repository/google' }
     //handler.mavenCentral { url 'https://maven.aliyun.com/repository/central' }
@@ -206,18 +202,14 @@ static def addRepos(RepositoryHandler handler) {
 
 ext.addRepos = this.&addRepos
 
-//自动添加XAOP和XRouter插件
-project.buildscript.configurations.each { configuration ->
+//閼奉亜濮╁ǎ璇插XAOP閸滃Router閹绘帊娆?project.buildscript.configurations.each { configuration ->
     def dependencies = getProject().dependencies
     //noinspection ChangeToOperator
     if (configuration.name.equals("classpath")) {
-        //XAOP插件
-        configuration.dependencies.add(dependencies.create(deps.xlibrary.xaop_plugin))
-        //XRouter插件
-        configuration.dependencies.add(dependencies.create(deps.xlibrary.xrouter_plugin))
+        //XAOP閹绘帊娆?        configuration.dependencies.add(dependencies.create(deps.xlibrary.xaop_plugin))
+        //XRouter閹绘帊娆?        configuration.dependencies.add(dependencies.create(deps.xlibrary.xrouter_plugin))
         //AspectJX
         //configuration.dependencies.add(dependencies.create('com.hujiang.aspectjx:gradle-android-plugin-aspectjx:2.0.10'))
-        //kotlin插件
-        configuration.dependencies.add(dependencies.create("org.jetbrains.kotlin:kotlin-gradle-plugin:$versions.kotlin"))
+        //kotlin閹绘帊娆?        configuration.dependencies.add(dependencies.create("org.jetbrains.kotlin:kotlin-gradle-plugin:$versions.kotlin"))
     }
 }
