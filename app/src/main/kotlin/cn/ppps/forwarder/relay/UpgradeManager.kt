@@ -104,6 +104,41 @@ object UpgradeManager {
     }
 
     /** 已下载目录里**版本高于当前**的 APK（用户要求：先查它，有就直接装）。 */
+    // ★★★ 2026-10-18【真机：包被写超】自动检测（启动后 60s）与手动点「检查更新」
+    //   可能**同时**触发下载 ⇒ 两个线程同时 append 同一个文件 ⇒ 真机实测包长
+    //   60.5MB > 目标 57.3MB，sha 必然不符。用互斥保证"同一时刻只有一个下载任务"。
+    private val DL_LOCK = Any()
+
+    @Volatile
+    private var dlBusy = false
+
+    /**
+     * APK 是否可被系统解析 —— 半截包/损坏包会返回 false。
+     *
+     * ★★★ 2026-10-18【真机：安装时提示"解析安装包失败"】
+     *   仅校验 size/sha256 还不够（中断的文件根本没走到校验那一步），必须**直接问系统
+     *   能不能解析这个 APK**。这是"能不能装"最权威的判据。
+     */
+    fun isApkParsable(f: File): Boolean {
+        return try {
+            val ctx = cn.ppps.forwarder.App.context ?: return false
+            ctx.packageManager.getPackageArchiveInfo(f.absolutePath, 0) != null
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /** 从 APK **内部**读 versionName（比文件名可靠；读不到返回空串）。 */
+    fun apkVersionName(f: File): String {
+        return try {
+            val ctx = cn.ppps.forwarder.App.context ?: return ""
+            ctx.packageManager.getPackageArchiveInfo(f.absolutePath, 0)?.versionName ?: ""
+        } catch (e: Exception) {
+            ""
+        }
+    }
+
+    /** 已下载目录里**版本高于当前且完好**的 APK（用户要求：先查它，有就直接装）。 */
     fun findDownloadedNewer(ctx: Context): File? {
         val dir = apkDir(ctx)
         val local = localVersionName()
@@ -111,10 +146,6 @@ object UpgradeManager {
         var best: File? = null
         var bestVer = ""
         for (f in files) {
-            // ★★ 2026-10-16【真机踩坑】必须跳过**半截/空包**：服务端拒收时（如白名单不认 .apk）
-            //   会留下 0 字节同名文件，而这里只按文件名解析版本 ⇒ 会被当成"已下载的新版本"
-            //   直接返回 ⇒ 用户点安装必然失败，且**再也不会去联网重下**（短路）。
-            //   安装包至少几 MB，低于 1MB 一律视为坏包并删掉。
             if (f.length() < 1024L * 1024L) {
                 try {
                     f.delete()
@@ -122,7 +153,13 @@ object UpgradeManager {
                 }
                 continue
             }
-            val ver = versionFromFileName(f.name)
+            // ★★★ 2026-10-18【真机：安装时报"解析安装包失败"】
+            //   原来只按**文件名**解析版本 ⇒ 半截包也被当成"已下载完的新版本"直接返回。
+            //   真机实测：红米 56.9MB/57.3MB、华为 12MB/57.3MB —— 都是中断的包。
+            //   现在：① 必须**能被系统解析**才算可用；② 版本号**从 APK 内部读**；
+            //        ③ 解析不了的**不删**（保留供断点续传），只是不当作"已下好"。
+            if (!isApkParsable(f)) continue
+            val ver = apkVersionName(f).ifEmpty { versionFromFileName(f.name) }
             if (ver.isEmpty()) continue
             if (!isNewer(ver, local)) continue
             if (best == null || isNewer(ver, bestVer)) {
@@ -218,52 +255,126 @@ object UpgradeManager {
     // 下载
     // ------------------------------------------------------------------
     /** 下载 entry 到 filesDir/apk/（中继走 UPGET 分片，NAS 走 HTTP），校验 sha256。 */
+    /**
+     * 下载 entry 到 filesDir/apk/，**支持断点续传**，完成后校验完整性。
+     *
+     * ★★★ 2026-10-18【用户要求：断点续传 + 完整性校验；真机"解析安装包失败"根因】
+     *   ① **断点续传**：文件已存在且比目标小 ⇒ 从 `dst.length()` 处继续
+     *      （中继按分片 offset 续传；NAS 用 `Range: bytes=N-`）；中断时**保留**半截文件。
+     *   ② **完整性**：size 必须**严格等于**清单 size + sha256 匹配 + **系统能解析**，
+     *      三者任一不过都不许进入安装流程。
+     *   ③ 真机现场：红米下到 56.9MB/57.3MB、华为 12MB/57.3MB 就中断，旧逻辑既不留断点
+     *      也不校验完整性 ⇒ 半截包被当"已下好" ⇒ 安装报"解析安装包失败"。
+     */
     fun download(entry: Entry, onStage: (Stage) -> Unit): Pair<File?, String> {
-        val fromRelay = entry.source.startsWith("中继云")
-        return if (fromRelay) downloadViaRelay(entry, onStage) else downloadViaHttp(entry, onStage)
+        synchronized(DL_LOCK) {
+            if (dlBusy) {
+                return null to "已有下载任务在进行，请稍候（并发写同一文件会损坏安装包）"
+            }
+            dlBusy = true
+        }
+        try {
+            return downloadLocked(entry, onStage)
+        } finally {
+            synchronized(DL_LOCK) {
+                dlBusy = false
+            }
+        }
     }
 
-    private fun downloadViaHttp(entry: Entry, onStage: (Stage) -> Unit): Pair<File?, String> {
+    private fun downloadLocked(entry: Entry, onStage: (Stage) -> Unit): Pair<File?, String> {
         val ctx = cn.ppps.forwarder.App.context ?: return null to "无上下文"
         val dst = File(apkDir(ctx), entry.file)
+
+        // ① 已有**完整**文件：先校验，通过就直接用
+        if (dst.exists() && entry.size > 0 && dst.length() == entry.size) {
+            val done = verify(dst, entry)
+            if (done.first != null) return done
+            try {
+                dst.delete()
+            } catch (e: Exception) {
+            }
+        }
+
+        // ② 断点续传起点（文件比目标小 ⇒ 继续；否则删掉重下）
+        var startOff = 0L
+        if (dst.exists()) {
+            val len = dst.length()
+            if (entry.size > 0 && len > 0 && len < entry.size) {
+                startOff = len
+                onStage(Stage("检测到未下完的安装包（已下 ${len / 1024 / 1024}MB / "
+                        + "${entry.size / 1024 / 1024}MB），从断点继续…", -1))
+            } else {
+                try {
+                    dst.delete()
+                } catch (e: Exception) {
+                }
+            }
+        }
+
+        return if (entry.source.startsWith("中继云")) {
+            downloadViaRelay(entry, dst, startOff, onStage)
+        } else {
+            downloadViaHttp(entry, dst, startOff, onStage)
+        }
+    }
+
+    private fun downloadViaHttp(entry: Entry, dst: File, startOff: Long,
+                                onStage: (Stage) -> Unit): Pair<File?, String> {
         val base = entry.source.removePrefix("NAS ").trim()
+        var resumed = startOff > 0
         return try {
             val conn = (URL("$base/${entry.file}" + (if (NAS_TOKEN.isNotEmpty()) "?token=$NAS_TOKEN" else "")).openConnection() as HttpURLConnection)
             conn.connectTimeout = HTTP_TIMEOUT_MS
             conn.readTimeout = HTTP_TIMEOUT_MS
             if (NAS_TOKEN.isNotEmpty()) conn.setRequestProperty("X-Upgrade-Token", NAS_TOKEN)
-            if (conn.responseCode != 200) return null to ("HTTP " + conn.responseCode)
-            // ★ contentLengthLong 需 API 24，本项目要兼容 API 19 ⇒ 用 contentLength
-            val total = conn.contentLength.toLong().takeIf { it > 0 } ?: entry.size
+            // ★ 断点续传：HTTP Range
+            if (startOff > 0) conn.setRequestProperty("Range", "bytes=$startOff-")
+            val code = conn.responseCode
+            if (code == 200 && startOff > 0) resumed = false      // 服务端不支持 Range ⇒ 从头写
+            else if (code != 200 && code != 206) return null to ("HTTP " + code)
+            if (!resumed && dst.exists()) {
+                try {
+                    dst.delete()
+                } catch (e: Exception) {
+                }
+            }
+            val baseDone = if (resumed) startOff else 0L
+            val total = if (resumed) entry.size
+                        else (conn.contentLength.toLong().takeIf { it > 0 } ?: entry.size)
             conn.inputStream.use { input ->
-                FileOutputStream(dst).use { fos ->
-                    copyWithProgress(input, fos, total, onStage)
+                FileOutputStream(dst, resumed).use { fos ->
+                    copyWithProgress(input, fos, total, onStage, baseDone)
                 }
             }
             conn.disconnect()
+            if (resumed) onStage(Stage("续传完成，正在校验…", -1))
             verify(dst, entry)
         } catch (ex: Exception) {
-            try {
-                dst.delete()        // 同上：失败不留半截包
+            // ★ 保留已下载部分，供下次续传（旧实现是直接 delete 掉，等于从头再来）
+            val kept = try {
+                dst.length() / 1024 / 1024
             } catch (e: Exception) {
+                0L
             }
-            null to ("下载失败: " + (ex.message ?: ex.javaClass.simpleName))
+            null to ("下载中断（已保留 ${kept}MB 断点，再点一次可续传）: "
+                    + (ex.message ?: ex.javaClass.simpleName))
         }
     }
 
-    private fun downloadViaRelay(entry: Entry, onStage: (Stage) -> Unit): Pair<File?, String> {
-        val ctx = cn.ppps.forwarder.App.context ?: return null to "无上下文"
-        val dst = File(apkDir(ctx), entry.file)
-        var off = 0L
+    private fun downloadViaRelay(entry: Entry, dst: File, startOff: Long,
+                                 onStage: (Stage) -> Unit): Pair<File?, String> {
+        var off = startOff
         var total = entry.size
+        val resumed = startOff > 0
         try {
-            FileOutputStream(dst).use { fos ->
+            // ★ 断点续传：追加写（startOff 即已下载字节数）
+            FileOutputStream(dst, resumed).use { fos ->
                 while (true) {
                     // ★★ 2026-10-16【真机踩坑】**每个分片开一个新连接**。
                     //   服务端 serve_upget 是"一次连接服务一个分片"的语义（PC 侧
                     //   upgrade_fetch._upget_once 也是每片新连接）；原来复用一个连接连续
-                    //   请求下一片 ⇒ 第二片永远等不到应答，表现为**文件停在 1MB 不动**
-                    //   （第一片 1MB 写完后一直阻塞在 readLine）。
+                    //   请求下一片 ⇒ 第二片永远等不到应答，表现为**文件停在 1MB 不动**。
                     val sock = Socket()
                     try {
                         sock.connect(InetSocketAddress(RELAY_HOST, RELAY_PORT), RELAY_TIMEOUT_MS)
@@ -296,7 +407,7 @@ object UpgradeManager {
                         }
                         if (total > 0) {
                             val pct = ((off * 100) / Math.max(1L, total)).toInt()
-                            onStage(Stage("正在下载 $pct%（中继云）", pct))
+                            onStage(Stage("正在下载 $pct%（中继云" + (if (resumed) "，续传" else "") + "）", pct))
                         }
                         if (real < CHUNK) break      // 最后一片
                     } finally {
@@ -309,17 +420,20 @@ object UpgradeManager {
             }
             return verify(dst, entry)
         } catch (ex: Exception) {
-            try {
-                dst.delete()        // ★ 失败不留半截包（半截包会被 findDownloadedNewer 认成"已下载"）
+            // ★ 保留已下载部分，供下次续传
+            val kept = try {
+                dst.length() / 1024 / 1024
             } catch (e: Exception) {
+                0L
             }
-            return null to ("中继下载失败: " + (ex.message ?: ex.javaClass.simpleName))
+            return null to ("中继下载中断（已保留 ${kept}MB 断点，再点一次可续传）: "
+                    + (ex.message ?: ex.javaClass.simpleName))
         }
     }
     private fun copyWithProgress(input: InputStream, output: OutputStream, total: Long,
-                                 onStage: (Stage) -> Unit) {
+                                 onStage: (Stage) -> Unit, baseDone: Long = 0L) {
         val buf = ByteArray(64 * 1024)
-        var done = 0L
+        var done = baseDone
         while (true) {
             val n = input.read(buf)
             if (n <= 0) break
@@ -327,15 +441,24 @@ object UpgradeManager {
             done += n
             if (total > 0) {
                 val pct = ((done * 100) / Math.max(1L, total)).toInt()
-                onStage(Stage("正在下载 $pct%（NAS）", pct))
+                onStage(Stage("正在下载 $pct%（NAS" + (if (baseDone > 0) "，续传" else "") + "）", pct))
             }
         }
     }
 
+    /**
+     * 完整性校验（三道关）。
+     *
+     * ★ 分级处理（关键）：
+     *   · 大小不符 ⇒ **保留文件**（多半是断点，下次可续传），但不允许安装；
+     *   · 大小对但 sha256 不符 ⇒ **删除**（内容已损坏，续传无意义）；
+     *   · 大小与 sha 都对但**系统解析不了** ⇒ 删除（极端情况，防"解析安装包失败"）。
+     */
     private fun verify(f: File, entry: Entry): Pair<File?, String> {
         if (!f.exists() || f.length() == 0L) return null to "下载文件为空"
         if (entry.size > 0 && f.length() != entry.size) {
-            return null to ("大小不符(" + f.length() + "/" + entry.size + ")，已丢弃")
+            return null to ("大小不符(" + f.length() + "/" + entry.size
+                    + ")，已保留供断点续传")
         }
         if (entry.sha256.isNotEmpty()) {
             val md = MessageDigest.getInstance("SHA-256")
@@ -349,11 +472,22 @@ object UpgradeManager {
             }
             val hex = md.digest().joinToString("") { "%02x".format(it) }
             if (!hex.equals(entry.sha256, ignoreCase = true)) {
-                f.delete()
-                return null to "sha256 校验失败，已丢弃"
+                try {
+                    f.delete()
+                } catch (e: Exception) {
+                }
+                return null to "sha256 校验失败，已删除（需重新下载）"
             }
         }
-        return f to ("校验通过: " + f.name)
+        // ★ 最后一道关：系统必须能解析（否则安装时就是"解析安装包失败"）
+        if (!isApkParsable(f)) {
+            try {
+                f.delete()
+            } catch (e: Exception) {
+            }
+            return null to "安装包结构损坏（系统无法解析），已删除（需重新下载）"
+        }
+        return f to ("校验通过（大小 " + f.length() + " 字节 · sha256 一致）: " + f.name)
     }
 
     // ------------------------------------------------------------------
@@ -368,6 +502,15 @@ object UpgradeManager {
         //   后续的"自动检测"提示覆盖 ⇒ 完全看不到失败原因。这里改为**逐层校验 + 双兜底 +
         //   把每一步的结果写进返回值**，由界面用弹窗显示（不再只写状态栏）。
         if (!apk.exists()) return "安装包不存在：${apk.absolutePath}"
+        // ★★★ 2026-10-18【真机：安装时"解析安装包失败"】装之前直接问系统能不能解析；
+        //   不能 ⇒ 删掉并明确告知（否则用户只看到系统那句含糊的"解析失败"）。
+        if (!isApkParsable(apk)) {
+            try {
+                apk.delete()
+            } catch (e: Exception) {
+            }
+            return "安装包已损坏（系统无法解析），已删除；请点「检查更新」重新下载"
+        }
         if (apk.length() < 1024 * 1024) {
             return "安装包不完整（${apk.length()} 字节），请重新下载"
         }
@@ -438,6 +581,151 @@ object UpgradeManager {
         }
         // 5) 都没有 ⇒ 明确告知（并给出文件位置，便于手动安装）
         return "系统未找到可用的安装器。请从文件管理器安装：${apk.absolutePath}"
+    }
+
+    // ------------------------------------------------------------------
+    // 自绘对话框（唯一能跨 ROM 稳定显示的方案）
+    // ------------------------------------------------------------------
+    /**
+     * **自绘**确认对话框 —— 不依赖任何主题/ROM 样式。
+     *
+     * ★★★ 2026-10-17【华为真机第三次踩坑】
+     *   ① `android.app.AlertDialog`：Material 主题下按钮不可见；
+     *   ② XUI `MaterialDialog`：Kotlin 对 onPositive/onNegative 的 SAM 推断失败（编译不过）；
+     *   ③ `androidx.appcompat.app.AlertDialog`：**红米正常、华为 CET-AL00 仍不可见**
+     *      —— uiautomator 实测按钮节点存在、clickable=true、有 bounds，
+     *      但文字色与背景色被 EMUI 主题改成同一个颜色 ⇒ 视觉上"没有按钮"。
+     *   ⇒ 根治办法：**连 Button 控件都不用**，全部用 TextView + 自绘背景，
+     *      颜色（#212121 文字 / #1565C0 主按钮 / 白底）**硬编码**，主题无从干预。
+     *
+     * @param onInstall 点「立即安装」
+     * @param onLater   点「稍后」
+     */
+    fun showInstallDialog(ctx: Context, apk: File,
+                          onInstall: () -> Unit, onLater: () -> Unit) {
+        val muted = showThemedDialog(
+            ctx, "发现新版本", versionCompareText(apk),
+            positive = "立即安装", negative = "稍后",
+            onPositive = onInstall, onNegative = onLater)
+        if (!muted) {
+            // 兜底：自绘都起不来时，退化成 Toast + 状态栏提示（至少不丢信息）
+            android.widget.Toast.makeText(ctx, "请点状态栏提示处重试安装",
+                                          android.widget.Toast.LENGTH_LONG).show()
+        }
+    }
+
+    /** 只显示一段信息的自绘对话框（用于"安装"结果提示）。返回是否成功显示。 */
+    fun showInfoDialog(ctx: Context, title: String, content: String): Boolean =
+            showThemedDialog(ctx, title, content, positive = "知道了", negative = null,
+                             onPositive = {}, onNegative = null)
+
+    /**
+     * 通用自绘对话框。返回 true = 已显示；false = 构建/显示失败（调用方可退化处理）。
+     *
+     * 结构：LinearLayout(vertical, 白底, 圆角) → 标题(TextView) + 正文(TextView)
+     *       + 按钮行(LinearLayout horizontal, 右对齐) → 取消(TextView) + 确定(TextView 蓝底白字)
+     */
+    private fun showThemedDialog(ctx: Context, title: String, content: String,
+                                 positive: String, negative: String?,
+                                 onPositive: () -> Unit,
+                                 onNegative: (() -> Unit)?): Boolean {
+        return try {
+            val dm = ctx.resources.displayMetrics
+            val den = dm.density
+            fun dp(v: Int): Int = (v * den + 0.5f).toInt()
+
+            val root = android.widget.LinearLayout(ctx).apply {
+                orientation = android.widget.LinearLayout.VERTICAL
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    cornerRadius = dp(14).toFloat()
+                    setColor(android.graphics.Color.WHITE)
+                }
+                setPadding(dp(22), dp(20), dp(22), dp(14))
+            }
+
+            root.addView(android.widget.TextView(ctx).apply {
+                text = title
+                textSize = 19f
+                setTextColor(android.graphics.Color.parseColor("#212121"))
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+            })
+
+            root.addView(android.widget.TextView(ctx).apply {
+                text = content
+                textSize = 14f
+                setTextColor(android.graphics.Color.parseColor("#424242"))
+                setLineSpacing(dp(4).toFloat(), 1f)
+                setPadding(0, dp(14), 0, dp(18))
+            })
+
+            val row = android.widget.LinearLayout(ctx).apply {
+                orientation = android.widget.LinearLayout.HORIZONTAL
+                gravity = android.view.Gravity.END
+            }
+
+            val dlg = android.app.Dialog(ctx)
+            dlg.setContentView(root)
+            dlg.window?.setBackgroundDrawable(
+                android.graphics.drawable.ColorDrawable(android.graphics.Color.TRANSPARENT))
+
+            // 次按钮（描边样式，避免"没有按钮"的观感）
+            if (negative != null) {
+                row.addView(android.widget.TextView(ctx).apply {
+                    text = negative
+                    textSize = 16f
+                    setTextColor(android.graphics.Color.parseColor("#1565C0"))
+                    gravity = android.view.Gravity.CENTER
+                    setPadding(dp(20), dp(10), dp(20), dp(10))
+                    background = android.graphics.drawable.GradientDrawable().apply {
+                        cornerRadius = dp(6).toFloat()
+                        setColor(android.graphics.Color.parseColor("#F1F5FB"))
+                    }
+                    setOnClickListener {
+                        try {
+                            dlg.dismiss()
+                        } catch (e: Exception) {
+                        }
+                        onNegative?.invoke()
+                    }
+                })
+                // 间距
+                row.addView(android.view.View(ctx).apply {
+                    layoutParams = android.widget.LinearLayout.LayoutParams(dp(10), dp(1))
+                })
+            }
+
+            // 主按钮：蓝底白字（颜色硬编码，主题改不了）
+            row.addView(android.widget.TextView(ctx).apply {
+                text = positive
+                textSize = 16f
+                setTextColor(android.graphics.Color.WHITE)
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+                gravity = android.view.Gravity.CENTER
+                setPadding(dp(22), dp(10), dp(22), dp(10))
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    cornerRadius = dp(6).toFloat()
+                    setColor(android.graphics.Color.parseColor("#1565C0"))
+                }
+                setOnClickListener {
+                    try {
+                        dlg.dismiss()
+                    } catch (e: Exception) {
+                    }
+                    onPositive()
+                }
+            })
+
+            root.addView(row)
+            dlg.setCanceledOnTouchOutside(true)
+            dlg.show()
+            // 宽度：屏宽 90%，最长不超过 560dp（平板/折叠屏不至于拉太宽）
+            val w = Math.min((dm.widthPixels * 0.9).toInt(), dp(560))
+            dlg.window?.setLayout(w, android.view.ViewGroup.LayoutParams.WRAP_CONTENT)
+            true
+        } catch (e: Exception) {
+            android.util.Log.e("UpgradeManager", "自绘对话框失败: ${e.message}", e)
+            false
+        }
     }
 
     // ------------------------------------------------------------------

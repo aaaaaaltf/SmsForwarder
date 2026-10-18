@@ -449,25 +449,20 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                 //      推断失败（Cannot infer a type for this parameter）。
                 //   ⇒ 最终用 **androidx.appcompat.app.AlertDialog**：在任何 AppCompat/Material
                 //      主题下按钮配色正常，且 setPositiveButton 的 lambda 是标准 OnClickListener。
-                androidx.appcompat.app.AlertDialog.Builder(ctx)
-                    .setTitle("发现新版本")
-                    .setMessage(UpgradeManager.versionCompareText(file))
-                    .setPositiveButton("立即安装") { _, _ ->
-                        lastManualTime = System.currentTimeMillis()
-                        val tip = UpgradeManager.install(ctx, file)
-                        binding?.tvUpdateStatus?.text = tip
-                        // 结果再用一个弹窗显示（安装界面一闪即退时，用户仍能看到原因）
-                        androidx.appcompat.app.AlertDialog.Builder(ctx)
-                            .setTitle("安装")
-                            .setMessage(tip)
-                            .setPositiveButton("知道了", null)
-                            .show()
-                    }
-                    .setNegativeButton("稍后") { _, _ ->
-                        binding?.tvUpdateStatus?.text =
-                            "已下载到手机，稍后点「检查更新」可直接安装"
-                    }
-                    .show()
+                // ★★ 2026-10-17【华为真机】androidx.appcompat.AlertDialog 在 EMUI 上按钮
+                //   节点存在、可点击，但文字色与背景被主题改成同色 ⇒ 视觉上"没有按钮"。
+                //   ⇒ 改用 UpgradeManager 的**自绘对话框**（纯 TextView + 硬编码颜色），
+                //     任何 ROM 都不受主题影响。
+                lastManualTime = System.currentTimeMillis()
+                UpgradeManager.showInstallDialog(ctx, file, onInstall = {
+                    val tip = UpgradeManager.install(ctx, file)
+                    binding?.tvUpdateStatus?.text = tip
+                    // 安装结果也用自绘弹窗（同样避免主题问题）
+                    UpgradeManager.showInfoDialog(ctx, "安装", tip)
+                }, onLater = {
+                    binding?.tvUpdateStatus?.text =
+                        "已下载到手机，稍后点「检查更新」可直接安装"
+                })
             }
         }.start()
     }
