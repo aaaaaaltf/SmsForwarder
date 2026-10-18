@@ -886,8 +886,24 @@ class RelayServerService : Service() {
         // ★★★ 2026-08-29 尾部追加第6字段【稳定唯一设备ID】。前面5个字段（名称|锁屏|屏幕|电量|充电）
         //   的顺序与含义【完全不变】；旧控制端按索引只读前5段，多出的尾段被自然忽略 → 向后兼容。
         //   用途：控制端判定"这个 100.x 是不是本机被控端的另一入口"时不再依赖无唯一性的状态指纹。
-        return "$name|${if (locked) 1 else 0}|${if (screenOn) 1 else 0}|$battery|$charging|${DeviceIdentity.uniqueDeviceId(this)}"
+        // ★★★ 2026-10-18 尾部再追加第7字段【ver=<版本号>】：
+        //   需求——手机控制端「手机远程」的在线被控端列表要显示被控端版本。
+        //   为什么挂在 devstate 上而不是新增一次版本查询：devstate 本来就是每台设备 5~30 秒一次的
+        //   状态通道（中继/直连/TS 三条链路都走它），版本随它自愈，无需请求-响应配对；
+        //   而 ver000/ver100 是"按命令字分发、不带 pcId"的，多一处探测就多一处串台风险
+        //   （Memory: 屏幕高清 caps 探测就是这么把自己坑死的）。
+        //   兼容性：仍是尾追加 —— 旧控制端只读前 5 段、只在尾部找 `did:` 前缀，本段被忽略。
+        return "$name|${if (locked) 1 else 0}|${if (screenOn) 1 else 0}|$battery|$charging" +
+                "|${DeviceIdentity.uniqueDeviceId(this)}|ver=${appVersionNameSafe()}"
     }
+
+    /** 版本号（取不到给 "?"：装饰性字段绝不能让整帧状态上报失败） */
+    private fun appVersionNameSafe(): String =
+        try {
+            cn.ppps.forwarder.utils.AppUtils.getAppVersionName().ifBlank { "?" }
+        } catch (_: Throwable) {
+            "?"
+        }
 
     override fun onDestroy() {
         Log.i(TAG, "onDestroy")

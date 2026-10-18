@@ -1146,7 +1146,11 @@ object RelayServerHandler {
         }
         // ★★★ 2026-08-29 与 RelayServerService.buildDeviceState 保持完全一致的尾部第6字段【唯一设备ID】。
         //   前5字段（名称|锁屏|屏幕|电量|充电）顺序含义不变，只做尾追加 → 旧控制端忽略尾段即可。
-        return "$name|${if (locked) 1 else 0}|${if (screenOn) 1 else 0}|$battery|$charging|${DeviceIdentity.uniqueDeviceId(ctx)}"
+        // ★★★ 2026-10-18 与被动上报同步追加第7字段【ver=<版本号>】—— 两处格式必须**逐字节同构**，
+        //   否则同一台设备"被动上报"与"探活响应"会交替刷出"有版本/无版本"，列表看着像在闪。
+        val versionName = try { AppUtils.getAppVersionName() } catch (_: Throwable) { "" }
+        return "$name|${if (locked) 1 else 0}|${if (screenOn) 1 else 0}|$battery|$charging" +
+                "|${DeviceIdentity.uniqueDeviceId(ctx)}|ver=${versionName.ifBlank { "?" }}"
     }
 
     private fun <T> parseData(json: String, clazz: Class<T>): T? {
