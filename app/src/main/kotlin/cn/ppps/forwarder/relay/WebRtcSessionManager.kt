@@ -941,6 +941,12 @@ class WebRtcSessionManager(
                                 sd.description.toByteArray(StandardCharsets.UTF_8)
                             )
                             Log.i(TAG, "$stepTag [8/8] setLocalDescription 成功 ✓，发送 ANSWER(len=${answerB64.length})")
+                            // ★★★ 2026-10-19【滞留候选第二道保险】ANSWER 已发出 ⇒ 远端描述必然就绪。
+                            //   此时再幂等补投一次：即便候选因任何未知路径滞留（历史版本缓冲、
+                            //   时序极端交错），也能在这里被捞起注入，不再依赖"下一次 OFFER"。
+                            try { flushPendingRemoteCandidates() } catch (t: Throwable) {
+                                Log.w(TAG, "$stepTag ★ [ICE-CAND] ANSWER 后补投异常(忽略): ${t.message}")
+                            }
                             cb.onSignalingMessage(RelayCommands.CMD_WEBRTC_ANSWER, answerB64)
                             cb.onStatus("ready", "ANSWER已发送，等待ICE连通" + facingSuffix())
                         }
@@ -984,17 +990,32 @@ class WebRtcSessionManager(
      *  ★ 2026-10-09【死锁修复】去掉 @Synchronized：本方法可能在持类锁的 startWithOffer 阻塞期间被
      *    中继线程调用，若再抢类锁会与信令线程形成锁反转；改用**独立 candidateLock** 保护列表。 */
     fun addRemoteIceCandidate(sdpMid: String, sdpMLineIndex: Int, candidateSdpBase64: String) {
-        val pc = peerConnection
-        if (pc == null || !remoteDescriptionSet) {
-            val n = synchronized(candidateLock) {
+        // ★★★ 2026-10-19【滞留竞态修复】原实现"锁外检查 remoteDescriptionSet → 锁内入列表"，
+        //   与 flushPendingRemoteCandidates 的"锁外置位 → 锁内快照"交错时存在窗口：
+        //     · 候选线程判定 remoteDescriptionSet=false（尚未置位）→ 还没来得及 add；
+        //     · flush 线程此刻置位 + 快照（列表里还没有它）+ clear；
+        //     · 候选线程随后 add ⇒ **该候选永远滞留在 pendingRemoteCandidates**（flush 只跑一次）。
+        //   真机后果（2026-10-19 19:47 华为→红米 coturn 铁证）：被控端 allocation 全程
+        //   零 CREATE_PERMISSION ⇒ 控制端的 relay 候选从未进入本端 WebRTC ⇒
+        //   relay↔relay 检查单通 ⇒ ice=FAILED(15s) → 30 秒后回退 JPEG。
+        //   ⇒ 修法：置位与"缓冲 or 直投"的判定全部收进 candidateLock，两线程串行化后
+        //     数学上不存在滞留窗口（要么先缓冲后被 flush 快照带走，要么看到置位直接注入）。
+        // ★ Kotlin 语法：synchronized 是 inline 表达式，直接把"是否已就绪的 pc"作为其
+        //   返回值带出锁外，规避"可空 peerConnection 传入非空参数"的编译错误，
+        //   且锁内判定/锁外注入的死锁纪律保持不变（锁内绝不调用原生方法）。
+        val ready: PeerConnection? = synchronized(candidateLock) {
+            val pc = peerConnection
+            if (pc == null || !remoteDescriptionSet) {
                 pendingRemoteCandidates.add(Triple(sdpMid, sdpMLineIndex, candidateSdpBase64))
-                pendingRemoteCandidates.size
+                Log.i(TAG, "★ [ICE-CAND] 远端候选早到，已缓冲（pending=${pendingRemoteCandidates.size}"
+                        + " pcReady=${pc != null} remoteDescSet=$remoteDescriptionSet）mid=$sdpMid idx=$sdpMLineIndex")
+                null
+            } else {
+                pc
             }
-            Log.i(TAG, "★ [ICE-CAND] 远端候选早到，已缓冲（pending=$n"
-                    + " pcReady=${pc != null} remoteDescSet=$remoteDescriptionSet）mid=$sdpMid idx=$sdpMLineIndex")
-            return
         }
-        doAddIceCandidate(pc, sdpMid, sdpMLineIndex, candidateSdpBase64)
+        if (ready == null) return
+        doAddIceCandidate(ready, sdpMid, sdpMLineIndex, candidateSdpBase64)
     }
 
     /** 真正调用 addIceCandidate（含 WebRTC 114.x 反射兼容），成功/失败都打日志便于实机定位 */
@@ -1035,9 +1056,12 @@ class WebRtcSessionManager(
      *    `Probable deadlock` 刷屏、setRemoteDescription 永不返回、华为收不到 ANSWER 回退 JPEG）。
      *    这里只用独立 candidateLock 取快照，随后在**锁外**逐个注入原生。 */
     private fun flushPendingRemoteCandidates() {
-        remoteDescriptionSet = true
         val pc = peerConnection
+        // ★ 2026-10-19 置位必须与快照在同一临界区内：addRemoteIceCandidate 的
+        //   "缓冲 or 直投"判定也在同一把锁里 ⇒ 快照之后到达的候选必然看到
+        //   remoteDescriptionSet=true 走直投，不可能再滞留（配合上面的修复）。
         val list = synchronized(candidateLock) {
+            remoteDescriptionSet = true
             if (pendingRemoteCandidates.isEmpty()) emptyList()
             else pendingRemoteCandidates.toList().also { pendingRemoteCandidates.clear() }
         }
