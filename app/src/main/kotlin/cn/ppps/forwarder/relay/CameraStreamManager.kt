@@ -632,15 +632,39 @@ object CameraStreamManager {
                         listOf(reader.surface),
                         object : android.hardware.camera2.CameraCaptureSession.StateCallback() {
                             override fun onConfigured(session: android.hardware.camera2.CameraCaptureSession) {
-                                val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                                    addTarget(reader.surface)
-                                    set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-                                }.build()
+                                // ★★★ 2026-10-19【防进程级崩溃】onConfigured 可能在 stop() 之后才回调：
+                                //   device.close() 不会取消已排队的会话配置回调；此刻 device 已失效，
+                                //   createCaptureRequest 会抛 CameraAccessException(CAMERA_ERROR/
+                                //   ENOSYS -38)，且该回调跑在 HandlerThread 上无人捕获 ⇒ FATAL 直接
+                                //   打死进程。真机实锤：2026-10-19 23:46:36 PID 12095
+                                //   "FATAL EXCEPTION: CameraStreamThread"（WebRTC 重建抢摄像头后，
+                                //   遗留 JPEG 流的迟到 onConfigured 触发），进程死亡后
+                                //   RelayServerService(START_STICKY 前台服务) 49 秒后被系统自重启
+                                //   ⇒ 用户看到"App 自己重启了、预览全程无图像"。
+                                //   修法：① 已停止/取帧已停 ⇒ 直接丢弃并关闭迟到会话；
+                                //        ② 全过程 try/catch，异常只记日志 + 收尾，绝不上抛。
+                                if (inStopping || !running) {
+                                    Log.w(TAG, "onConfigured 迟到（会话已停止 inStopping=$inStopping running=$running），丢弃并关闭")
+                                    try { session.close() } catch (_: Exception) {}
+                                    return
+                                }
                                 try {
-                                    session.setRepeatingRequest(request, null, cameraHandler)
-                                    Log.i(TAG, "摄像头流已启动 camera=$cameraId")
-                                } catch (e: Exception) {
-                                    Log.e(TAG, "开始预览失败: ${e.message}")
+                                    val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                                        addTarget(reader.surface)
+                                        set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+                                    }.build()
+                                    try {
+                                        session.setRepeatingRequest(request, null, cameraHandler)
+                                        Log.i(TAG, "摄像头流已启动 camera=$cameraId")
+                                    } catch (e: Exception) {
+                                        Log.e(TAG, "开始预览失败: ${e.message}")
+                                    }
+                                } catch (t: Throwable) {
+                                    // ★ camera 失效/竞争等一切异常都在此止步（历史真机：此处上抛 = 进程猝死）
+                                    Log.e(TAG, "摄像头会话配置异常(已捕获不再崩溃): ${t.javaClass.name}: ${t.message}")
+                                    try { session.close() } catch (_: Exception) {}
+                                    lastError = "摄像头会话配置失败：${t.javaClass.simpleName}"
+                                    stop()
                                 }
                             }
 

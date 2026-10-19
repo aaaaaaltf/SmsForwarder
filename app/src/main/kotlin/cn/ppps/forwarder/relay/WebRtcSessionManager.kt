@@ -305,9 +305,18 @@ class WebRtcSessionManager(
             closeInternal(false)
         }
         running = true
-        // ★★★ 2026-10-09 新会话重置候选缓冲/远端描述标志（防止上一会话残留候选被误补投）
+        // ★★★ 2026-10-09 新会话重置远端描述标志（addIceCandidate 必须在其后）
+        //   ★★★ 2026-10-19【删除 pendingRemoteCandidates.clear()——真机铁证】华为 23:11-23:12
+        //     三次预览两败一成：失败轮中继把 200B 候选小帧插到 5380B OFFER 大帧之前送达 ⇒
+        //     RelayServerHandler 先把候选暂存会话级、OFFER 处理时补投进本 mgr（日志 pending=1），
+        //     随后 startWithOffer 线程的 clear() 把它当"上会话残留"清掉 ⇒ setRemote 成功后
+        //     flush 拿到空列表静默返回 ⇒ 候选永久丢失 ⇒ ICE 无远端候选、连 CHECKING 都没有
+        //     ⇒ 18s 后无图像被关（红米文件日志 23:11:42.805 pending=1 → 42.931 setRemote 成功
+        //     但无"开始补投"日志，实锤）。
+        //     为什么删掉是安全的：① OFFER 处理器每会话都 new WebRtcSessionManager()，新实例
+        //     本来就是空列表，无残留可清；② 实例复用路径（mic 复用等）由 closeInternal 的
+        //     clear 负责；③ 反之这行 clear 与"OFFER 处理器先补投再起线程"的时序必然冲突。
         remoteDescriptionSet = false
-        synchronized(candidateLock) { pendingRemoteCandidates.clear() }
         this.relayPreferred = relayPreferred
         // ★★★ 2026-10-04 屏幕高清模式：只换"采集源"，其余（信令/回退/看门狗/时间戳矫正）全部复用
         this.screenMode = screenMode
@@ -679,7 +688,16 @@ class WebRtcSessionManager(
                 // ★ 打包为 "方向|sdpMid|sdpMLineIndex|candidateSDP_BASE64"
                 val sdp64 = Base64.getEncoder().encodeToString(candidate.sdp.toByteArray(StandardCharsets.UTF_8))
                 val payload = "ANSWERER|${candidate.sdpMid}|${candidate.sdpMLineIndex}|$sdp64"
-                cb.onSignalingMessage(RelayCommands.CMD_WEBRTC_CANDIDATE, payload)
+                // ★★★ 2026-10-19【丢弃迟到信令】会话已被关闭（HANGUP/新 OFFER 抢占）时，
+                //   迟到的候选/ANSWER 对控制端是纯噪音：真机 23:45:26 红米给一个早已
+                //   HANGUP 掉的会话补发了 ANSWER（o=-278，比正常 ANSWER 晚 2.9 秒），
+                //   控制端靠幂等去重才没乱套。这里从源头拦住：running=false 直接丢弃。
+                if (running) {
+                    cb.onSignalingMessage(RelayCommands.CMD_WEBRTC_CANDIDATE, payload)
+                } else {
+                    Log.w(TAG, "★ 会话已关闭，丢弃迟到 ICE 候选（mid=${candidate.sdpMid}）")
+                    return
+                }
                 // ★★★ 2026-08-12 TS直连修复：host候选的IP是底层WiFi/蜂窝IP而非Tailscale IP，
                 //   跨设备TS直连ICE两端候选都不含Tailscale IP → 无法选路。将host候选IP改写为本机Tailscale IP
                 //   额外发送一份，对端即可通过Tailscale虚拟网直连本机tun0。
@@ -947,7 +965,12 @@ class WebRtcSessionManager(
                             try { flushPendingRemoteCandidates() } catch (t: Throwable) {
                                 Log.w(TAG, "$stepTag ★ [ICE-CAND] ANSWER 后补投异常(忽略): ${t.message}")
                             }
-                            cb.onSignalingMessage(RelayCommands.CMD_WEBRTC_ANSWER, answerB64)
+                            // ★ 2026-10-19 会话已关闭（快速切换时 HANGUP 抢先到达）⇒ 丢弃迟到 ANSWER
+                            if (running) {
+                                cb.onSignalingMessage(RelayCommands.CMD_WEBRTC_ANSWER, answerB64)
+                            } else {
+                                Log.w(TAG, "$stepTag ★ 会话已关闭，丢弃迟到 ANSWER（len=${answerB64.length}）")
+                            }
                             cb.onStatus("ready", "ANSWER已发送，等待ICE连通" + facingSuffix())
                         }
                         pc.setLocalDescription(object : SdpObserverAdapter() {
