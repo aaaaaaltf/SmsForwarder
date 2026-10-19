@@ -399,7 +399,9 @@ object TailscaleManager {
     }
 
     /** authkey 无 UI 登录（幂等） */
-    private fun startLogin(ctx: Context) {
+    // ★ 2026-10-19 放开为 public：TailscaleCredBootstrap（NAS 自助补凭证）保存 authkey 后
+    //   需要立即用新 key 重登；startLogin 本身有 LOGIN_IN_FLIGHT 在途保护，重入安全。
+    fun startLogin(ctx: Context) {
         val a = app ?: return
         try {
             var authkey = getAuthkey(ctx)
@@ -418,6 +420,14 @@ object TailscaleManager {
                             startLogin(ctx)
                         } else {
                             Log.w(TAG, "★ 暂无法自动签发 AuthKey（无凭证或换取失败），等待控制端下发凭证后自动重试")
+                            // ★★★ 2026-10-19【NAS 自助补凭证】"等控制端下发"之外再给一条活路：
+                            //   无中继/新装机时控制端也连不上 ⇒ 从 NAS 升级仓库自助补凭证
+                            //   （与 PC 被控端 ensure_ts_cred 同款；内部带 5 分钟退避与单飞保护）。
+                            try {
+                                TailscaleCredBootstrap.bootstrapAsync(ctx)
+                            } catch (t: Throwable) {
+                                Log.w(TAG, "★ NAS 补凭证触发失败(忽略): ${t.message}")
+                            }
                         }
                     } catch (t: Throwable) {
                         Log.w(TAG, "OAuth authkey 处理异常: " + t.message)
