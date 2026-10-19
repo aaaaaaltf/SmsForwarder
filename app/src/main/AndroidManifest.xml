@@ -65,10 +65,9 @@
     <!-- 后台启动点亮屏幕Activity（远程点亮被控端屏幕） -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <!-- 远程麦克风采集（被控端采集麦克风音频推送到控制端免提播放） -->
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />    <!-- ★ 2026-10-15 手机操作记录：读取本机应用使用记录（特殊访问权限，
-         安装后仍需在 系统设置→隐私→特殊访问权限→使用情况访问 手动开启） -->
-    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"
-        tools:ignore="ProtectedPermissions" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- ★ 2026-10-18 手机操作记录（UsageStats）已整体移除，PACKAGE_USAGE_STATS 权限随之删除：
+         用户明确"手机上所有操作记录需求都指 PC 被控端"，留着等于白申请一个特殊权限。 -->
 
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <!-- Android 14+ 后台录制音频必须声明 microphone 类型前台服务 -->

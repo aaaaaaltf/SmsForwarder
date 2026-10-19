@@ -448,6 +448,11 @@ object RelayServerHandler {
                     RelayCommands.RSP_FS_MKDIR to handleFsMkdir(payloadText)
                 }
 
+                RelayCommands.CMD_FS_PASTE -> {
+                    // ★ 2026-10-18 复制/剪切粘贴（语义与 PC 被控端 modules/fs_paste.py 逐条对齐）
+                    RelayCommands.RSP_FS_PASTE to handleFsPaste(payloadText)
+                }
+
                 RelayCommands.CMD_FS_GET -> {
                     // ★ 下载：启动后台线程推送（RSP_FS_GET → CMD_FS_DATA分块 → CMD_FS_DONE），此处不返回
                     startFsDownload(payloadText, sender, peerKey)
@@ -1062,15 +1067,6 @@ object RelayServerHandler {
                     null
                 }
 
-                // ==================== 手机操作记录（2026-10-15 新增） ====================
-                // 控制端拉取本机应用使用记录（UsageStats 前台时段）。
-                // 与 PC 被控端的 acthst 是两套数据源：这里取的是**手机自己的**使用记录。
-                RelayCommands.CMD_PHONE_ACTIVITY -> {
-                    val (data, err) = handlePhoneActivity(payloadText)
-                    if (data == null) return RelayCommands.RSP_PHONE_ACTIVITY to error(err ?: "查询失败")
-                    RelayCommands.RSP_PHONE_ACTIVITY to success(data)
-                }
-
                 else -> null
             }
         } catch (e: Exception) {
@@ -1207,126 +1203,6 @@ object RelayServerHandler {
             AppUtils.getAppVersionCode(),
             AppUtils.getAppVersionName(),
         )
-    }
-
-    // ==================== 手机操作记录（2026-10-15 新增） ====================
-
-    /**
-     * 拉取本机应用使用记录（系统 UsageStats 的前台时段）。
-     *
-     * 负载：`limit|keyword|days`（keyword/days 可空；days=0 表示最近 30 天）。
-     * 返回 Pair(data, err)：data 非空时由调用方包 success()；为空时 err 为原因
-     * （控制端直接弹原因，不干等——与 PC 侧 #META|ERROR 一个语义）。
-     *
-     * ★ 为什么用 queryEvents 而不是 queryUsageStats：后者只有聚合值（总时长），
-     *   拿不到"什么时候用的"，而控制端表格要 开始/结束/时长 三列。
-     * ★ 权限：使用情况访问是**特殊访问权限**（系统设置里手动开），运行时申请不到，
-     *   所以这里只做检查，未授权就明确返回原因，由控制端提示用户去哪开。
-     */
-    private fun handlePhoneActivity(payloadText: String): Pair<Any?, String?> {
-        val ctx = App.context ?: return null to "无法获取应用上下文"
-        val parts = payloadText.split("|")
-        val limit = parts.getOrNull(0)?.trim()?.toIntOrNull() ?: 1000
-        val keyword = (parts.getOrNull(1)?.trim() ?: "").lowercase()
-        val days = parts.getOrNull(2)?.trim()?.toIntOrNull() ?: 0
-
-        if (!hasUsageStatsPermission(ctx)) {
-            return null to "未授权「使用情况访问」：请在 系统设置 → 隐私/安全 → 特殊访问权限 → 使用情况访问 里为本应用开启"
-        }
-        val usm = ctx.getSystemService(Context.USAGE_STATS_SERVICE) as? android.app.usage.UsageStatsManager
-            ?: return null to "本机不支持 UsageStatsManager"
-        val end = System.currentTimeMillis()
-        val begin = end - (if (days > 0) days.toLong() else 30L) * 24L * 3600L * 1000L
-
-        // queryEvents：ACTIVITY_RESUMED/PAUSED 配对出每个应用的前台时段
-        val events = usm.queryEvents(begin, end)
-        val ev = android.app.usage.UsageEvents.Event()
-        val open = HashMap<String, Long>()
-        val segs = ArrayList<Triple<String, Long, Long>>()   // (pkg, start, end)
-        while (events.hasNextEvent()) {
-            events.getNextEvent(ev)
-            val pkg = ev.packageName ?: continue
-            when (ev.eventType) {
-                android.app.usage.UsageEvents.Event.ACTIVITY_RESUMED -> open[pkg] = ev.timeStamp
-                android.app.usage.UsageEvents.Event.ACTIVITY_PAUSED -> {
-                    val st = open.remove(pkg)
-                    if (st != null && ev.timeStamp > st) segs.add(Triple(pkg, st, ev.timeStamp))
-                }
-            }
-        }
-        // 查询结束瞬间仍在前台的：用当前时间收尾（否则这条记录永远不完整）
-        for ((pkg, st) in open) segs.add(Triple(pkg, st, end))
-        segs.sortByDescending { it.second }
-
-        val pm = ctx.packageManager
-        val fmt = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US)
-        val records = ArrayList<HashMap<String, String>>()
-        for ((pkg, st, en) in segs) {
-            if (records.size >= limit) break
-            var label = pkg
-            var version = ""
-            var installPath = ""
-            try {
-                val ai = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    pm.getApplicationInfo(pkg, android.content.pm.PackageManager.ApplicationInfoFlags.of(0))
-                } else {
-                    @Suppress("DEPRECATION") pm.getApplicationInfo(pkg, 0)
-                }
-                label = pm.getApplicationLabel(ai).toString()
-                installPath = ai.sourceDir ?: ""
-                val pi = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    pm.getPackageInfo(pkg, android.content.pm.PackageManager.PackageInfoFlags.of(0))
-                } else {
-                    @Suppress("DEPRECATION") pm.getPackageInfo(pkg, 0)
-                }
-                version = pi.versionName ?: ""
-            } catch (_: Exception) {
-                // 已卸载/对本品不可见：保留包名当应用名，不猜
-            }
-            // 发行商：安卓没有直接 API（只有签名/安装来源），统一留空，不编
-            val durSec = ((en - st) / 1000L).toInt()
-            if (keyword.isNotEmpty()
-                && !(label + pkg).lowercase().contains(keyword)) continue
-            val row = HashMap<String, String>()
-            row["start"] = fmt.format(java.util.Date(st))
-            row["end"] = fmt.format(java.util.Date(en))
-            row["duration"] = String.format("%02d:%02d:%02d", durSec / 3600, (durSec % 3600) / 60, durSec % 60)
-            row["kind"] = "应用使用"
-            row["app"] = label
-            row["package"] = pkg
-            row["version"] = version
-            row["publisher"] = ""
-            row["content"] = label
-            row["path"] = installPath
-            records.add(row)
-        }
-        val meta = HashMap<String, Any>()
-        meta["rows"] = records.size
-        meta["os"] = "Android " + Build.VERSION.RELEASE
-        meta["range"] = "%s ~ %s".format(fmt.format(java.util.Date(begin)), fmt.format(java.util.Date(end)))
-        meta["note"] = "数据来源：系统 UsageStats（前台时段；发行商安卓无 API 恒为空）"
-        val data = HashMap<String, Any>()
-        data["meta"] = meta
-        data["records"] = records
-        return data to null
-    }
-
-    /** 使用情况访问权限（特殊权限，运行时申请不到，只能去系统设置开）。 */
-    private fun hasUsageStatsPermission(ctx: Context): Boolean {
-        return try {
-            val appOps = ctx.getSystemService(Context.APP_OPS_SERVICE) as? android.app.AppOpsManager
-                ?: return false
-            val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                appOps.unsafeCheckOpNoThrow(android.app.AppOpsManager.OPSTR_GET_USAGE_STATS,
-                    android.os.Process.myUid(), ctx.packageName)
-            } else {
-                @Suppress("DEPRECATION") appOps.checkOpNoThrow(android.app.AppOpsManager.OPSTR_GET_USAGE_STATS,
-                    android.os.Process.myUid(), ctx.packageName)
-            }
-            mode == android.app.AppOpsManager.MODE_ALLOWED
-        } catch (_: Exception) {
-            false
-        }
     }
 
     private fun handleBattery(): BatteryInfo {
@@ -1574,6 +1450,130 @@ object RelayServerHandler {
             Log.w(TAG, "新建文件夹失败: $p ${e.message}")
             "0|failed|${e.message ?: "新建文件夹失败"}"
         }
+    }
+
+    /**
+     * ★ 2026-10-18 粘贴（复制/剪切）—— 与 PC 被控端 `modules/fs_paste.py` 的语义逐条对齐：
+     *   payload = `mode|dest_dir|owflags|src1|src2|...`
+     *   · mode=copy 保留源 / mode=move 移动（同分区 rename，跨分区复制+删除）
+     *   · 同名且未允许覆盖 => 跳过（不算失败，回执里计数）
+     *   · 允许覆盖 => 先递归删目标再写入（Android 无只读属性问题，无需清只读）
+     *   · 源与目标同一路径 => 跳过，**绝不动源**
+     * @return "1|success|已复制 N 项[，跳过 M 项]" 或 "0|failed|…"
+     */
+    private fun handleFsPaste(payload: String): String {
+        val parts = payload.trim().split("|")
+        if (parts.size < 4) return "0|failed|粘贴报文不合法（至少需要 mode|dest|owflags|src）"
+        val mode = parts[0].trim().lowercase()
+        if (mode != "copy" && mode != "move" && mode != "probe") {
+            return "0|failed|未知的粘贴模式: ${parts[0]}"
+        }
+        val destDir = parts[1].trim()
+        if (destDir.isEmpty()) return "0|failed|粘贴目标目录为空"
+        val flags = parts[2].trim()
+        val srcs = parts.drop(3).filter { it.isNotBlank() }
+        if (srcs.isEmpty()) return "0|failed|没有要粘贴的源"
+        val dest = File(destDir)
+        if (!dest.isDirectory) return "0|failed|目标目录不存在: $destDir"
+
+        // ★ 2026-10-18 probe：只回报目标里的同名项（含 D/F 类型），**不写任何东西**。
+        //   控制端据此"有同名才弹窗、逐项询问"，与 PC 端 modules/fs_paste.probe_conflicts 同构。
+        if (mode == "probe") return probeFsConflicts(dest, srcs)
+
+        val verb = if (mode == "copy") "复制" else "移动"
+        var done = 0
+        var skipped = 0
+        val errors = ArrayList<String>()
+        for ((idx, srcPath) in srcs.withIndex()) {
+            val allow = idx < flags.length && flags[idx] == '1'
+            val src = File(srcPath)
+            try {
+                if (!src.exists()) {
+                    errors.add("${src.name}：源已不存在")
+                    continue
+                }
+                val target = File(dest, src.name)
+                if (target.absolutePath.equals(src.absolutePath, ignoreCase = true)) {
+                    skipped++
+                    Log.i(TAG, "[粘贴] 跳过（源与目标同一路径）: $srcPath")
+                    continue
+                }
+                if (target.exists()) {
+                    if (!allow) {
+                        skipped++
+                        Log.i(TAG, "[粘贴] 跳过（同名已存在，未选择覆盖）: ${target.absolutePath}")
+                        continue
+                    }
+                    deleteRecursively(target)
+                }
+                val ok = if (mode == "copy") copyRecursively(src, target) else moveRecursively(src, target)
+                if (ok) {
+                    done++
+                    Log.i(TAG, "[粘贴] ${verb}成功: $srcPath -> ${target.absolutePath}")
+                } else {
+                    errors.add("${src.name}：${verb}失败")
+                }
+            } catch (e: Exception) {
+                errors.add("${src.name}：${e.message ?: (verb + "失败")}")
+                Log.w(TAG, "[粘贴] ${verb}失败: $srcPath ${e.message}")
+            }
+        }
+
+        val detail = StringBuilder("已$verb $done 项")
+        if (skipped > 0) detail.append("，跳过 $skipped 项")
+        if (errors.isNotEmpty()) {
+            detail.append("，失败 ").append(errors.size).append(" 项：")
+            detail.append(errors.take(3).joinToString("; "))
+        }
+        return if (errors.isEmpty()) "1|success|$detail" else "0|failed|$detail"
+    }
+
+    /**
+     * 粘贴前探测同名项（不写盘）。回执格式与 PC 端一致：
+     *   `conflicts=N|name1|D|name2|F`（每项带 D=目录 / F=文件）
+     */
+    private fun probeFsConflicts(dest: File, srcs: List<String>): String {
+        val items = ArrayList<String>()
+        val seen = HashSet<String>()
+        for (srcPath in srcs) {
+            val nm = File(srcPath).name
+            if (nm.isEmpty() || !seen.add(nm.lowercase())) continue
+            val target = File(dest, nm)
+            if (target.exists()) {
+                items.add(nm)
+                items.add(if (target.isDirectory) "D" else "F")
+            }
+        }
+        val detail = if (items.isEmpty()) "conflicts=0" else "conflicts=${items.size / 2}|" + items.joinToString("|")
+        Log.i(TAG, "[粘贴] 探测同名项: $detail（目标 ${dest.absolutePath}）")
+        return "1|success|$detail"
+    }
+
+    /** 递归复制（文件或整棵目录）；目标由调用方负责先删（覆盖语义） */
+    private fun copyRecursively(src: File, dst: File): Boolean {
+        if (src.isDirectory) {
+            if (!dst.exists() && !dst.mkdirs()) return false
+            val children = src.listFiles() ?: return true
+            for (c in children) {
+                if (!copyRecursively(c, File(dst, c.name))) return false
+            }
+            return true
+        }
+        src.inputStream().use { input ->
+            dst.outputStream().use { output -> input.copyTo(output) }
+        }
+        try {
+            dst.setLastModified(src.lastModified())
+        } catch (_: Exception) {
+        }
+        return true
+    }
+
+    /** 移动：同分区 rename；跨分区（/sdcard 与 /storage/xxx）退化为 复制 + 删除 */
+    private fun moveRecursively(src: File, dst: File): Boolean {
+        if (src.renameTo(dst)) return true
+        if (!copyRecursively(src, dst)) return false
+        return deleteRecursively(src)
     }
 
     private fun deleteRecursively(f: File): Boolean {

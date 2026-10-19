@@ -109,14 +109,6 @@ object RelayCommands {
 
     /** PC协议版本查询（控制端用于确认被控端在线，兼容PC被控端协议） */
     const val CMD_GET_VERSION = "ver000000000"
-// ==================== 手机操作记录（2026-10-15 新增） ====================
-/** 控制端 -> 手机被控端：拉取本机应用使用记录（负载 limit|keyword|days，keyword/days 可空） */
-const val CMD_PHONE_ACTIVITY = "phact0000000"
-
-/** 手机被控端 -> 控制端：应用使用记录响应（JSON：{meta:{...}, records:[...]}） */
-const val RSP_PHONE_ACTIVITY = "phact1000000"
-
-
     /** 版本信息响应（负载: 版本|设备名|用户|isAdmin|isService，ASCII内容GBK/UTF-8解码一致） */
     const val CMD_VERSION_INFO = "ver100000000"
 
@@ -243,6 +235,14 @@ const val RSP_PHONE_ACTIVITY = "phact1000000"
 
     /** 新建文件夹响应（负载: "1|success|信息" 或 "0|failed|原因"，原因含"已存在"表示重名冲突） */
     const val RSP_FS_MKDIR = "sfmkdirrsp00"
+
+    // ==================== ★ 复制/剪切粘贴（2026-10-18，控制端→被控端） ====================
+    /** 粘贴（负载: mode|dest_dir|owflags|src1|src2|...，语义与 PC 被控端 modules/fs_paste.py 完全一致：
+     *  mode=copy 保留源 / mode=move 移动；owflags 与 src 一一对应，'1'=允许覆盖同名目标） */
+    const val CMD_FS_PASTE = "sfpaste00000"
+
+    /** 粘贴响应（负载: "1|success|已复制 2 项" 或 "0|failed|原因"） */
+    const val RSP_FS_PASTE = "sfpasterst00"
 
     // ==================== ★ WebRTC 信令命令（2026-08-10新增，复用现有命令通道传SDP/ICE） ★ ====================
     // ★ 摄像头预览 + 麦克风同步的WebRTC模式：控制端发送CMD_WEBRTC_OFFER(而非分开的vcdstr/sfmicstr)，
