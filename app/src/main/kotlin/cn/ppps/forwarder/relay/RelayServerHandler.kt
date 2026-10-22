@@ -448,6 +448,11 @@ object RelayServerHandler {
                     RelayCommands.RSP_FS_MKDIR to handleFsMkdir(payloadText)
                 }
 
+                RelayCommands.CMD_FS_RENAME -> {
+                    // ★ 2026-10-22 重命名（文件+文件夹）：负载=旧路径|新名称；重名/源不存在回失败，控制端据此提示并刷新确认
+                    RelayCommands.RSP_FS_RENAME to handleFsRename(payloadText)
+                }
+
                 RelayCommands.CMD_FS_PASTE -> {
                     // ★ 2026-10-18 复制/剪切粘贴（语义与 PC 被控端 modules/fs_paste.py 逐条对齐）
                     RelayCommands.RSP_FS_PASTE to handleFsPaste(payloadText)
@@ -1449,6 +1454,52 @@ object RelayServerHandler {
         } catch (e: Exception) {
             Log.w(TAG, "新建文件夹失败: $p ${e.message}")
             "0|failed|${e.message ?: "新建文件夹失败"}"
+        }
+    }
+
+    /**
+     * ★ 2026-10-22 重命名文件/文件夹（负载: 旧路径|新名称）
+     * 语义与 PC 被控端 modules/service_client_remote_commands.py:_cmd_rename 对齐：
+     *   · 源不存在 / 参数不完整 → 0|failed|原因
+     *   · 目标已存在（文件或文件夹均算冲突）→ 0|failed|已存在: 名称（控制端据此提示）
+     *   · 成功 → 1|success|重命名成功
+     *   · 无权限（含 renameTo 被系统拒绝/SecurityException）→ 0|failed|无权限重命名…（不提权，
+     *     控制端原样展示，2026-10-23 用户要求）
+     * 注意：新名称只取 basename，拼在源的同级目录——新值里带路径分隔符也按 basename 处理，
+     *   避免"偷偷移动"到别的目录（与 PC 侧 pathlib parent/new 语义一致）。
+     */
+    private fun handleFsRename(payload: String): String {
+        val text = payload.trim()
+        if (text.isEmpty()) return "0|failed|参数为空"
+        val parts = text.split("|", limit = 2)
+        if (parts.size < 2 || parts[0].trim().isEmpty() || parts[1].trim().isEmpty()) {
+            return "0|failed|参数不完整"
+        }
+        val oldPath = parts[0].trim()
+        val newName = File(parts[1].trim()).name // 只取 basename，防止借改名偷移位置
+        val src = File(oldPath)
+        if (!src.exists()) return "0|failed|文件或目录不存在"
+        val parent = src.parentFile
+        if (parent == null) return "0|failed|无法确定上级目录"
+        if (newName.isEmpty()) return "0|failed|新名称为空"
+        val dst = File(parent, newName)
+        if (dst.exists()) return "0|failed|已存在: $newName"
+        return try {
+            if (src.renameTo(dst)) {
+                "1|success|重命名成功: ${src.name} -> $newName"
+            } else {
+                // ★ 2026-10-23 用户要求：不提权。Android 11+ 对公共目录的改写受
+                //   MANAGE_EXTERNAL_STORAGE/SAF 限制，renameTo 返回 false 绝大多数
+                //   就是权限问题——明确回"无权限重命名"，控制端原样展示给用户。
+                Log.w(TAG, "无权限重命名（系统拒绝）: $oldPath -> $newName")
+                "0|failed|无权限重命名（系统拒绝修改该位置，请检查存储权限）"
+            }
+        } catch (e: SecurityException) {
+            Log.w(TAG, "无权限重命名: $oldPath -> $newName ${e.message}")
+            "0|failed|无权限重命名（${e.message ?: "安全权限不足"}）"
+        } catch (e: Exception) {
+            Log.w(TAG, "重命名失败: $oldPath -> $newName ${e.message}")
+            "0|failed|${e.message ?: "重命名失败"}"
         }
     }
 

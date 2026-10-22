@@ -236,6 +236,13 @@ object RelayCommands {
     /** 新建文件夹响应（负载: "1|success|信息" 或 "0|failed|原因"，原因含"已存在"表示重名冲突） */
     const val RSP_FS_MKDIR = "sfmkdirrsp00"
 
+    // ==================== ★ 重命名（2026-10-22新增，控制端→被控端） ====================
+    /** 重命名文件/文件夹（负载: 旧路径|新名称），被控端回 RSP_FS_RENAME */
+    const val CMD_FS_RENAME = "sfrm00000000"
+
+    /** 重命名响应（负载: "1|success|信息" 或 "0|failed|原因"，原因含"已存在"表示重名冲突） */
+    const val RSP_FS_RENAME = "sfrmrsp00000"
+
     // ==================== ★ 复制/剪切粘贴（2026-10-18，控制端→被控端） ====================
     /** 粘贴（负载: mode|dest_dir|owflags|src1|src2|...，语义与 PC 被控端 modules/fs_paste.py 完全一致：
      *  mode=copy 保留源 / mode=move 移动；owflags 与 src 一一对应，'1'=允许覆盖同名目标） */
