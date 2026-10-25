@@ -358,6 +358,17 @@ class RelayServerService : Service() {
         val onConnected: () -> Unit = {
             isConnected = true
             Log.i(TAG, "被控端已连接中继 ${RelaySettings.relayHost}:${RelaySettings.relayServerPort}")
+            // ★★★ 2026-10-25【根治"偶发连不上"】注册帧发出后立刻补一帧设备状态。
+            //   中继服务器只按**上行**数据刷新活跃时间戳，而待机状态上报是 30 秒节拍：
+            //   注册成功后若等下一个节拍，第一帧就可能晚于服务器的空闲阈值 ⇒ 被踢线重连，
+            //   控制端正好落在重连空档里点连接就是失败（实测 #87/#88/#89 注册 20 秒后被断）。
+            //   这里注册一完成就主动上报，服务器立刻拿到首帧、连接稳定在线。
+            try {
+                client?.send(RelayCommands.CMD_DEV_STATE, buildDeviceState())
+                Log.i(TAG, "注册后已立即上报首帧设备状态（保活/上线确认）")
+            } catch (e: Exception) {
+                Log.w(TAG, "注册后立即上报设备状态失败(忽略): ${e.message}")
+            }
             // ★★★ 2026-10-06【整改：关 VPN 方向也只看开关，不看到达性】
             //   本 client"连上"只是**传输层**事实 —— 总闸 off 时命令通道照样连得上（设计如此），
             //   所以"连上"并不能证明用户在中继模式。旧实现在无权威窗口时就据此关 VPN，
