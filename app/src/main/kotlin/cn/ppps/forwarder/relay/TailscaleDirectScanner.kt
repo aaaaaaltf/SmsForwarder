@@ -83,6 +83,34 @@ class TailscaleDirectScanner(
     private var lastTriggerIp: String? = null
     private var lastTriggerTime = 0L
 
+    /**
+     * ★★★ 2026-10-25【成员列表缓存】localapi 在隧道刚建立时经常超时（真机：控制端侧
+     *   23:08:30 仍报 "tsIps空(localapi超时)"）。原实现拿不到成员就只做局域网扫描，
+     *   异地场景等于整轮空转。现在保留上一轮非空成员表作为兜底候选，并明确记日志。
+     */
+    @Volatile
+    private var lastMembers: List<String> = emptyList()
+
+    /**
+     * ★★★ 2026-10-25【立即唤醒】VPN 刚建立/刚切到直连时，不必等 15~60 秒的下一轮。
+     *   kick() 会：
+     *     · 清除"同一 IP 60 秒内不重复触发"的冷却（隧道刚通时必须立刻重试）；
+     *     · 打断扫描线程的 sleep，使其立刻进入下一轮。
+     */
+    fun kick(reason: String) {
+        if (!running) {
+            Log.i(TAG, "★ 直连扫描唤醒($reason) 忽略：扫描器未运行")
+            return
+        }
+        lastTriggerIp = null
+        lastTriggerTime = 0L
+        Log.i(TAG, "★ 直连扫描唤醒($reason) → 立即重扫，并清除重复触发冷却")
+        try {
+            thread?.interrupt()
+        } catch (_: Exception) {
+        }
+    }
+
     fun start() {
         if (running) return
         running = true
@@ -254,7 +282,8 @@ class TailscaleDirectScanner(
         return result
     }
 
-    /** 拉取 Tailscale 在线成员IP（localapi /status，免缓存：TailscaleManager 自带解析） */
+    /** 拉取 Tailscale 在线成员IP（localapi /status，免缓存：TailscaleManager 自带解析）
+     *  ★ 2026-10-25：localapi 超时/隧道未就绪时，用上一轮非空结果兜底，避免异地直连整轮空转。 */
     private fun getOnlineMemberIps(): List<String> {
         val result = try {
             cn.ppps.forwarder.tailscale.TailscaleManager.getOnlineMemberIps()
@@ -262,9 +291,17 @@ class TailscaleDirectScanner(
             emptyList()
         }
         if (result.isNotEmpty()) {
+            lastMembers = result
             Log.i(TAG, "Tailscale在线成员: ${result.size} 个 ${result}")
+            return result
         }
-        return result
+        if (lastMembers.isNotEmpty()) {
+            Log.w(TAG, "★ Tailscale成员为空（localapi超时/隧道未就绪）→ 使用上次缓存 "
+                    + "${lastMembers.size} 个: $lastMembers")
+            return lastMembers
+        }
+        Log.w(TAG, "★ Tailscale成员为空且无缓存 → 本轮只做局域网扫描")
+        return emptyList()
     }
 
     /**

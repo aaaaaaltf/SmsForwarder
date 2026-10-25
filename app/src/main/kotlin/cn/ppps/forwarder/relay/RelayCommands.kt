@@ -163,6 +163,16 @@ object RelayCommands {
     /** 查询定位 */
     const val CMD_LOCATION = "sflocqry0000"
 
+    /** ★ 2026-10-25 新增：历史轨迹查询（控制端→被控端）
+     *  负载: `startMs|endMs|maxPoints`（ASCII 数字，可只传前两段）
+     *  响应: [RSP_TRACK_QUERY]，data = {"points":[{"t":毫秒,"lng":..,"lat":..}...],"total":N}
+     *  数据来源：LocationTrackStore（每 5 分钟采样、位移去重、只保留最近 6 个月）。 */
+    const val CMD_TRACK_QUERY = "sftrkqry0000"
+
+    /** 历史轨迹查询响应 */
+    const val RSP_TRACK_QUERY = "sftrkdata000"
+
+
     /** 一键换新机-拉取配置（负载: "pull" 或 CloneInfo JSON） */
     const val CMD_CLONE_PULL = "sfclone00000"
 

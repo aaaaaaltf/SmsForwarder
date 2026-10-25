@@ -136,6 +136,31 @@ class RelayServerClient(
     }
 
     /**
+     * ★★★ 2026-10-26【网络恢复 → 立即重连】
+     *   真机（红米 00:00:19 Wi-Fi 硬件 data-stall 掉线 → 00:05:05 才恢复）：
+     *   网络恢复时 connectLoop 仍在退避 sleep（最长 20 秒），直到 00:05:20 才重新注册 ——
+     *   白等 15 秒。kick() 关闭可能半死的 socket 并打断退避，让它立刻进入下一轮连接。
+     *   已连接且已注册时不动（避免网络抖动导致无谓重连）。
+     */
+    fun kick(reason: String) {
+        if (!running) {
+            Log.i(TAG, "★ 中继立即重连($reason) 忽略：客户端未运行")
+            return
+        }
+        if (isConnected() && registered) {
+            Log.i(TAG, "★ 中继立即重连($reason) 忽略：当前连接正常")
+            return
+        }
+        Log.i(TAG, "★ 中继立即重连($reason) → 关闭半死连接并打断退避，立即重拨")
+        try {
+            socket?.close()
+        } catch (_: Exception) {
+        }
+        socket = null
+        thread?.interrupt()
+    }
+
+    /**
      * ★★★ 2026-10-04【C批次】同步读一帧并校验命令字（用于注册握手：服务器先发 challenge）。
      *  帧格式与主循环一致：[4B大端长度][12B命令][负载]。读到指定命令返回其负载；否则 null。
      */

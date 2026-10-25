@@ -539,6 +539,30 @@ object RelayServerHandler {
                     RelayCommands.RSP_LOCATION to success(handleLocation())
                 }
 
+                // ★★★ 2026-10-25 新增：历史轨迹查询（负载 startMs|endMs|maxPoints）
+                //   数据来自 LocationTrackStore：每 5 分钟采样、位移≥25 米才记录、只保留最近 6 个月。
+                RelayCommands.CMD_TRACK_QUERY -> {
+                    if (!HttpServerUtils.enableApiLocation) {
+                        return RelayCommands.RSP_TRACK_QUERY to error("服务端已禁用定位功能")
+                    }
+                    val seg = payloadText.split("|")
+                    val startMs = seg.getOrNull(0)?.trim()?.toLongOrNull() ?: 0L
+                    val endMs = seg.getOrNull(1)?.trim()?.toLongOrNull() ?: System.currentTimeMillis()
+                    val maxPoints = (seg.getOrNull(2)?.trim()?.toIntOrNull() ?: 2000).coerceIn(2, 5000)
+                    val arr = LocationTrackStore.query(App.context, startMs, endMs, maxPoints)
+                    val points = ArrayList<Map<String, Any>>(arr.length())
+                    for (i in 0 until arr.length()) {
+                        val o = arr.optJSONObject(i) ?: continue
+                        points.add(mapOf(
+                            "t" to o.optLong("t", 0L),
+                            "lng" to o.optDouble("lng", 0.0),
+                            "lat" to o.optDouble("lat", 0.0),
+                        ))
+                    }
+                    Log.i(TAG, "★ 历史轨迹查询: ${startMs}~${endMs} → ${points.size} 个点")
+                    RelayCommands.RSP_TRACK_QUERY to success(mapOf("total" to points.size, "points" to points))
+                }
+
                 RelayCommands.CMD_CLONE_PULL -> {
                     if (!HttpServerUtils.enableApiClone) return RelayCommands.RSP_CLONE to error("服务端已禁用该功能")
                     val cloneInfo = parseData(payloadText, CloneInfo::class.java)

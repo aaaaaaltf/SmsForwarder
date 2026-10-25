@@ -159,6 +159,14 @@ class TailscaleVpnService : VpnService(), IPNService {
         // ★ 2026-08-16 竞态修复：VPN 建立后若中继已正常，立即关闭 VPN（节省资源）
         if (status) {
             TailscaleManager.onVpnEstablished()
+            // ★★★ 2026-10-25【VPN 就绪 → 立刻重扫控制端】
+            //   真机：切直连后对端 VPN 23:05:29 才开始重建，而扫描要等下一轮（忙15s/待机60s），
+            //   同一 IP 还有 60s 冷却 ⇒ 3 分钟才连上。这里就绪即唤醒扫描。
+            try {
+                cn.ppps.forwarder.service.RelayServerService.kickDirectScan("vpn-established")
+            } catch (t: Throwable) {
+                Log.w(TAG, "唤醒直连扫描失败(忽略): ${t.message}")
+            }
         }
     }
 }

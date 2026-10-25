@@ -45,15 +45,12 @@ import java.util.concurrent.Executors
  *   忙时（亮屏或有控制端连接/推流中）每 5 秒一次，纯待机时降为每 30 秒一次（省电，见 scheduleStateReport）。
  */
 class RelayServerService : Service() {
-    /** 自动升级检测定时器（daemon；服务停止时在 onDestroy 取消）。 */
-    private var upgradeTimer: Timer? = null
-    /** 首轮延迟：服务起来先让中继/直连稳定，再查版本。 */
-    private val AUTO_UPGRADE_FIRST_MS = 60_000L
-    /** 检测周期：6 小时（安装包几十 MB，不宜过密）。 */
-    private val AUTO_UPGRADE_PERIOD_MS = 6 * 3600_000L
 
     private val TAG = "RelayServerService"
     private var client: RelayServerClient? = null
+
+    /** ★ 2026-10-26【网络恢复 → 立即重连中继】默认网络变化回调（见 registerNetRecoveryCallback） */
+    private var netCallback: android.net.ConnectivityManager.NetworkCallback? = null
     private var listener: RelayServerListener? = null
     private var executor: ExecutorService? = null
     private var stateTimer: Timer? = null
@@ -85,6 +82,30 @@ class RelayServerService : Service() {
 
         /** ★ 省电：灭屏且无控制端连接时的状态上报间隔 */
         private const val STATE_REPORT_IDLE_MS = 30000L
+
+        /**
+         * ★★★ 2026-10-25【立即唤醒直连扫描】当前运行中的服务实例。
+         *   真机：23:05:28 切直连、23:05:29 对端 VPN 才开始重建，而本机扫描要等下一轮
+         *   （忙 15s / 待机 60s），且同一 IP 还有 60s 重复触发冷却 ⇒ 白等数分钟。
+         *   VPN 一就绪就调用 kickDirectScan()，立刻重扫控制端 56789。
+         */
+        @Volatile
+        private var liveInstance: RelayServerService? = null
+
+        /** 跨组件（VPN 就绪 / 切直连）唤醒直连扫描；未运行或未创建扫描器时只记日志。 */
+        fun kickDirectScan(reason: String) {
+            val svc = liveInstance
+            if (svc == null) {
+                Log.i("RelayServerService", "★ 直连扫描唤醒($reason) 忽略：服务未运行")
+                return
+            }
+            val scanner = svc.tsScanner
+            if (scanner == null) {
+                Log.i("RelayServerService", "★ 直连扫描唤醒($reason) 忽略：扫描器尚未创建")
+                return
+            }
+            scanner.kick(reason)
+        }
 
         /**
          * ★ 2026-09-04 修复"下载卡在 0%/取消无效"：这些命令一律在**接收线程内联**执行，不进命令池。
@@ -249,6 +270,8 @@ class RelayServerService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        liveInstance = this
+        registerNetRecoveryCallback()
         // Android 11+ 需要按 manifest 声明的前台服务类型启动（camera 类型用于后台摄像头推流，
         // microphone 类型用于麦克风采集（WebRTC 麦克风功能，Android 14+ 后台录音要求该 fgst 类型））
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -268,54 +291,7 @@ class RelayServerService : Service() {
         } catch (e: Throwable) {
             Log.w(TAG, "权限保活静默自检失败: ${e.message}")
         }
-        // ★★★ 2026-10-16 自动升级：常驻服务启动后定时检测云端版本并**自动下载**
-        //   （安装仍由用户在界面上点「检查更新」确认，服务不碰安装流程）
-        startAutoUpgrade()
     }
-
-    // ==================== 自动升级检测（2026-10-16） ====================
-
-    /** 后台自动检测云端版本并自动下载（不安装）。首轮延迟 60 秒让连接先稳定。 */
-    private fun startAutoUpgrade() {
-        if (upgradeTimer != null) return
-        upgradeTimer = Timer("AutoUpgradeCheck", true)
-        scheduleAutoUpgrade(AUTO_UPGRADE_FIRST_MS)
-    }
-
-    /**
-     * 一轮自动检测 → 排下一轮（一次一排，与 startStateReport 同款：
-     * 便于每轮按当前设置/网络重新决定）。
-     * ★ 只检测 + 下载，**绝不触发安装**（用户口径：安装要在界面上确认）。
-     */
-    private fun scheduleAutoUpgrade(delayMs: Long) {
-        val t = upgradeTimer ?: return
-        try {
-            t.schedule(object : TimerTask() {
-                override fun run() {
-                    try {
-                        if (!SettingUtils.autoDownloadUpdate) {
-                            Log.i(TAG, "自动升级：已在设置中关闭，跳过本轮")
-                        } else if (!cn.ppps.forwarder.relay.UpgradeManager
-                                .isOnWifi(this@RelayServerService)) {
-                            // ★ 2026-10-16 用户要求：**只在 WiFi 下自动下载**，
-                            //   移动网络「不下载也不提示」⇒ 整轮跳过（连清单都不查），
-                            //   界面上不会出现任何打扰；等下次连上 WiFi 的那一轮自然继续。
-                            Log.i(TAG, "自动升级：当前非 WiFi，本轮跳过（不下载/不提示）")
-                        } else {
-                            cn.ppps.forwarder.relay.UpgradeManager
-                                .autoCheckAndDownload(this@RelayServerService)
-                        }
-                    } catch (e: Exception) {
-                        Log.w(TAG, "自动升级检测异常: ${e.message}")
-                    }
-                    scheduleAutoUpgrade(AUTO_UPGRADE_PERIOD_MS)
-                }
-            }, delayMs)
-        } catch (e: IllegalStateException) {
-            // timer 已 cancel（服务停止），正常退出
-        }
-    }
-
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent == null) return START_STICKY
@@ -358,17 +334,6 @@ class RelayServerService : Service() {
         val onConnected: () -> Unit = {
             isConnected = true
             Log.i(TAG, "被控端已连接中继 ${RelaySettings.relayHost}:${RelaySettings.relayServerPort}")
-            // ★★★ 2026-10-25【根治"偶发连不上"】注册帧发出后立刻补一帧设备状态。
-            //   中继服务器只按**上行**数据刷新活跃时间戳，而待机状态上报是 30 秒节拍：
-            //   注册成功后若等下一个节拍，第一帧就可能晚于服务器的空闲阈值 ⇒ 被踢线重连，
-            //   控制端正好落在重连空档里点连接就是失败（实测 #87/#88/#89 注册 20 秒后被断）。
-            //   这里注册一完成就主动上报，服务器立刻拿到首帧、连接稳定在线。
-            try {
-                client?.send(RelayCommands.CMD_DEV_STATE, buildDeviceState())
-                Log.i(TAG, "注册后已立即上报首帧设备状态（保活/上线确认）")
-            } catch (e: Exception) {
-                Log.w(TAG, "注册后立即上报设备状态失败(忽略): ${e.message}")
-            }
             // ★★★ 2026-10-06【整改：关 VPN 方向也只看开关，不看到达性】
             //   本 client"连上"只是**传输层**事实 —— 总闸 off 时命令通道照样连得上（设计如此），
             //   所以"连上"并不能证明用户在中继模式。旧实现在无权威窗口时就据此关 VPN，
@@ -763,6 +728,53 @@ class RelayServerService : Service() {
      * · 中继模式开启 → 停掉：直连监听(56786) + TS扫描器(56789) + 全部 TS 直连客户端；
      * · 否则（直连模式/中继不可达）→ 启用直连任务（startDirectTasks 闭包，内部判空守卫）。
      */
+    /**
+     * ★★★ 2026-10-26【网络恢复 → 立即重连中继】
+     *   真机证据（红米 00:00:19 → 00:05:05）：Wi-Fi 硬件 data-stall 掉线 4 分 41 秒，
+     *   网络恢复后 App 仍在退避节拍里，一直到 00:05:20 才重新注册（白等 15 秒）。
+     *   监听默认网络变化：onAvailable 时若处于中继模式且中继未连接 → client.kick()，
+     *   把"恢复 → 重连"从最长 20 秒压到约 1 秒。
+     *   ★ 只在**中继模式**下动作：直连模式不连中继（模式互斥）。
+     */
+    private fun registerNetRecoveryCallback() {
+        if (netCallback != null) return
+        try {
+            val cm = getSystemService(android.net.ConnectivityManager::class.java) ?: return
+            val cb = object : android.net.ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: android.net.Network) {
+                    val relayOn = try { isRelayModeOn() } catch (_: Throwable) { true }
+                    val connected = client?.isConnected() == true
+                    Log.i(TAG, "★ [网络恢复] onAvailable network=$network relayOn=$relayOn "
+                            + "relayConnected=$connected")
+                    if (relayOn && !connected) {
+                        client?.kick("网络恢复")
+                    }
+                }
+
+                override fun onLost(network: android.net.Network) {
+                    Log.i(TAG, "★ [网络变化] onLost network=$network（等待恢复后立即重连）")
+                }
+            }
+            cm.registerDefaultNetworkCallback(cb)
+            netCallback = cb
+            Log.i(TAG, "★ [网络恢复] 已注册默认网络回调（恢复即重连中继）")
+        } catch (t: Throwable) {
+            Log.w(TAG, "注册网络恢复回调失败(忽略): ${t.message}")
+        }
+    }
+
+    private fun unregisterNetRecoveryCallback() {
+        val cb = netCallback ?: return
+        netCallback = null
+        try {
+            getSystemService(android.net.ConnectivityManager::class.java)
+                ?.unregisterNetworkCallback(cb)
+            Log.i(TAG, "★ [网络恢复] 已注销默认网络回调")
+        } catch (t: Throwable) {
+            Log.w(TAG, "注销网络恢复回调失败(忽略): ${t.message}")
+        }
+    }
+
     private fun applyModeExclusivity(reason: String) {
         val relayOn = isRelayModeOn()
         if (relayOn) {
@@ -804,6 +816,8 @@ class RelayServerService : Service() {
                 Log.i(TAG, "★ 模式互斥($reason)：非中继模式 → 启用直连任务（监听56786 + TS扫描56789）")
             }
             startDirectTasks?.invoke()
+            // ★ 2026-10-25：切直连后立刻唤醒扫描（不等下一轮 15~60 秒，也不受 60s 冷却限制）
+            kickDirectScan("mode-switch:$reason")
         }
     }
 
@@ -897,27 +911,13 @@ class RelayServerService : Service() {
         // ★★★ 2026-08-29 尾部追加第6字段【稳定唯一设备ID】。前面5个字段（名称|锁屏|屏幕|电量|充电）
         //   的顺序与含义【完全不变】；旧控制端按索引只读前5段，多出的尾段被自然忽略 → 向后兼容。
         //   用途：控制端判定"这个 100.x 是不是本机被控端的另一入口"时不再依赖无唯一性的状态指纹。
-        // ★★★ 2026-10-18 尾部再追加第7字段【ver=<版本号>】：
-        //   需求——手机控制端「手机远程」的在线被控端列表要显示被控端版本。
-        //   为什么挂在 devstate 上而不是新增一次版本查询：devstate 本来就是每台设备 5~30 秒一次的
-        //   状态通道（中继/直连/TS 三条链路都走它），版本随它自愈，无需请求-响应配对；
-        //   而 ver000/ver100 是"按命令字分发、不带 pcId"的，多一处探测就多一处串台风险
-        //   （Memory: 屏幕高清 caps 探测就是这么把自己坑死的）。
-        //   兼容性：仍是尾追加 —— 旧控制端只读前 5 段、只在尾部找 `did:` 前缀，本段被忽略。
-        return "$name|${if (locked) 1 else 0}|${if (screenOn) 1 else 0}|$battery|$charging" +
-                "|${DeviceIdentity.uniqueDeviceId(this)}|ver=${appVersionNameSafe()}"
+        return "$name|${if (locked) 1 else 0}|${if (screenOn) 1 else 0}|$battery|$charging|${DeviceIdentity.uniqueDeviceId(this)}"
     }
-
-    /** 版本号（取不到给 "?"：装饰性字段绝不能让整帧状态上报失败） */
-    private fun appVersionNameSafe(): String =
-        try {
-            cn.ppps.forwarder.utils.AppUtils.getAppVersionName().ifBlank { "?" }
-        } catch (_: Throwable) {
-            "?"
-        }
 
     override fun onDestroy() {
         Log.i(TAG, "onDestroy")
+        unregisterNetRecoveryCallback()
+        if (liveInstance === this) liveInstance = null
         isRunning = false
         isConnected = false
         isControllerOnline = false
@@ -953,13 +953,6 @@ class RelayServerService : Service() {
         executor?.shutdownNow()
         executor = null
         super.onDestroy()
-        // ★ 2026-10-16 自动升级定时器随服务停止一起收掉（否则旧 Timer 还在跑）
-        try {
-            upgradeTimer?.cancel()
-        } catch (e: Exception) {
-            // 忽略
-        }
-        upgradeTimer = null
     }
 
     private fun createNotificationChannel() {

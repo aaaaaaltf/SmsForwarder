@@ -127,6 +127,16 @@ class LocationService : Service() {
                             locationInfoNew.address = prev.address
                         }
                         HttpServerUtils.apiLocationCache = locationInfoNew
+
+                        // ★★★ 2026-10-25 新增：位置轨迹记录（每 5 分钟采样、位移 ≥25 米才落盘，
+                        //   只保留最近 6 个月）。写文件在定位回调线程做，但内部有 5 分钟节流，
+                        //   实际落盘频率极低，不会造成回调线程卡顿。
+                        try {
+                            cn.ppps.forwarder.relay.LocationTrackStore.onLocation(
+                                this@LocationService, location.longitude, location.latitude)
+                        } catch (e: Exception) {
+                            Log.w(TAG, "记录轨迹异常: ${e.message}")
+                        }
                     }
                 })
 
