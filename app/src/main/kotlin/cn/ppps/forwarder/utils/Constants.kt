@@ -41,6 +41,9 @@ const val SP_BATTERY_AUTH_GUIDED = "sp_battery_auth_guided"
 const val SP_HUAWEI_KEEPALIVE_GUIDED = "sp_huawei_keepalive_guided"
 // ★★★ 2026-08-28 权限与保活自检：OEM（MIUI/EMUI 等）自启动/后台活动引导已提示过（持久化，只引导一次）
 const val SP_OEM_AUTOSTART_GUIDED = "sp_oem_autostart_guided"
+// ★★★ 2026-10-26 首次安装启动的"权限 + 保活"总向导是否已展示过（新装/升级后只跑一次，
+//   之后不再自动打扰；用户可随时点界面上的「一键授权」重跑）
+const val SP_KEEPALIVE_ONBOARD_DONE = "sp_keepalive_onboard_done"
 
 //数据库
 const val DATABASE_NAME = "sms_forwarder.db"
@@ -104,6 +107,10 @@ const val SP_LOCATION_ACCURACY = "location_accuracy"
 const val SP_LOCATION_POWER_REQUIREMENT = "location_power_requirement"
 const val SP_LOCATION_MIN_INTERVAL = "location_min_interval_time"
 const val SP_LOCATION_MIN_DISTANCE = "location_min_distance"
+
+// ★★★ 2026-10-26 历史轨迹白天（6:00-22:00）采样间隔，单位【秒】，支持 0.5 分钟
+//   可选档位：30/60/120/180/240/300/600/900/1200/1800 秒，默认 300 秒（5 分钟）
+const val SP_LOCATION_TRACK_INTERVAL_SEC = "location_track_interval_sec"
 
 const val SP_BLUETOOTH = "enable_bluetooth"
 const val SP_BLUETOOTH_SCAN_INTERVAL = "bluetooth_scan_interval"

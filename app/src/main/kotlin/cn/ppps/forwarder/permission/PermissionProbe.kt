@@ -2,7 +2,6 @@ package cn.ppps.forwarder.permission
 
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.app.ActivityManager
-import android.app.AppOpsManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.pm.PackageManager
@@ -89,14 +88,41 @@ object RomType {
     private val brand: String = (Build.BRAND ?: "").lowercase()
     private val device: String = (Build.DEVICE ?: "").lowercase()
 
-    val isHuawei: Boolean get() = man.contains("huawei") || man.contains("honor") || brand.contains("honor")
-    val isXiaomi: Boolean get() = man.contains("xiaomi") || man.contains("redmi") || brand.contains("poco")
-    val isOppo: Boolean get() = man.contains("oppo") || man.contains("realme") || man.contains("oneplus")
-    val isVivo: Boolean get() = man.contains("vivo") || man.contains("iqoo")
-    val isSamsung: Boolean get() = man.contains("samsung")
+    /** 厂商/品牌/设备名任一命中即算该机型（不同 ROM 填的字段不一致，三者都查更稳）。 */
+    private fun any(vararg keys: String): Boolean =
+        keys.any { man.contains(it) || brand.contains(it) || device.contains(it) }
 
-    /** 是否是需要额外"自启动/后台管理"引导的国产 ROM（MIUI / EMUI / ColorOS / OriginOS） */
-    val needsOemGuide: Boolean get() = isHuawei || isXiaomi || isOppo || isVivo
+    // ---- 有独立"自启动/后台管理"开关、必须逐机型引导的 ROM ----
+    val isHuawei: Boolean get() = any("huawei", "honor")          // EMUI / HarmonyOS
+    val isXiaomi: Boolean get() = any("xiaomi", "redmi", "poco", "blackshark") // MIUI / HyperOS
+    val isOppo: Boolean get() = any("oppo", "realme", "oneplus")  // ColorOS / realme UI / OxygenOS
+    val isVivo: Boolean get() = any("vivo", "iqoo")               // OriginOS / FuntouchOS
+    val isSamsung: Boolean get() = any("samsung")                 // One UI（智能管理器）
+    val isMeizu: Boolean get() = any("meizu")                     // Flyme
+    val isAsus: Boolean get() = any("asus")                       // ZenUI / ROG
+    val isLenovo: Boolean get() = any("lenovo", "zuk")            // ZUI
+    val isNubia: Boolean get() = any("nubia", "redmagic", "zte")  // 努比亚/红魔/ZTE
+    val isTranssion: Boolean get() = any("transsion", "infinix", "tecno", "itel")
+
+    // ---- 近原生 ROM：没有厂商自启动白名单，仅用于报告里如实显示机型名 ----
+    val isMotorola: Boolean get() = any("motorola", "moto")
+    val isSony: Boolean get() = any("sony")
+    val isGoogle: Boolean get() = any("google")
+    val isNothing: Boolean get() = any("nothing")
+    val isNokia: Boolean get() = any("nokia", "hmd")
+    val isSharp: Boolean get() = any("sharp")
+    val isTcl: Boolean get() = any("tcl", "alcatel")
+    val isLg: Boolean get() = man.startsWith("lge") || man == "lg" || brand == "lg"
+    val isHtc: Boolean get() = any("htc")
+
+    /**
+     * 是否需要"自启动/关联启动/后台活动"额外引导。
+     * 注意：Android 标准的电池优化白名单对所有 ROM 都单独检测（[PermissionProbe.isBatteryWhitelisted]），
+     * 这里只决定要不要再跳厂商私有后台管理页。
+     */
+    val needsOemGuide: Boolean
+        get() = isHuawei || isXiaomi || isOppo || isVivo || isSamsung ||
+                isMeizu || isAsus || isLenovo || isNubia || isTranssion
 
     val miuiVersion: String
         get() = try {
@@ -106,11 +132,25 @@ object RomType {
         }
 
     fun describe(): String = when {
-        isXiaomi -> "小米/红米 MIUI(${miuiVersion})"
+        isXiaomi -> "小米/红米/POCO MIUI(${miuiVersion})"
         isHuawei -> "华为/荣耀 EMUI"
-        isOppo -> "OPPO/一加/realme"
-        isVivo -> "vivo/iQOO"
-        isSamsung -> "三星"
+        isOppo -> "OPPO/一加/realme ColorOS"
+        isVivo -> "vivo/iQOO OriginOS"
+        isSamsung -> "三星 One UI"
+        isMeizu -> "魅族 Flyme"
+        isAsus -> "华硕/ROG"
+        isLenovo -> "联想/ZUI"
+        isNubia -> "努比亚/红魔/ZTE"
+        isTranssion -> "传音(Infinix/TECNO/itel)"
+        isMotorola -> "摩托罗拉"
+        isSony -> "索尼"
+        isGoogle -> "Google Pixel"
+        isNothing -> "Nothing"
+        isNokia -> "诺基亚/HMD"
+        isSharp -> "夏普"
+        isTcl -> "TCL/阿尔卡特"
+        isLg -> "LG"
+        isHtc -> "HTC"
         else -> "原生/其他(${Build.MANUFACTURER})"
     }
 }
@@ -220,26 +260,15 @@ object PermissionProbe {
     }
 
     /**
-     * 保活是否"够用"的宽松判定：标准白名单 OR（华为/荣耀）OP_RUN_ANY_IN_BACKGROUND 未被 IGNORED。
-     * 保留既有口径（EMUI 上用户已设"不优化/允许后台活动"时标准 API 仍可能返回 false，
-     * 会导致每次启动重复弹窗），本模块作为唯一实现，ServerFragment 也改为委托到这里。
+     * 保活是否"够用"：**严格要求进入 AOSP/EMUI 的电池优化白名单**（DeviceIdle exempt）。
+     *
+     * ★ 2026-10-26 修正（真机实证）：旧实现为"防重复弹窗"在华为/荣耀上把
+     * `RUN_ANY_IN_BACKGROUND != IGNORED` 也当成已授权，但该 appop 在未做任何设置时
+     * 默认值就是 allow（`dumpsys deviceidle whitelist` 里根本没有本应用）。
+     * 结果报告把"从未真正进白名单"误判成 ✓，用户也就看不到 EMUI 低电量冻结中继的根因。
+     * 现在只认 `isIgnoringBatteryOptimizations`，与"电池优化 → 不允许优化"完全一致。
      */
-    fun isKeepAliveEffective(ctx: Context): Boolean {
-        if (isBatteryWhitelisted(ctx)) return true
-        if (RomType.isHuawei) {
-            try {
-                val am = ctx.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
-                @Suppress("UNCHECKED_CAST")
-                val mode = am.javaClass.getMethod(
-                    "checkOpNoThrow", String::class.java, Int::class.javaPrimitiveType, String::class.java
-                ).invoke(am, "android:run_any_in_background", ctx.applicationInfo.uid, ctx.packageName) as? Int
-                if (mode != null && mode != AppOpsManager.MODE_IGNORED) return true
-            } catch (t: Throwable) {
-                Log.w(TAG, "查 RUN_ANY_IN_BACKGROUND appops 失败: ${t.message}")
-            }
-        }
-        return false
-    }
+    fun isKeepAliveEffective(ctx: Context): Boolean = isBatteryWhitelisted(ctx)
 
     /** 悬浮窗（SYSTEM_ALERT_WINDOW）：远程点亮屏幕 ScreenLighter 用 TYPE_APPLICATION_OVERLAY。 */
     fun isOverlayGranted(ctx: Context): Boolean = try {
@@ -256,6 +285,19 @@ object PermissionProbe {
         false
     }
 
+    /**
+     * ★ 2026-10-26 EMUI「休眠时始终保持网络连接」的唯一可读信号：
+     * AOSP 标准键 `Settings.Global.wifi_sleep_policy`（2 = NEVER，即休眠不断网）。
+     * 读全局设置无需特殊权限；写回需要 WRITE_SECURE_SETTINGS，普通应用做不到，故只能检测+引导。
+     * 返回 -1 表示该键不存在/读取失败（部分 EMUI 版本可能用私有键，此时按"无法判定"处理）。
+     */
+    fun wifiSleepPolicyValue(ctx: Context): Int = try {
+        Settings.Global.getInt(ctx.contentResolver, "wifi_sleep_policy", -1)
+    } catch (t: Throwable) {
+        Log.w(TAG, "读取 wifi_sleep_policy 异常: ${t.message}")
+        -1
+    }
+
     /** 所有文件访问（MANAGE_EXTERNAL_STORAGE，Android 11+）。 */
     fun isAllFilesAccessGranted(ctx: Context): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return true
@@ -263,6 +305,21 @@ object PermissionProbe {
             Environment.isExternalStorageManager()
         } catch (t: Throwable) {
             Log.w(TAG, "isExternalStorageManager 异常: ${t.message}")
+            false
+        }
+    }
+
+    /**
+     * ★ 2026-10-26 「安装未知应用」（REQUEST_INSTALL_PACKAGES，Android 8+ 特殊权限）：
+     * 被控端自升级（UpgradeManager 下载 APK 后交给系统安装器）必需，安装/升级后默认是关闭的，
+     * 属于"初次安装后未自动授权"的典型项。
+     */
+    fun isInstallUnknownAppsGranted(ctx: Context): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return true
+        return try {
+            ctx.packageManager.canRequestPackageInstalls()
+        } catch (t: Throwable) {
+            Log.w(TAG, "canRequestPackageInstalls 异常: ${t.message}")
             false
         }
     }
@@ -644,6 +701,23 @@ object PermissionProbe {
                 )
             )
         }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val st = if (isInstallUnknownAppsGranted(ctx)) GrantState.GRANTED else GrantState.DENIED
+            out.add(
+                PermStatus(
+                    key = "install_unknown_apps",
+                    label = "安装未知应用（被控端自升级）",
+                    kind = PermissionKind.SPECIAL,
+                    state = st,
+                    autoFixable = true,
+                    manualSteps = if (st == GrantState.DENIED)
+                        "设置 → 应用 → 特殊应用权限 → 安装未知应用 → SmsForwarder 允许（或点「一键授权」跳转该页）；" +
+                                "不开启时点「检查更新→立即安装」会被系统静默拦下"
+                    else "",
+                    detector = "PackageManager.canRequestPackageInstalls",
+                )
+            )
+        }
         if (isDeclared(ctx, "android.permission.WRITE_SETTINGS")) {
             // ★ 该权限来自依赖库合并进 manifest 的声明（项目自身源码 0 处使用，grep 已核实），
             //   因此不参与申请、也不算"待处理项"，只在报告里说明原委，避免误导用户去开无用开关。
@@ -672,6 +746,41 @@ object PermissionProbe {
                 detector = OemGuide.probeDetector(),
             )
         )
+        // ★ 2026-10-26 华为/荣耀专属：用户点名的两项系统开关。
+        //   ① 休眠保持网络：可从 AOSP 标准键 wifi_sleep_policy 读取（2=NEVER），但写回需要
+        //      WRITE_SECURE_SETTINGS，普通应用不可用；读不到时按 UNKNOWN 处理，不误报。
+        //   ② 多任务界面锁定：EMUI 不提供任何读取/写入 API，只能给精确路径让用户手动上锁。
+        //   两项 autoFixable 均为 false，报告里归入"需手工确认/无法检测"，不会假装已处理。
+        if (RomType.isHuawei) {
+            val sleepPolicy = wifiSleepPolicyValue(ctx)
+            val sleepOn = sleepPolicy == 2 // WIFI_SLEEP_POLICY_NEVER
+            out.add(
+                PermStatus(
+                    key = "huawei_sleep_network",
+                    label = "休眠时始终保持网络连接（EMUI 电池→更多电池设置）",
+                    kind = PermissionKind.OEM,
+                    state = if (sleepOn) GrantState.GRANTED else GrantState.UNKNOWN,
+                    autoFixable = false,
+                    manualSteps = if (sleepOn) "" else
+                        "设置 → 电池 → 更多电池设置 → 打开「休眠时始终保持网络连接」；" +
+                                "不打开时低电量/深度休眠会冻结本应用网络，中继会反复掉线" +
+                                "（当前读取 wifi_sleep_policy=$sleepPolicy，2=已开启）",
+                    detector = "Settings.Global.wifi_sleep_policy=$sleepPolicy（2=NEVER；-1=读不到，按无法判定）",
+                )
+            )
+            out.add(
+                PermStatus(
+                    key = "recents_lock",
+                    label = "多任务界面锁定（防一键清理）",
+                    kind = PermissionKind.OEM,
+                    state = GrantState.UNKNOWN,
+                    autoFixable = false,
+                    manualSteps = "打开最近任务（多任务）界面 → 找到 SmsForwarder 卡片 → 下拉（或点右上角锁图标）上锁；" +
+                            "EMUI 清理后台时不会杀掉已上锁任务",
+                    detector = "任务锁定状态无公开 API，只能手动确认",
+                )
+            )
+        }
         if (!isLocationServiceOn(ctx)) {
             out.add(
                 PermStatus(
@@ -692,8 +801,24 @@ object PermissionProbe {
     fun batteryStepsForUi(): String = when {
         RomType.isXiaomi -> "MIUI：设置 → 应用设置 → 应用管理 → SmsForwarder → 省电策略 → 选「无限制」；" +
                 "再进 安全中心 → 授权管理 → 自启动管理 → 允许 SmsForwarder 自启动"
-        RomType.isHuawei -> "EMUI：设置 → 应用 → 应用管理 → SmsForwarder → 启动管理 → 关闭「自动管理」，" +
-                "手动勾选 自启动/关联启动/后台活动；同时 手机管家 → 电池 → 更多电池设置 里将本应用设为「不优化/受保护」"
+        RomType.isHuawei -> "EMUI：设置 → 应用和服务 → 应用启动管理 → SmsForwarder → 关闭「自动管理」，" +
+                "勾选 自启动/关联启动/后台活动；同时 设置 → 电池 → 电池优化 → SmsForwarder → 不允许优化"
+        RomType.isOppo -> "ColorOS/realme UI：设置 → 电池 → 更多设置（应用耗电管理）→ SmsForwarder → " +
+                "允许后台活动并关闭「智能限制」；手机管家 → 权限隐私 → 自启动管理 → 允许 SmsForwarder"
+        RomType.isVivo -> "OriginOS：设置 → 电池 → 后台高耗电 → 允许 SmsForwarder；" +
+                "i管家 → 应用管理 → 权限管理 → 自启动 → 允许 SmsForwarder"
+        RomType.isSamsung -> "One UI：设置 → 电池和设备维护 → 电池 → 后台使用限制 → " +
+                "把 SmsForwarder 加入「永不睡眠的应用」，并在「应用电源管理」里设为「不受限制」"
+        RomType.isMeizu -> "Flyme：手机管家 → 权限管理 → 后台管理 → 允许 SmsForwarder 后台运行；" +
+                "设置 → 电量管理 → 智能后台/待机耗电管理 → 允许 SmsForwarder"
+        RomType.isAsus -> "华硕/ROG：设置 → 电池 → 电池优化 → SmsForwarder → 不优化；" +
+                "Mobile Manager → 电源管理 → 允许 SmsForwarder 自启动/后台运行"
+        RomType.isLenovo -> "联想/ZUI：设置 → 电池 → 后台运行管理/应用省电策略 → SmsForwarder → 允许后台运行；" +
+                "安全中心 → 权限管理 → 自启动 → 允许 SmsForwarder"
+        RomType.isNubia -> "努比亚/红魔/ZTE：设置 → 电池 → 后台耗电管理/待机省电 → SmsForwarder → 允许后台运行；" +
+                "手机管家 → 自启动管理 → 允许 SmsForwarder"
+        RomType.isTranssion -> "传音(Infinix/TECNO/itel)：Phone Master → 权限管理 → 自启动 → 允许 SmsForwarder；" +
+                "设置 → 电池 → 后台耗电管理 → SmsForwarder → 无限制"
         else -> "设置 → 电池 → 电池优化 → 找到 SmsForwarder → 选「不允许（不优化）」"
     }
 

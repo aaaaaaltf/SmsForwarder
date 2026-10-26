@@ -3,16 +3,19 @@ package cn.ppps.forwarder.relay
 import android.content.Context
 import android.location.Location
 import android.util.Log
+import cn.ppps.forwarder.utils.SettingUtils
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.util.Calendar
 import java.util.concurrent.locks.ReentrantLock
 
 /**
  * 位置轨迹存储（★ 2026-10-25 新增）
  *
- * 需求：被控端每 5 分钟采集一次定位，把"定位时间 + 经纬度"写入文件；
+ * 需求：被控端白天 06:00~22:00 按可配置间隔采集定位（默认 5 分钟，可选 0.5/1/2/3/4/5/10/15/20/30 分钟），
+ *      夜间 22:00~06:00 固定每 30 分钟；把"定位时间 + 经纬度"写入文件；
  *      与上一条位置相同（位移小于噪声阈值）则不记录，只有位置真的变化才记录。
  *
  * 要点：
@@ -29,8 +32,22 @@ object LocationTrackStore {
     private const val TAG = "LocationTrack"
     private const val FILE_NAME = "location_track.jsonl"
 
-    /** 采样间隔：5 分钟 */
-    private const val SAMPLE_INTERVAL_MS = 5 * 60 * 1000L
+    /**
+     * ★ 2026-10-26 采集间隔可选档位（秒），与手机控制端历史轨迹页下拉选项一一对应：
+     * 0.5 / 1 / 2 / 3 / 4 / 5 / 10 / 15 / 20 / 30 分钟。
+     */
+    val TRACK_INTERVAL_SECONDS: IntArray = intArrayOf(30, 60, 120, 180, 240, 300, 600, 900, 1200, 1800)
+
+    /** 校验并纠正配置：不在可选档位内时退回默认 5 分钟（300 秒） */
+    fun normalizeIntervalSec(sec: Int): Int =
+        if (sec in TRACK_INTERVAL_SECONDS) sec else 300
+
+    /** ★ 2026-10-26 需求：夜间采样间隔 30 分钟（22:00 ~ 次日 06:00），不随白天配置变化 */
+    private const val NIGHT_SAMPLE_INTERVAL_MS = 30 * 60 * 1000L
+
+    /** 夜间时段：22:00（含）~ 次日 06:00（不含） */
+    private const val NIGHT_START_HOUR = 22
+    private const val NIGHT_END_HOUR = 6
 
     /** 判重阈值（米）：小于该位移视为"位置未变化"，不记录 */
     private const val MIN_MOVE_METERS = 25.0
@@ -41,7 +58,7 @@ object LocationTrackStore {
     /** 清理节流：最多每 6 小时检查一次过期数据（避免每写一条就全量读文件） */
     private const val PURGE_INTERVAL_MS = 6L * 60 * 60 * 1000L
 
-    /** 行数兜底上限（6 个月 5 分钟一条理论 ≈ 5.2 万条，取 6 万防异常高频写入撑爆存储） */
+    /** 行数兜底上限（6 个月按 5~30 分钟采样理论 ≈ 3.2 万条，取 6 万防异常高频写入撑爆存储） */
     private const val MAX_LINES = 60000
 
     private val lock = ReentrantLock()
@@ -59,8 +76,22 @@ object LocationTrackStore {
     private fun file(ctx: Context): File = File(ctx.filesDir, FILE_NAME)
 
     /**
+     * ★ 2026-10-26 需求：22:00 ~ 次日 06:00 固定每 30 分钟采样一次；
+     * 其余时间（06:00 ~ 22:00）按控制端下发的档位采样（0.5~30 分钟，默认 5 分钟）。
+     * 用本地时区的小时数判断，跨天（22:00~23:59 与 00:00~05:59）都落在夜间时段。
+     */
+    private fun sampleIntervalMs(ctx: Context, now: Long): Long {
+        val hour = Calendar.getInstance().apply { timeInMillis = now }.get(Calendar.HOUR_OF_DAY)
+        return if (hour >= NIGHT_START_HOUR || hour < NIGHT_END_HOUR) {
+            NIGHT_SAMPLE_INTERVAL_MS
+        } else {
+            normalizeIntervalSec(SettingUtils.locationTrackIntervalSec) * 1000L
+        }
+    }
+
+    /**
      * 定位回调入口：由 LocationService 每次定位成功时调用。
-     * 只有"距上次采样 ≥ 5 分钟"且"位移 ≥ 25 米"才落盘。
+     * 只有"距上次采样 ≥ 当前时段间隔（白天按所选档位 0.5~30 分钟 / 夜间 30 分钟）"且"位移 ≥ 25 米"才落盘。
      */
     fun onLocation(ctx: Context, lng: Double, lat: Double) {
         if (lng.isNaN() || lat.isNaN()) return
@@ -69,8 +100,8 @@ object LocationTrackStore {
             lock.lock()
             if (!ensureLoaded(ctx)) return
             val now = System.currentTimeMillis()
-            // ① 5 分钟节流：未到下一次采样点直接返回（不改 lastSampleAt，保持周期稳定）
-            if (lastSampleAt != 0L && now - lastSampleAt < SAMPLE_INTERVAL_MS) return
+            // ① 采样节流：按所处时段动态取间隔，未到下一次采样点直接返回（不改 lastSampleAt，保持周期稳定）
+            if (lastSampleAt != 0L && now - lastSampleAt < sampleIntervalMs(ctx, now)) return
             lastSampleAt = now
             // ② 位置判重：上一条存在且位移不足阈值 → 不记录
             if (!lastLng.isNaN() && !lastLat.isNaN()) {

@@ -32,6 +32,8 @@ import cn.ppps.forwarder.utils.HttpServerUtils
 import cn.ppps.forwarder.utils.PhoneUtils
 import cn.ppps.forwarder.utils.RelaySettings
 import cn.ppps.forwarder.utils.SettingUtils
+import cn.ppps.forwarder.utils.SharedPreference
+import cn.ppps.forwarder.utils.SP_LOCATION_TRACK_INTERVAL_SEC
 import com.google.gson.Gson
 import com.google.gson.GsonBuilder
 import com.xuexiang.xutil.XUtil
@@ -560,7 +562,38 @@ object RelayServerHandler {
                         ))
                     }
                     Log.i(TAG, "★ 历史轨迹查询: ${startMs}~${endMs} → ${points.size} 个点")
-                    RelayCommands.RSP_TRACK_QUERY to success(mapOf("total" to points.size, "points" to points))
+                    val intervalSec = LocationTrackStore.normalizeIntervalSec(SettingUtils.locationTrackIntervalSec)
+                    RelayCommands.RSP_TRACK_QUERY to success(mapOf(
+                        "total" to points.size,
+                        "points" to points,
+                        "intervalSec" to intervalSec,
+                        // 兼容旧控制端：整分钟档位同时返回 intervalMin（0.5 分钟时为 0，旧端会忽略）
+                        "intervalMin" to (intervalSec / 60),
+                    ))
+                }
+
+                // ★★★ 2026-10-26 新增：设置轨迹采集间隔（负载: 秒数，限 0.5/1/2/3/4/5/10/15/20/30 分钟）
+                //   只调整白天 06:00-22:00 的采样间隔；夜间 22:00-06:00 固定 30 分钟。
+                RelayCommands.CMD_TRACK_CONFIG -> {
+                    val seconds = payloadText.trim().toIntOrNull()
+                    if (seconds == null || seconds !in LocationTrackStore.TRACK_INTERVAL_SECONDS) {
+                        RelayCommands.RSP_TRACK_CONFIG to error("采集间隔需为 0.5/1/2/3/4/5/10/15/20/30 分钟")
+                    } else {
+                        // ★ 2026-10-26 需求：必须确认已写入配置文件后才回复成功（commit 同步落盘 + 回读校验）
+                        val committed = SharedPreference.preference.edit()
+                            .putInt(SP_LOCATION_TRACK_INTERVAL_SEC, seconds)
+                            .commit()
+                        val persisted = SharedPreference.preference
+                            .getInt(SP_LOCATION_TRACK_INTERVAL_SEC, -1)
+                        if (!committed || persisted != seconds) {
+                            Log.w(TAG, "★ 轨迹采集间隔保存失败: committed=$committed persisted=$persisted")
+                            RelayCommands.RSP_TRACK_CONFIG to error("采集间隔保存失败，请重试")
+                        } else {
+                            val label = if (seconds < 60) "${seconds / 60.0} 分钟" else "${seconds / 60} 分钟"
+                            Log.i(TAG, "★ 轨迹采集间隔已保存到配置文件: 白天每 $label（夜间固定 30 分钟）")
+                            RelayCommands.RSP_TRACK_CONFIG to success(mapOf("intervalSec" to seconds))
+                        }
+                    }
                 }
 
                 RelayCommands.CMD_CLONE_PULL -> {

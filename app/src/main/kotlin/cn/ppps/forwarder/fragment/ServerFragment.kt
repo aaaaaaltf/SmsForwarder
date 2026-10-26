@@ -45,6 +45,10 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
     @Volatile
     private var startupChecked = false
 
+    /** ★ 2026-10-26 本次进程是否已展示过"首次安装启动"总向导（防 onResume 反复弹） */
+    @Volatile
+    private var firstLaunchOnboardShown = false
+
     /** ★ 2026-08-28 用户是否已点击「一键授权」：只有为 true 时 onResume 才继续逐个打开系统页 */
     @Volatile
     // ★ 2026-08-29 本次一键授权是否真的发起了批量运行时权限申请（决定报告时机）
@@ -339,6 +343,12 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             }
         } catch (e: Exception) {
             Log.w(TAG, "自动授权完成检测异常: ${e.message}")
+        }
+        // ★ 2026-10-26 首次安装/升级后只跑一次的「权限 + 保活」总向导（自动申请 + 逐项跳转引导）
+        try {
+            maybeStartFirstLaunchOnboarding()
+        } catch (e: Exception) {
+            Log.w(TAG, "首次启动授权向导异常: ${e.message}")
         }
         // ★ 2026-10-16：把后台「自动检测/自动下载」的最新结果带出来 —— 否则用户在界面上
         //   看不到"其实已经自动下好新版了"（安装仍由他点「检查更新」确认）。
@@ -959,6 +969,70 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
     }
 
     /**
+     * ★★★ 2026-10-26 首次安装/升级后的「权限 + 保活」总向导（只跑一次）。
+     *
+     * 用户要求：初次安装并启动时，全部权限自动申请；无法自动授权的给出设置引导并跳转对应界面。
+     * Android 不允许 App 静默授予运行时权限，所以"自动"= 一次性把系统弹窗/授权页按顺序拉起来，
+     * 用户只需在弹窗里点允许；其余系统级开关（无障碍/自启动/悬浮窗/所有文件/未知来源/电池优化）
+     * 由流程逐项跳转到对应设置页并在报告里给出精确路径。
+     *
+     * 只跑一次：用 keepAliveOnboardDone 持久化，避免每次启动打扰；用户中途退出后
+     * 可随时在界面上点「一键授权」重跑同一套流程。
+     */
+    private fun maybeStartFirstLaunchOnboarding() {
+        if (SettingUtils.keepAliveOnboardDone) return
+        if (firstLaunchOnboardShown) return
+        if (!isAdded || isDetached || isHidden) return
+        firstLaunchOnboardShown = true
+        val ctx = requireContext()
+        val oemSteps = try {
+            cn.ppps.forwarder.permission.OemGuide.manualSteps()
+        } catch (t: Throwable) {
+            ""
+        }
+        val content = "接下来会按顺序自动申请以下权限（系统弹窗出现时请点「允许」）：\n" +
+                "· 短信、通话记录、电话状态/本机号码、通讯录、定位（含后台定位）\n" +
+                "· 相机、麦克风、拨打电话、通知（Android 13+）\n" +
+                "· 并逐项打开需要你点一下确认的系统页面：通知、悬浮窗、所有文件访问、安装未知应用、" +
+                "电池优化白名单、应用启动管理、无障碍、VPN、屏幕共享。\n\n" +
+                "无法自动完成的开关会给出设置路径。" +
+                if (cn.ppps.forwarder.permission.RomType.isHuawei) {
+                    "\n\n华为/荣耀需手动完成（系统未开放给第三方 App）：\n$oemSteps"
+                } else {
+                    "\n\n厂商自启动/后台限制（需手动确认）：\n$oemSteps"
+                }
+        try {
+            com.xuexiang.xui.widget.dialog.materialdialog.MaterialDialog.Builder(ctx)
+                .title("首次启动：权限与保活设置")
+                .content(content)
+                .autoDismiss(false)
+                .cancelable(false)
+                .positiveText("开始授权")
+                .onPositive { dialog, _ ->
+                    dialog.dismiss()
+                    SettingUtils.keepAliveOnboardDone = true
+                    Log.i(TAG, "★ 首次启动总向导：用户确认，开始自动申请全部权限")
+                    oneClickAuthorize()
+                }
+                .negativeText("稍后")
+                .onNegative { dialog, _ ->
+                    dialog.dismiss()
+                    SettingUtils.keepAliveOnboardDone = true
+                    XToastUtils.toast("已跳过，可随时点「一键授权」补授权")
+                    Log.i(TAG, "★ 首次启动总向导：用户选择稍后（不再自动打扰）")
+                }
+                .build()
+                .show()
+            Log.i(TAG, "★ 首次启动总向导已展示（仅一次）")
+        } catch (t: Throwable) {
+            // 弹窗本身失败也不能把授权流程吞掉：直接开始申请
+            Log.w(TAG, "首次启动总向导弹窗失败，直接开始授权: ${t.message}")
+            SettingUtils.keepAliveOnboardDone = true
+            oneClickAuthorize()
+        }
+    }
+
+    /**
      * ★ 一键授权所有权限
      * 分两步：
      * 1. 自动授权：复用已有的分批权限请求方法（每批独立请求，避免一次请求过多权限导致崩溃）
@@ -1141,6 +1215,30 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                     return
                 }
             }
+            // 3.5 安装未知应用（Android 8+ 特殊权限，被控端自升级必需）
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O &&
+                !cn.ppps.forwarder.permission.PermissionProbe.isInstallUnknownAppsGranted(ctx)) {
+                if (autoManualPrompted.add("install_unknown")) {
+                    lastAutoManualJumpTime = now
+                    Log.i(TAG, "★ 自动授权继续：跳转「安装未知应用」设置")
+                    when (cn.ppps.forwarder.permission.PermissionRequests.openUnknownAppSources(ctx)) {
+                        cn.ppps.forwarder.permission.OpenResult.OPENED ->
+                            XToastUtils.toast("请允许「安装未知应用」后返回应用（自升级需要）")
+                        else -> Log.w(TAG, "「安装未知应用」设置页打不开，跳过并在报告里给手工步骤")
+                    }
+                    return
+                }
+            }
+            // 3.6 通知（Android 13+ POST_NOTIFICATIONS / 通知渠道被关）——前台服务保活通知必需
+            if (!cn.ppps.forwarder.permission.PermissionProbe.areNotificationsEnabled(ctx)) {
+                if (autoManualPrompted.add("notification")) {
+                    lastAutoManualJumpTime = now
+                    Log.i(TAG, "★ 自动授权继续：跳转通知设置")
+                    cn.ppps.forwarder.permission.PermissionRequests.openNotificationSettings(ctx)
+                    XToastUtils.toast("请开启 SmsForwarder 的通知权限后返回应用")
+                    return
+                }
+            }
             // 4. 无障碍服务（远程触摸）
             if (cn.ppps.forwarder.relay.TouchControlService.instance == null) {
                 if (autoManualPrompted.add("accessibility")) {
@@ -1284,6 +1382,30 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                 return
             }
             Log.w(TAG, "悬浮窗设置页打不开($r)，继续下一项")
+        }
+
+        // 2.5 安装未知应用（Android 8+ 特殊权限，被控端自升级必需）
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O &&
+            !cn.ppps.forwarder.permission.PermissionProbe.isInstallUnknownAppsGranted(ctx)
+        ) {
+            pendingItems.add("安装未知应用")
+            val r = cn.ppps.forwarder.permission.PermissionRequests.openUnknownAppSources(ctx)
+            if (r == cn.ppps.forwarder.permission.OpenResult.OPENED) {
+                XToastUtils.toast("请允许「安装未知应用」后返回应用")
+                return
+            }
+            Log.w(TAG, "「安装未知应用」设置页打不开($r)，继续下一项")
+        }
+
+        // 2.8 通知（POST_NOTIFICATIONS / 通知渠道被关，前台服务保活通知必需）
+        if (!cn.ppps.forwarder.permission.PermissionProbe.areNotificationsEnabled(ctx)) {
+            pendingItems.add("通知")
+            val r = cn.ppps.forwarder.permission.PermissionRequests.openNotificationSettings(ctx)
+            if (r == cn.ppps.forwarder.permission.OpenResult.OPENED) {
+                XToastUtils.toast("请开启「允许通知」后返回应用")
+                return
+            }
+            Log.w(TAG, "通知设置页打不开($r)，继续下一项")
         }
 
         // 3. 无障碍服务（远程触摸）——系统禁止第三方程序化开启，只能跳设置页引导

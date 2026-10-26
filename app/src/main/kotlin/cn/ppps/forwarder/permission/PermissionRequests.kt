@@ -67,7 +67,36 @@ object OemGuide {
         )
         RomType.isSamsung -> listOf(
             "com.samsung.android.sm_cn" to "com.samsung.android.sm.ui.ram.AutoRunActivity",
-            "com.samsung.android.lool" to "com.samsung.android.sm.battery.ui.BatteryActivity",
+            "com.samsung.android.sm" to "com.samsung.android.sm.ui.ram.AutoRunActivity",
+            "com.samsung.android.lool" to "com.samsung.android.sm.ui.ram.AutoRunActivity",
+            "com.samsung.android.lool" to "com.samsung.android.sm.ui.battery.BatteryActivity",
+            "com.samsung.android.sm_cn" to "com.samsung.android.sm.ui.battery.BatteryActivity",
+        )
+        RomType.isMeizu -> listOf(
+            "com.meizu.safe" to "com.meizu.safe.permission.SmartBGActivity",
+            "com.meizu.safe" to "com.meizu.safe.permission.PermissionMainActivity",
+            "com.meizu.safe" to "com.meizu.safe.powerui.PowerAppPermissionActivity",
+        )
+        RomType.isAsus -> listOf(
+            "com.asus.mobilemanager" to "com.asus.mobilemanager.autostart.AutoStartActivity",
+            "com.asus.mobilemanager" to "com.asus.mobilemanager.powersaver.PowerSaverSettings",
+            "com.asus.mobilemanager" to "com.asus.mobilemanager.MainActivity",
+        )
+        RomType.isLenovo -> listOf(
+            "com.lenovo.powersetting" to "com.lenovo.powersetting.ui.PowerSettingActivity",
+            "com.lenovo.security" to "com.lenovo.security.power.BatteryActivity",
+            "com.zui.safecenter" to "com.zui.safecenter.MainActivity",
+        )
+        RomType.isNubia -> listOf(
+            "cn.nubia.powercenter" to "cn.nubia.powercenter.ui.PowerCenterActivity",
+            "com.zte.heartyservice" to "com.zte.heartyservice.setting.HintDeskSetActivity",
+            "com.zte.heartyservice" to "com.zte.heartyservice.setting.ClearMemoryActivity",
+        )
+        RomType.isTranssion -> listOf(
+            "com.transsion.phonemaster" to "com.transsion.phonemaster.activity.PermissionManagerActivity",
+            "com.transsion.phonemaster" to "com.transsion.phonemaster.activity.PowerSavingActivity",
+            "com.transsion.phonemaster" to "com.cyin.himgr.autostart.AutoStartActivity",
+            "com.transsion.phonemaster" to "com.transsion.phonemaster.activity.MainActivity",
         )
         else -> emptyList()
     }
@@ -132,17 +161,53 @@ object OemGuide {
                     "③ 最近任务里给 SmsForwarder 下拉加锁（防止一键清理杀掉）；\n" +
                     "④ 如仍被杀：设置 → 电池与性能 → 关闭「智能省电」对该应用的作用"
         RomType.isHuawei ->
-            "EMUI 启动管理（该页对第三方应用受系统权限保护，可能无法直达）：\n" +
-                    "① 手机管家 → 应用启动管理 → 找到 SmsForwarder → 关闭「自动管理」；\n" +
-                    "② 在弹出框里手动勾选 自启动 + 关联启动 + 后台活动 → 确定；\n" +
-                    "③ 设置 → 应用 → 应用管理 → SmsForwarder → 省电/启动管理 同样设为允许"
+            "EMUI 保活四步（缺一不可）：\n" +
+                    "① 设置 → 应用和服务 → 应用启动管理 → SmsForwarder → 关闭「自动管理」，" +
+                    "并勾选 自启动 / 关联启动 / 后台活动；\n" +
+                    "② 设置 → 电池 → 电池优化 → SmsForwarder → 选择「不允许优化」；\n" +
+                    "③ 设置 → 电池 → 更多电池设置 → 打开「休眠时始终保持网络连接」；\n" +
+                    "④ 打开多任务（最近任务）界面 → 下拉 SmsForwarder 卡片（或点卡片右上角锁图标）上锁，防一键清理杀进程"
         RomType.isOppo ->
-            "ColorOS：手机管家 → 权限隐私 → 自启动管理 允许 SmsForwarder；" +
-                    "设置 → 电池 → 更多设置 → 深度休眠/后台冻结 里排除 SmsForwarder"
+            "ColorOS / realme UI / OxygenOS 保活三步：\n" +
+                    "① 手机管家 → 权限隐私 → 自启动管理 → 允许「SmsForwarder」；\n" +
+                    "② 设置 → 电池 → 更多设置（应用耗电管理）→ SmsForwarder → 允许后台活动，关闭「智能限制」；\n" +
+                    "③ 最近任务 → SmsForwarder 卡片右上角菜单 → 锁定"
         RomType.isVivo ->
-            "OriginOS：i管家 → 应用管理 → 允许自启动 + 允许后台高耗电"
+            "OriginOS / FuntouchOS 保活三步：\n" +
+                    "① i管家 → 应用管理 → 权限管理 → 自启动 → 允许「SmsForwarder」；\n" +
+                    "② 设置 → 电池 → 后台高耗电 → 允许「SmsForwarder」；\n" +
+                    "③ 最近任务 → 下拉卡片锁定"
         RomType.isSamsung ->
-            "三星：设备维护/智能管理器 → 电池 → 后台使用限制 → 将 SmsForwarder 设为「不受限制」"
+            "One UI 保活四步：\n" +
+                    "① 设置 → 电池和设备维护 → 电池 → 后台使用限制 → 将 SmsForwarder 加入「永不睡眠的应用」；\n" +
+                    "② 同一页进入「应用电源管理」→ SmsForwarder → 设为「不受限制」；\n" +
+                    "③ 设置 → 应用 → SmsForwarder → 电池 → 允许后台活动；\n" +
+                    "④ 最近任务 → 长按 SmsForwarder 图标 → 锁定"
+        RomType.isMeizu ->
+            "Flyme 保活三步：\n" +
+                    "① 手机管家 → 权限管理 → 后台管理 → 允许「SmsForwarder」后台运行；\n" +
+                    "② 设置 → 电量管理 → 智能后台 / 待机耗电管理 → 允许「SmsForwarder」；\n" +
+                    "③ 最近任务 → 下拉卡片锁定"
+        RomType.isAsus ->
+            "华硕/ROG 保活三步：\n" +
+                    "① 设置 → 电池 → 电池优化 → SmsForwarder → 不优化；\n" +
+                    "② Mobile Manager（华硕手机管家）→ 电源管理 → 自启动 / 后台限制 → 允许「SmsForwarder」；\n" +
+                    "③ 最近任务 → 锁定 SmsForwarder"
+        RomType.isLenovo ->
+            "联想/ZUI 保活三步：\n" +
+                    "① 设置 → 电池 → 后台运行管理 / 应用省电策略 → SmsForwarder → 允许后台运行；\n" +
+                    "② 安全中心 → 权限管理 → 自启动 → 允许「SmsForwarder」；\n" +
+                    "③ 最近任务 → 锁定 SmsForwarder"
+        RomType.isNubia ->
+            "努比亚/红魔/ZTE 保活三步：\n" +
+                    "① 设置 → 电池 → 后台耗电管理 / 待机省电 → SmsForwarder → 允许后台运行；\n" +
+                    "② 手机管家 → 自启动管理 → 允许「SmsForwarder」；\n" +
+                    "③ 最近任务 → 锁定 SmsForwarder"
+        RomType.isTranssion ->
+            "传音(Infinix/TECNO/itel) 保活三步：\n" +
+                    "① Phone Master（手机管家）→ 权限管理 → 自启动 → 允许「SmsForwarder」；\n" +
+                    "② 设置 → 电池 → 后台耗电管理 / 省电模式 → SmsForwarder → 无限制；\n" +
+                    "③ 最近任务 → 锁定 SmsForwarder"
         else -> "当前 ROM 无厂商自启动入口，仅需保证电池优化白名单即可"
     }
 
@@ -228,6 +293,61 @@ object PermissionRequests {
         // 4) 本应用详情页兜底
         if (openAppDetails(ctx) == OpenResult.OPENED) return OpenResult.OPENED
         return OpenResult.FAILED
+    }
+
+    /**
+     * ★ 2026-10-26 华为/荣耀「电池 → 更多电池设置」页。
+     * 用户点名的"休眠时始终保持网络连接"就在该页，但 EMUI 没有公开 API 供三方应用读写，
+     * 只能尽力把用户送到最接近的系统页（组件名逐级探测，全部失败退回应用详情页）。
+     */
+    fun openHuaweiBatterySettings(ctx: Context): OpenResult {
+        if (RomType.isHuawei) {
+            val candidates = listOf(
+                "com.huawei.systemmanager" to "com.huawei.systemmanager.power.ui.HwPowerManagerActivity",
+                "com.huawei.systemmanager" to "com.huawei.systemmanager.power.ui.PowerMainActivity",
+                "com.huawei.systemmanager" to "com.huawei.systemmanager.optimize.process.ProtectActivity",
+            )
+            for ((pkg, cls) in candidates) {
+                try {
+                    val intent = Intent().setComponent(ComponentName(pkg, cls))
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    if (ctx.packageManager.resolveActivity(intent, 0) != null) {
+                        ctx.startActivity(intent)
+                        Log.i(TAG, "★ 已打开 EMUI 电池/电源管理页: $pkg/$cls")
+                        return OpenResult.OPENED
+                    }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "打开 EMUI 电池页 $pkg/$cls 失败: ${t.message}")
+                }
+            }
+        }
+        // 通用电池设置页兜底（原生 ROM 直接可用；EMUI 上通常也能落到电池设置）
+        try {
+            val intent = Intent(Settings.ACTION_BATTERY_SAVER_SETTINGS)
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            ctx.startActivity(intent)
+            Log.i(TAG, "★ 已打开通用电池设置页（休眠网络开关所在页的入口）")
+            return OpenResult.OPENED
+        } catch (t: Throwable) {
+            Log.w(TAG, "通用电池设置页打不开: ${t.message}")
+        }
+        return openAppDetails(ctx)
+    }
+
+    /** 「安装未知应用」设置页（REQUEST_INSTALL_PACKAGES，Android 8+ 被控端自升级必需）。 */
+    fun openUnknownAppSources(ctx: Context): OpenResult {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return OpenResult.NOT_NEEDED
+        if (PermissionProbe.isInstallUnknownAppsGranted(ctx)) return OpenResult.NOT_NEEDED
+        try {
+            val intent = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES)
+            intent.data = Uri.parse("package:" + ctx.packageName)
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            ctx.startActivity(intent)
+            return OpenResult.OPENED
+        } catch (t: Throwable) {
+            Log.w(TAG, "打开安装未知应用设置失败: ${t.message}")
+        }
+        return openAppDetails(ctx)
     }
 
     /**

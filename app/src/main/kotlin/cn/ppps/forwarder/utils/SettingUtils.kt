@@ -32,6 +32,9 @@ class SettingUtils private constructor() {
         //★★★ 2026-08-28 权限与保活自检：OEM（MIUI/EMUI 等）自启动/后台活动引导已提示过（持久化，只引导一次）
         var oemAutostartGuided: Boolean by SharedPreference(SP_OEM_AUTOSTART_GUIDED, false)
 
+        //★★★ 2026-10-26 首次安装启动的「权限 + 保活」总向导是否已展示过（持久化，只跑一次）
+        var keepAliveOnboardDone: Boolean by SharedPreference(SP_KEEPALIVE_ONBOARD_DONE, false)
+
         //是否转发短信
         var enableSms: Boolean by SharedPreference(SP_ENABLE_SMS, false)
 
@@ -170,6 +173,9 @@ class SettingUtils private constructor() {
 
         //设置位置更新最小距离（单位：米）；默认距离：0米
         var locationMinDistance: Int by SharedPreference(SP_LOCATION_MIN_DISTANCE, 0)
+
+        //★★★ 2026-10-26 历史轨迹白天（6:00-22:00）采样间隔，单位秒（支持 0.5 分钟=30 秒），默认 300 秒
+        var locationTrackIntervalSec: Int by SharedPreference(SP_LOCATION_TRACK_INTERVAL_SEC, 300)
 
         //是否跟随系统语言
         //var isFlowSystemLanguage: Boolean by SharedPreference(SP_IS_FLOW_SYSTEM_LANGUAGE, false)

@@ -108,6 +108,8 @@ object KeepAliveReportBuilder {
      */
     fun show(ctx: Context, report: KeepAliveReport) {
         val text = report.toDisplayText()
+        // 非华为机型：有可直达的厂商后台管理页时，报告页也提供一键跳转（与「一键授权」同一入口）
+        val oemJumpable = !RomType.isHuawei && RomType.needsOemGuide && OemGuide.hasJumpEntry(ctx)
         try {
             MaterialDialog.Builder(ctx)
                 .title(if (report.allClear) "授权自检：全部就绪" else "授权自检：还有 ${report.needManual.size + report.unsupported.size} 项需处理")
@@ -119,9 +121,26 @@ object KeepAliveReportBuilder {
                     copyToClipboard(ctx, text)
                     dialog.dismiss()
                 }
-                .neutralText("应用详情页")
+                .neutralText(
+                    when {
+                        RomType.isHuawei -> "华为电池设置"
+                        oemJumpable -> "厂商后台设置"
+                        else -> "应用详情页"
+                    }
+                )
                 .onNeutral { dialog, _ ->
-                    PermissionRequests.openAppDetails(ctx)
+                    when {
+                        RomType.isHuawei -> {
+                            val r = PermissionRequests.openHuaweiBatterySettings(ctx)
+                            Log.i("KeepAliveGuardian", "★ 报告页跳转华为电池设置: $r（休眠保持网络开关在该页）")
+                        }
+                        oemJumpable -> {
+                            val r = OemGuide.openAutostartPage(ctx)
+                            Log.i("KeepAliveGuardian", "★ 报告页跳转 ${RomType.describe()} 厂商后台设置: $r")
+                            if (r != OpenResult.OPENED) PermissionRequests.openAppDetails(ctx)
+                        }
+                        else -> PermissionRequests.openAppDetails(ctx)
+                    }
                     dialog.dismiss()
                 }
                 .negativeText("关闭")
@@ -225,6 +244,12 @@ object KeepAliveGuardian {
                 try {
                     if (PermissionProbe.isKeepAliveEffective(ctx)) {
                         Log.i(TAG, "★ 启动自检：已在电池优化白名单（或 EMUI 后台活动已放行），静默跳过弹窗")
+                        return@post
+                    }
+                    // ★ 2026-10-26 首次安装/升级后的总向导还没跑过 → 由 ServerFragment 的首次授权流程
+                    //   统一申请（含电池白名单），这里先不弹，避免两个弹窗叠在一起。
+                    if (!SettingUtils.keepAliveOnboardDone) {
+                        Log.i(TAG, "★ 启动自检：首次授权向导尚未执行，电池白名单交由该流程统一申请，跳过本次弹窗")
                         return@post
                     }
                     if (startupBatteryPrompted) return@post

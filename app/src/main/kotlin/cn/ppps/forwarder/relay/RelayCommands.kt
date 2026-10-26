@@ -172,6 +172,14 @@ object RelayCommands {
     /** 历史轨迹查询响应 */
     const val RSP_TRACK_QUERY = "sftrkdata000"
 
+    /** ★ 2026-10-26 新增：设置历史轨迹采集间隔（白天 6:00-22:00）
+     *  负载: 秒数 30/60/120/180/240/300/600/900/1200/1800（即 0.5~30 分钟）
+     *  响应: [RSP_TRACK_CONFIG]，data = {"intervalSec":N} */
+    const val CMD_TRACK_CONFIG = "sftrkcfg0000"
+
+    /** 轨迹采集间隔设置响应 */
+    const val RSP_TRACK_CONFIG = "sftrkcfgrsp0"
+
 
     /** 一键换新机-拉取配置（负载: "pull" 或 CloneInfo JSON） */
     const val CMD_CLONE_PULL = "sfclone00000"
