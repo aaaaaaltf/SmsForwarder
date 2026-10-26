@@ -10,6 +10,7 @@ name: Weekly Build
 #   在 ~10 秒内失败，GitHub 每周日 23:00 就给仓库所有者发失败邮件。
 #   若将来要恢复自动周构建：先在本仓库 Settings → Secrets 里配齐上面 5 个 secret，
 #   再取消下面注释即可。
+on:
   # schedule:
   #   - cron: '0 15 * * 0' #每周天在国际标准时间15点(北京时间+8，即 23:00)
   workflow_dispatch:
