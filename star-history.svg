@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="520" viewBox="0 0 960 520" role="img" aria-labelledby="title description">
+  <title id="title">aaaaaaltf/SmsForwarder Star History</title>
+  <desc id="description">GitHub stars by date, last updated 2026-10-26</desc>
+  <style>
+    .background { fill: #ffffff; }
+    .grid { fill: none; stroke: #d8dee4; stroke-width: 1; }
+    .minor-grid { fill: none; stroke: #d8dee4; stroke-width: 1; stroke-dasharray: 3 5; opacity: .6; }
+    .label, .subtitle { fill: #57606a; font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .heading, .value { fill: #24292f; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .heading { font-size: 20px; font-weight: 600; }
+    .value { font-size: 24px; font-weight: 600; }
+    .area { fill: #0969da; opacity: .12; }
+    .line { fill: none; stroke: #0969da; stroke-linecap: round; stroke-linejoin: round; stroke-width: 3; }
+    .point { fill: #0969da; stroke: #ffffff; stroke-width: 2; }
+    @media (prefers-color-scheme: dark) {
+      .background { fill: #0d1117; }
+      .grid { stroke: #30363d; }
+      .minor-grid { stroke: #30363d; }
+      .label, .subtitle { fill: #8b949e; }
+      .heading, .value { fill: #f0f6fc; }
+      .area { fill: #58a6ff; }
+      .line { stroke: #58a6ff; }
+      .point { fill: #58a6ff; stroke: #0d1117; }
+    }
+  </style>
+  <rect class="background" width="960" height="520" rx="8"/>
+  <text class="heading" x="76" y="38">aaaaaaltf/SmsForwarder Star History</text>
+  <text class="subtitle" x="76" y="62">GitHub stars by date · updated 2026-10-26</text>
+  <text class="value" x="928" y="40" text-anchor="end">★ 0</text>
+  <path class="grid" d="M 76 456.0 H 928"/><text class="label" x="64" y="460.0" text-anchor="end">0</text><path class="grid" d="M 76 92.0 H 928"/><text class="label" x="64" y="96.0" text-anchor="end">5K</text>
+  
+  <path class="area" d="M 928.0 456.0 V 456 H 928.0 Z"/>
+  <path class="line" d="M 928.0 456.0"/>
+  <circle class="point" cx="928.0" cy="456.0" r="5"/>
+</svg>
