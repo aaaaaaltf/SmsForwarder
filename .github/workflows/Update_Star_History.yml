@@ -29,6 +29,11 @@ jobs:
           node-version-file: .nvmrc
 
       - name: Delete Workflow
+        # ★ 2026-10-26【fork 无上游 secrets.TOKEN ⇒ 本步必然失败，不能让它拖垮整个任务】
+        #   这一步只是"清理历史运行记录"的可选收尾；缺少 PAT 时 GitHub 会报
+        #   "Input required and not supplied: token" 并让整个 job 变红 ⇒ 每天一封失败邮件。
+        #   后面的快照生成/发布只用内置 GITHUB_TOKEN（已声明 contents: write），不受影响。
+        continue-on-error: true
         uses: Mattraks/delete-workflow-runs@v2
         with:
           token: ${{ secrets.TOKEN }}

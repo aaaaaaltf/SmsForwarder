@@ -1,9 +1,17 @@
 name: Weekly Build
 
 # 触发器
-on:
-  schedule:
-    - cron: '0 15 * * 0' #每周天在国际标准时间15点(北京时间+8，即 23:00)
+# ★★★ 2026-10-26【停用每周定时触发，避免每周一封 "Weekly Build: All jobs have failed" 邮件】
+#   本工作流是上游作者（pppscn）的**私有发布流水线**，依赖上游仓库里配置的 secrets：
+#     TOKEN（PAT，用于删除旧运行记录 + 检出私有 keystore 仓库 pppscn/keystore）
+#     XUPDATE_TOKEN / X_TOKEN / URL_ADD_VERSION / URL_UPLOAD_APK（上传到作者的 XUpdate 服务）
+#   fork 仓库（aaaaaaltf/SmsForwarder）不可能拥有这些 secrets ⇒ 第 3 步
+#   `Delete Weekly Build`（Mattraks/delete-workflow-runs@v2，token: secrets.TOKEN）必然
+#   在 ~10 秒内失败，GitHub 每周日 23:00 就给仓库所有者发失败邮件。
+#   若将来要恢复自动周构建：先在本仓库 Settings → Secrets 里配齐上面 5 个 secret，
+#   再取消下面注释即可。
+  # schedule:
+  #   - cron: '0 15 * * 0' #每周天在国际标准时间15点(北京时间+8，即 23:00)
   workflow_dispatch:
     inputs:
       root_sol:
