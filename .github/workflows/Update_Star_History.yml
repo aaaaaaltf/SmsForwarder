@@ -18,6 +18,14 @@ env:
 jobs:
   update:
     runs-on: ubuntu-latest
+    # ★★★ 2026-10-26【fork 里这个作业永远不该把整条工作流标成失败】
+    #   本工作流继承自上游 pppscn/SmsForwarder：清理历史运行需要上游的 secrets.TOKEN
+    #   （fork 没有）；其余步骤（快照生成 → 发布到 star-history 分支）用内置
+    #   GITHUB_TOKEN 可正常运行。但只要任一步红（缺 token / action 版本解析 / 分支冲突…），
+    #   GitHub 就给仓库所有者发 "Update Star History: All jobs have failed" 邮件。
+    #   星史图对本项目只是装饰性产物 ⇒ 作业级 continue-on-error：失败也记为成功运行，
+    #   不再打扰用户；排查时仍能在 Actions 里看到该 job 里具体哪一步是红的。
+    continue-on-error: true
     timeout-minutes: 5
     steps:
       - name: Checkout
