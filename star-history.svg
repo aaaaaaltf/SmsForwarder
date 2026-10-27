@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="960" height="520" viewBox="0 0 960 520" role="img" aria-labelledby="title description">
   <title id="title">aaaaaaltf/SmsForwarder Star History</title>
-  <desc id="description">GitHub stars by date, last updated 2026-10-26</desc>
+  <desc id="description">GitHub stars by date, last updated 2026-10-27</desc>
   <style>
     .background { fill: #ffffff; }
     .grid { fill: none; stroke: #d8dee4; stroke-width: 1; }
@@ -26,11 +26,11 @@
   </style>
   <rect class="background" width="960" height="520" rx="8"/>
   <text class="heading" x="76" y="38">aaaaaaltf/SmsForwarder Star History</text>
-  <text class="subtitle" x="76" y="62">GitHub stars by date · updated 2026-10-26</text>
+  <text class="subtitle" x="76" y="62">GitHub stars by date · updated 2026-10-27</text>
   <text class="value" x="928" y="40" text-anchor="end">★ 0</text>
   <path class="grid" d="M 76 456.0 H 928"/><text class="label" x="64" y="460.0" text-anchor="end">0</text><path class="grid" d="M 76 92.0 H 928"/><text class="label" x="64" y="96.0" text-anchor="end">5K</text>
   
-  <path class="area" d="M 928.0 456.0 V 456 H 928.0 Z"/>
-  <path class="line" d="M 928.0 456.0"/>
+  <path class="area" d="M 76.0 456.0 H 928.0 V 456.0 V 456 H 76.0 Z"/>
+  <path class="line" d="M 76.0 456.0 H 928.0 V 456.0"/>
   <circle class="point" cx="928.0" cy="456.0" r="5"/>
 </svg>
