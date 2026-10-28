@@ -530,9 +530,9 @@ class WebRtcSessionManager(
                     .setEnableInternalTracer(false)
                     .createInitializationOptions()
             )
-            // ★ 2026-08-11 诊断：开启WebRTC内部详细日志（定位视频帧在采集/编码/发送链路的断点）
+            // 逐包诊断会经 Go 日志桥再次落盘，挤占编码与心跳线程的 CPU。
             try {
-                org.webrtc.Logging.enableLogToDebugOutput(org.webrtc.Logging.Severity.LS_VERBOSE)
+                org.webrtc.Logging.enableLogToDebugOutput(org.webrtc.Logging.Severity.LS_WARNING)
             } catch (_: Throwable) {}
             Log.i(TAG, "$stepTag [4/8] PeerConnectionFactory.initialize 成功 ✓")
         } catch (alreadyInit: IllegalStateException) {

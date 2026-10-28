@@ -11,7 +11,9 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.os.BatteryManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import cn.ppps.forwarder.utils.Log
 import cn.ppps.forwarder.App
@@ -54,6 +56,7 @@ class RelayServerService : Service() {
     private var listener: RelayServerListener? = null
     private var executor: ExecutorService? = null
     private var stateTimer: Timer? = null
+    private val lifecycleHandler = Handler(Looper.getMainLooper())
 
     // ★ Tailscale直连客户端（多控制端：phoneIp → client，中继关闭时被控端主动连接控制端56789）
     private val tsDirectClients = ConcurrentHashMap<String, TailscaleDirectClient>()
@@ -602,6 +605,15 @@ class RelayServerService : Service() {
 
     /** ★ 启动Tailscale直连客户端（主动连接手机控制端56789，中继关闭时仍可控制，多控制端各自独立连接） */
     private fun startTailscaleDirect(phoneIp: String, port: Int) {
+        // 扫描回调持有扫描器锁，只投递不等待，避免与销毁时的 stop() 锁倒置。
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            lifecycleHandler.post { startTailscaleDirect(phoneIp, port) }
+            return
+        }
+        if (liveInstance !== this || !isRunning || isRelayModeOn()) {
+            Log.i(TAG, "直连触发已失效，忽略 $phoneIp:$port")
+            return
+        }
         Log.i(TAG, "★ startTailscaleDirect: 连接手机控制端 $phoneIp:$port")
         // ★ 防止自连：本机IP（局域网/TS）直接忽略——扫描器可能把本机56789(控制端App同机运行)当成控制端，
         //   自连会占住 isDirectActive 使扫描器休眠，导致真实控制端(华为/PC)永不被发现
@@ -743,10 +755,10 @@ class RelayServerService : Service() {
             val cb = object : android.net.ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: android.net.Network) {
                     val relayOn = try { isRelayModeOn() } catch (_: Throwable) { true }
-                    val connected = client?.isConnected() == true
+                    val ready = client?.isReady() == true
                     Log.i(TAG, "★ [网络恢复] onAvailable network=$network relayOn=$relayOn "
-                            + "relayConnected=$connected")
-                    if (relayOn && !connected) {
+                            + "relayReady=$ready")
+                    if (relayOn && !ready) {
                         client?.kick("网络恢复")
                     }
                 }
@@ -776,6 +788,12 @@ class RelayServerService : Service() {
     }
 
     private fun applyModeExclusivity(reason: String) {
+        // 与 onDestroy 串行，入口检查和资源启停之间不能穿插销毁。
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            lifecycleHandler.post { applyModeExclusivity(reason) }
+            return
+        }
+        if (liveInstance !== this || !isRunning) return
         val relayOn = isRelayModeOn()
         if (relayOn) {
             listener?.let {
@@ -911,7 +929,31 @@ class RelayServerService : Service() {
         // ★★★ 2026-08-29 尾部追加第6字段【稳定唯一设备ID】。前面5个字段（名称|锁屏|屏幕|电量|充电）
         //   的顺序与含义【完全不变】；旧控制端按索引只读前5段，多出的尾段被自然忽略 → 向后兼容。
         //   用途：控制端判定"这个 100.x 是不是本机被控端的另一入口"时不再依赖无唯一性的状态指纹。
-        return "$name|${if (locked) 1 else 0}|${if (screenOn) 1 else 0}|$battery|$charging|${DeviceIdentity.uniqueDeviceId(this)}"
+        // ★★★ 2026-10-28【恢复"版本显示"】尾追加 ver=，与 RelayServerHandler.buildDeviceStateForQuery
+        //   同构（那边以 `|ver=${versionName.ifBlank { "?" }}` 结尾）。
+        //   历史：ae39130 那次提交把这行漏掉了 ⇒ 控制端列表里"主动探活有版本、被动上报没版本"，
+        //   表现为版本号时有时无地闪烁，回归断言 4.196 因此长期红。
+        return "$name|${if (locked) 1 else 0}|${if (screenOn) 1 else 0}|$battery|$charging|${DeviceIdentity.uniqueDeviceId(this)}|ver=${appVersionNameSafe()}"
+
+    /**
+     * ★ 2026-10-28 版本名（取不到回 "?"，绝不抛异常）。
+     *   两类 getPackageInfo 重载按 API 分派（33+ 必须用 PackageInfoFlags）。
+     */
+    private fun appVersionNameSafe(): String {
+        return try {
+            val pm = packageManager
+            val info = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                pm.getPackageInfo(packageName,
+                        android.content.pm.PackageManager.PackageInfoFlags.of(0))
+            } else {
+                @Suppress("DEPRECATION")
+                pm.getPackageInfo(packageName, 0)
+            }
+            info.versionName?.takeIf { it.isNotBlank() } ?: "?"
+        } catch (e: Exception) {
+            "?"
+        }
+    }
     }
 
     override fun onDestroy() {
@@ -919,6 +961,8 @@ class RelayServerService : Service() {
         unregisterNetRecoveryCallback()
         if (liveInstance === this) liveInstance = null
         isRunning = false
+        lifecycleHandler.removeCallbacksAndMessages(null)
+        startDirectTasks = null
         isConnected = false
         isControllerOnline = false
         // ★ 2026-08-25 停止VPN掉线恢复看门狗（服务停止后不再自动拉起VPN）
@@ -933,15 +977,14 @@ class RelayServerService : Service() {
         //   中继 client 由下面的 setClient(null) 负责摘除，这里补齐另外两类。
         listener?.let { cn.ppps.forwarder.relay.CameraStreamManager.removeSender(it) }
         listener = null
-        // ★ 停止全部TS直连（多控制端）
+        // 先等待扫描回调退出，再清理其可能刚创建的连接。
+        tsScanner?.stop()
+        tsScanner = null
         tsDirectClients.values.forEach {
             cn.ppps.forwarder.relay.CameraStreamManager.removeSender(it)
             it.stop()
         }
         tsDirectClients.clear()
-        // ★ 停止TS直连扫描器
-        tsScanner?.stop()
-        tsScanner = null
         RelayServerHandler.tsDirectLauncher = null
         cn.ppps.forwarder.relay.CameraStreamManager.setClient(null)
         // ★ 2026-08-27 省电修复：麦克风此前从未在服务销毁时停止——MicrophoneStreamManager 持有

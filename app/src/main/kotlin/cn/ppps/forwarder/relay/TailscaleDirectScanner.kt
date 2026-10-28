@@ -69,9 +69,12 @@ class TailscaleDirectScanner(
      */
     private val LAN_PROBE_THREADS = 8
 
+    private val lifecycleLock = Any()
     @Volatile
     private var running = false
+    @Volatile
     private var thread: Thread? = null
+    private var pendingKick = false
 
     /** ★ 省电：/24 扫描用的线程池改为整轮生命周期复用，避免每 15 秒新建/销毁 16 个线程 */
     private var probePool: java.util.concurrent.ExecutorService? = null
@@ -97,13 +100,14 @@ class TailscaleDirectScanner(
      *     · 清除"同一 IP 60 秒内不重复触发"的冷却（隧道刚通时必须立刻重试）；
      *     · 打断扫描线程的 sleep，使其立刻进入下一轮。
      */
-    fun kick(reason: String) {
+    fun kick(reason: String): Unit = synchronized(lifecycleLock) {
         if (!running) {
             Log.i(TAG, "★ 直连扫描唤醒($reason) 忽略：扫描器未运行")
             return
         }
         lastTriggerIp = null
         lastTriggerTime = 0L
+        pendingKick = true
         Log.i(TAG, "★ 直连扫描唤醒($reason) → 立即重扫，并清除重复触发冷却")
         try {
             thread?.interrupt()
@@ -111,20 +115,22 @@ class TailscaleDirectScanner(
         }
     }
 
-    fun start() {
+    fun start() = synchronized(lifecycleLock) {
         if (running) return
         running = true
-        if (probePool == null) {
-            probePool = Executors.newFixedThreadPool(LAN_PROBE_THREADS) { r ->
-                Thread(r, "LanProbe").apply { isDaemon = true }
-            }
+        pendingKick = false
+        probePool = Executors.newFixedThreadPool(LAN_PROBE_THREADS) { r ->
+            Thread(r, "LanProbe").apply { isDaemon = true }
         }
-        thread = Thread({ scanLoop() }, "TailscaleDirectScan").apply { isDaemon = true }.also { it.start() }
+        val worker = Thread({ scanLoop() }, "TailscaleDirectScan").apply { isDaemon = true }
+        thread = worker
+        worker.start()
         Log.i(TAG, "★ 已启动Tailscale直连扫描（忙时每${SCAN_INTERVAL_MS / 1000}秒、待机时每${SCAN_INTERVAL_IDLE_MS / 1000}秒探测手机控制端${CONTROL_PORT}端口）")
     }
 
-    fun stop() {
+    fun stop() = synchronized(lifecycleLock) {
         running = false
+        pendingKick = false
         thread?.interrupt()
         thread = null
         try {
@@ -134,8 +140,11 @@ class TailscaleDirectScanner(
         probePool = null
     }
 
+    private fun isCurrentScan(owner: Thread = Thread.currentThread()): Boolean =
+        running && thread === owner
+
     private fun scanLoop() {
-        while (running) {
+        while (isCurrentScan()) {
             val busy = try { isBusy() } catch (_: Throwable) { true }
             scanRound++
             // ★ 待机时 /24 全段扫描降频到每 LAN_SWEEP_EVERY_IDLE_ROUNDS 轮一次（Tailscale 成员扫描保持每轮）
@@ -146,7 +155,7 @@ class TailscaleDirectScanner(
                 //   对每台未连接的控制端分别建立直连；已连接的控制端由 connectedIps 跳过。
                 // ① Tailscale 成员扫描（异地场景）
                 scanTsMembers()
-                if (!running) break
+                if (!isCurrentScan()) break
                 // ② 局域网网段扫描（同WiFi场景，比Tailscale虚拟网更快更稳定）
                 if (doLanSweep) {
                     scanLanSubnet()
@@ -165,7 +174,7 @@ class TailscaleDirectScanner(
         val connected = connectedIps()
         val now = System.currentTimeMillis()
         for (ip in members) {
-            if (!running) break
+            if (!isCurrentScan()) break
             if (ip in own) continue
             // ★ 已连接的控制端跳过（多控制端各自独立建连，避免重复探测已连接的IP）
             if (ip in connected) continue
@@ -187,42 +196,48 @@ class TailscaleDirectScanner(
         val ownIps = getAllLocalIps()
         // ★ 2026-08-27 省电：线程池由 start()/stop() 创建与销毁，此处复用；
         //   旧实现每轮 Executors.newFixedThreadPool(16) + shutdown()，等于每分钟新建/销毁约 64 个线程。
-        val pool = probePool ?: Executors.newFixedThreadPool(LAN_PROBE_THREADS).also { probePool = it }
+        val pool = probePool ?: return
+        val owner = Thread.currentThread()
         val found = ConcurrentLinkedQueue<String>()
-        // ★ 等待方式改为计数闩锁：线程池生命周期已长于单次扫描，不能再 awaitTermination(pool)
+        val probes = ArrayList<java.util.concurrent.Future<*>>()
         val latch = java.util.concurrent.CountDownLatch(254)
-        for (octet in 1..254) {
-            if (!running) break
-            val ip = "$prefix.$octet"
-            if (ip in ownIps) {
-                latch.countDown()
-                continue
-            }
-            pool.execute {
-                try {
-                    if (!running) return@execute
-                    if (probeControlFast(ip)) found.add(ip)
-                } finally {
-                    latch.countDown()
-                }
-            }
-        }
         try {
+            for (octet in 1..254) {
+                if (!isCurrentScan()) return
+                val ip = "$prefix.$octet"
+                if (ip in ownIps) {
+                    latch.countDown()
+                    continue
+                }
+                probes.add(pool.submit {
+                    try {
+                        if (!isCurrentScan(owner) || Thread.currentThread().isInterrupted) return@submit
+                        if (probeControlFast(ip) && isCurrentScan(owner)
+                            && !Thread.currentThread().isInterrupted) found.add(ip)
+                    } finally {
+                        latch.countDown()
+                    }
+                })
+            }
             latch.await(30, TimeUnit.SECONDS)
         } catch (_: InterruptedException) {
+            // 唤醒意图由 pendingKick 保留，下一轮不能重新进入正常休眠。
+        } finally {
+            probes.forEach { if (!it.isDone) it.cancel(true) }
+            (pool as? java.util.concurrent.ThreadPoolExecutor)?.purge()
         }
         val now = System.currentTimeMillis()
         val connected = connectedIps()
         for (ip in found) {
-            if (!running) break
-            // ★ 已连接的控制端跳过
+            if (!isCurrentScan()) break
             if (ip in connected) continue
             if (tryTrigger(ip, now)) break
         }
     }
 
     /** 冷却检查并触发直连，返回是否已触发 */
-    private fun tryTrigger(ip: String, now: Long): Boolean {
+    private fun tryTrigger(ip: String, now: Long): Boolean = synchronized(lifecycleLock) {
+        if (!isCurrentScan()) return false
         if (ip == lastTriggerIp && now - lastTriggerTime < RE_TRIGGER_MIN_MS) {
             Log.d(TAG, "跳过重复触发 $ip:$CONTROL_PORT（冷却期内）")
             return false
@@ -350,6 +365,14 @@ class TailscaleDirectScanner(
     }
 
     private fun sleepInterruptible(ms: Long) {
+        synchronized(lifecycleLock) {
+            if (!isCurrentScan()) return
+            if (pendingKick) {
+                pendingKick = false
+                Thread.interrupted()
+                return
+            }
+        }
         try {
             Thread.sleep(ms)
         } catch (_: InterruptedException) {

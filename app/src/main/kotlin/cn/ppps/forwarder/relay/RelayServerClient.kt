@@ -114,6 +114,8 @@ class RelayServerClient(
         return s.isConnected && !s.isClosed && !s.isInputShutdown && !s.isOutputShutdown
     }
 
+    fun isReady(): Boolean = registered && isConnected()
+
     fun start() {
         if (running) return
         running = true
@@ -210,9 +212,12 @@ class RelayServerClient(
         // ★ 2026-08-28 省电：连续失败计数（用于退避 + 日志节流），成功连接后归零
         var consecutiveFailures = 0
         while (running) {
+            var attempt: Socket? = null
             try {
                 val s = Socket()
+                attempt = s
                 s.tcpNoDelay = true
+                s.soTimeout = 10000
                 s.connect(InetSocketAddress(host, port), 8000)
                 if (!running) {
                     try {
@@ -292,8 +297,11 @@ class RelayServerClient(
                 if (running && (consecutiveFailures == 1 || consecutiveFailures % 4 == 0)) {
                     Log.w(TAG, "连接中继失败(第${consecutiveFailures}次): ${e.message}")
                 }
+            } finally {
+                try { attempt?.close() } catch (_: Exception) { }
+                registered = false
+                socket = null
             }
-            socket = null
             if (running) onDisconnected()
             if (running) {
                 try {
