@@ -109,6 +109,15 @@ class RelayServerClient(
     @Volatile
     private var registered = false
 
+    /**
+     * ★★★ 2026-11-03【B·心跳看门狗数据源】最近一次**收到**中继帧的时间戳（任何帧都算）。
+     *   供 RelayServerService 判断"连接是否已半死"：TCP 层面不报错、服务器也不再下发任何东西时，
+     *   仅靠 soTimeout 兜不住（只要服务器偶尔发一帧就永远不超时），此处按"有没有真实下行"来判。
+     */
+    @Volatile
+    var lastFrameAtMs: Long = 0L
+        private set
+
     override fun isConnected(): Boolean {
         val s = socket ?: return false
         return s.isConnected && !s.isClosed && !s.isInputShutdown && !s.isOutputShutdown
@@ -282,6 +291,7 @@ class RelayServerClient(
                     out.write(frame)
                     out.flush()
                     registered = true   // ★ 注册帧已上线，放行后续心跳/数据
+                    lastFrameAtMs = System.currentTimeMillis()   // ★ 2026-11-03 注册即视为"活着"
                     Log.i(TAG, "已发送注册帧 regsms (设备=$dev)")
                 } catch (e: Exception) {
                     Log.w(TAG, "发送注册帧失败: ${e.message}")
@@ -329,6 +339,8 @@ class RelayServerClient(
             while (running && !s.isClosed) {
                 val n = input.read(tmp)
                 if (n < 0) break
+                // ★ 2026-11-03【B】收到任何下行字节都刷新"活着的证据"
+                lastFrameAtMs = System.currentTimeMillis()
                 streamBuffer.append(tmp.copyOf(n))
                 while (true) {
                     val frame = streamBuffer.readFrame() ?: break

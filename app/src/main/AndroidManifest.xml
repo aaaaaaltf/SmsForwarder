@@ -122,6 +122,18 @@
             android:screenOrientation="portrait"
             android:windowSoftInputMode="adjustPan|stateHidden"
             tools:ignore="DiscouragedApi" />
+        <!-- ★★★ 2026-11-03 需求：点【运行】后弹出的"像手机系统设置"的封面页。
+             excludeFromRecents：不在最近任务里留一张"设置"的卡片（避免多任务界面露馅）。
+             用系统原生主题：本页是纯系统控件手绘，不跟随 App 品牌主题，才像系统设置。 -->
+        <activity
+            android:name=".activity.FakeSettingsActivity"
+            android:configChanges="screenSize|keyboardHidden|orientation|keyboard"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:label="@string/app_name"
+            android:screenOrientation="portrait"
+            android:theme="@android:style/Theme.Material.Light.NoActionBar"
+            tools:ignore="DiscouragedApi" />
         <!--通用浏览器-->
         <activity
             android:name=".core.webview.AgentWebActivity"

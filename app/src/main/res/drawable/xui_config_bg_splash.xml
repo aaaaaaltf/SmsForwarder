@@ -1,22 +1,9 @@
-<?xml version="1.0" encoding="utf-8"?><!--有公司logo-->
+<?xml version="1.0" encoding="utf-8"?>
+<!-- ★ 2026-11-04【需求】启动时不要再闪一下旧图标：
+     这个 drawable 同时是启动主题的 android:windowBackground（系统"启动窗口"用它），
+     原来中间画 @drawable/ic_splash_app_logo、底部画公司 logo ⇒ 启动瞬间能看到旧图标。
+     现在只留纯白底色：系统启动窗口 = 纯白，直接过渡到"设置"封面页，没有任何图标闪现。 -->
 <layer-list xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:tools="http://schemas.android.com/tools"
     android:opacity="opaque">
     <item android:drawable="@color/xui_config_color_white" />
-
-    <item
-        android:bottom="@dimen/xui_config_app_logo_bottom"
-        tools:ignore="PrivateResource">
-        <bitmap
-            android:gravity="center"
-            android:src="@drawable/ic_splash_app_logo" />
-    </item>
-
-    <item
-        android:bottom="@dimen/xui_config_company_logo_bottom"
-        tools:ignore="PrivateResource">
-        <bitmap
-            android:gravity="bottom"
-            android:src="@drawable/ic_splash_company_logo" />
-    </item>
 </layer-list>

