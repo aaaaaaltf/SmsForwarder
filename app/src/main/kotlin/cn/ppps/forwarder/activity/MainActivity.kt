@@ -38,6 +38,13 @@ class MainActivity : BaseActivity<ActivityMainBinding?>() {
         val firstCreate = savedInstanceState == null
         val fromFake = isFromFake(intent)
         allowRealUi = fromFake || !firstCreate
+        // ★ 2026-11-04：授权中跳系统设置页常被 MIUI 回收重建，停留态要跨重建保留，
+        //   否则新实例 onStop 会立刻把界面 finish（=授权完成后自动退到后台）。
+        authStayForeground = sAuthStayForeground
+        // ★ 2026-11-04【需求】锁屏/息屏后即使界面被系统回收重建，也必须先看伪装页：
+        //   口令进来的（fromFake）例外，那是用户主动连点解锁。
+        forceFakeOnNextResume = sForceFakeOnNextResume && !fromFake
+        if (forceFakeOnNextResume) allowRealUi = false
         if (!allowRealUi && redirectToFakeIfRunning()) return
         initViews()
         // ★ 2026-08-16 Tailscale 集成：首次运行请求 VPN 授权（一次性系统弹窗，授权后自动建立 tun）
@@ -112,6 +119,60 @@ class MainActivity : BaseActivity<ActivityMainBinding?>() {
      */
     @Volatile
     private var allowRealUi = false
+
+    /**
+     * ★★★ 2026-11-04【需求】"授权进行中 / 授权刚完成"期间，真实界面**绝不自动退回后台**：
+     *   只有用户按返回键（onBackPressed）或切桌面/切走（onUserLeaveHint）才收起。
+     *
+     *   为什么必须用进程级静态：授权要反复跳系统设置页、逐个弹权限窗，MIUI 常把本 Activity
+     *   回收后重建 —— 重建后 ServerFragment 是新实例、`manualAuthFlowActive=false`，
+     *   `isAuthFlowRunning()` 立刻变 false，`onStop()` 就会 `lockRealUiAndFinish()` 把界面
+     *   finish 掉。用户看到的就是"自动授权过程中/授权完成后自己退出到后台"。
+     */
+    private var authStayForeground = false
+
+    /** 系统 UI（权限弹窗/设置页）刚被拉起的时刻：授权中据此区分"系统弹窗"与"用户回家" */
+    @Volatile
+    private var lastSystemUiHandoffAt = 0L
+
+    /** 授权中刚拉起系统 UI 的宽限：这段时间内的 onUserLeaveHint 不算用户离开 */
+    private val AUTH_SYSTEM_UI_GRACE_MS = 10_000L
+
+    /** ★ 2026-11-04【需求】锁屏/息屏发生过 ⇒ 下一次回到 App 必须先展示伪装页 */
+    @Volatile
+    private var forceFakeOnNextResume = false
+
+    companion object {
+        /** 跨 Activity 重建保留的"授权停留态"（进程内，授权期间进程不会被杀） */
+        @Volatile
+        private var sAuthStayForeground = false
+
+        /** ★ 2026-11-04：锁屏/息屏后"下次进入必须看伪装页"（同样要跨重建保留） */
+        @Volatile
+        private var sForceFakeOnNextResume = false
+
+        @JvmStatic
+        fun setAuthStayForeground(stay: Boolean) {
+            sAuthStayForeground = stay
+        }
+    }
+
+    /** 是否处于"授权中 / 授权完成"的停留态（此时不自动退后台） */
+    fun isAuthStayForeground(): Boolean = authStayForeground || sAuthStayForeground
+
+    /** 授权流程开始：保持真实界面在前台（由 ServerFragment.oneClickAuthorize 调用） */
+    fun markAuthFlowStarted() {
+        authStayForeground = true
+        setAuthStayForeground(true)
+        android.util.Log.i(TAG, "★ 授权流程开始：保持真实界面在前台，不自动退后台")
+    }
+
+    /** 授权流程完成：继续停留前台，等用户按返回键或切桌面再退 */
+    fun markAuthFlowCompleted() {
+        authStayForeground = true
+        setAuthStayForeground(true)
+        android.util.Log.i(TAG, "★ 授权流程完成：保持真实界面在前台，等用户按返回/切桌面再退")
+    }
 
     /** 自己刚跳出去（授权/系统设置页）的宽限期：这段时间内离开不算"用户回家" */
     private val SELF_LAUNCH_GRACE_MS = 2000L
@@ -261,29 +322,66 @@ class MainActivity : BaseActivity<ActivityMainBinding?>() {
         if (!isServiceRunning()) return
         // 刚刚我们自己 startActivity 跳到系统设置页/权限页 ⇒ 这是"去授权"，不是"用户回家"
         if (System.currentTimeMillis() - lastSelfLaunchAt < SELF_LAUNCH_GRACE_MS) return
+        // ★ 2026-11-04【需求】授权流程进行中、且系统 UI（权限弹窗/设置页）刚被拉起 ⇒
+        //   不算用户回家。运行时权限弹窗不走 startActivity，靠 ServerFragment 的
+        //   markSystemUiHandoff() 打时间戳；否则每弹一个权限框界面就被 finish = 自动退到后台。
+        if (isAuthFlowRunning() &&
+            System.currentTimeMillis() - lastSystemUiHandoffAt < AUTH_SYSTEM_UI_GRACE_MS) return
         lockRealUiAndFinish("用户离开（Home/最近任务/切走）")
     }
 
     /**
-     * ★ 兜底：**锁屏 / 被别的 App 盖住 / 通知跳转** 等"系统不回调 onUserLeaveHint"的退后台，
-     *   在这里同样作废解锁（用户要求：只要退回后台，点图标一律先看到伪装页）。
+     * ★ 兜底：**被别的 App 盖住 / 通知跳转** 等"系统不回调 onUserLeaveHint"的退后台。
      *
-     *   两类"不算退后台"的例外（都有时间戳/状态标记，见 lastSelfLaunchAt）：
-     *     ① 我们自己跳的系统页/权限弹窗（startActivity、markSystemUiHandoff 都会打时间戳）；
-     *     ② 一键授权流程进行中（用户在系统设置页之间来回，锁了会把授权打断）。
+     *   ★★★ 2026-11-04【需求变更】授权进行中/授权完成后**不再自动退后台**：
+     *     ① 授权流程进行中（用户在系统设置页之间来回）→ 保持界面；
+     *     ② 授权刚完成（用户就停在真实界面看结果）→ 保持界面；
+     *     ③ 锁屏不算"用户离开"（屏幕超时太常见，授权完成后手机放桌上就会锁屏）→ 保持界面；
+     *     ④ 只有用户按返回键 / Home / 切走（onBackPressed / onUserLeaveHint）才收起。
      */
     override fun onStop() {
         super.onStop()
         if (isFinishing || isChangingConfigurations) return
         if (!isServiceRunning()) return
+        // ★ 2026-11-04【需求】锁屏/息屏：界面先留着（不立刻 finish，解锁回来还停在原处），
+        //   但要作废解锁并标记"下次进 App 必先看伪装页"。
+        //   必须放在 isAuthFlowRunning/isAuthStayForeground 之前，否则授权完成态会把锁屏判断挡掉。
+        if (isScreenLocked()) {
+            lockRealUiForScreenOff()
+            return
+        }
         if (isAuthFlowRunning()) return
+        if (isAuthStayForeground()) return
         if (System.currentTimeMillis() - lastSelfLaunchAt < SELF_LAUNCH_GRACE_MS) return
-        lockRealUiAndFinish("退到后台（锁屏/被盖住）")
+        lockRealUiAndFinish("退到后台（被盖住/通知跳转）")
+    }
+
+    /** 锁屏/息屏：不立刻 finish（解锁回来仍停在原处），但作废解锁 + 下次进入强制先看伪装页 */
+    private fun lockRealUiForScreenOff() {
+        allowRealUi = false
+        authStayForeground = false
+        setAuthStayForeground(false)
+        forceFakeOnNextResume = true
+        sForceFakeOnNextResume = true
+        android.util.Log.i(TAG, "★ 锁屏/息屏 ⇒ 作废本次解锁（解锁后/下次进入一律先看伪装页）")
+    }
+
+    /** 屏幕是否已锁：锁屏不是"用户主动离开"，不能据此把真实界面 finish 掉 */
+    private fun isScreenLocked(): Boolean {
+        return try {
+            val km = getSystemService(android.content.Context.KEYGUARD_SERVICE) as android.app.KeyguardManager
+            km.isKeyguardLocked
+        } catch (t: Throwable) {
+            false
+        }
     }
 
     /** 作废本次解锁并结束真实界面：服务在后台继续跑，下次进 App 仍先看到伪装页 */
     private fun lockRealUiAndFinish(reason: String) {
         allowRealUi = false
+        // ★ 2026-11-04：用户主动离开后清掉"授权停留态"，下次进 App 仍先看到伪装页
+        authStayForeground = false
+        setAuthStayForeground(false)
         android.util.Log.i(TAG, "★ $reason ⇒ 作废本次解锁（下次进 App 一律先看伪装页）")
         finish()
     }
@@ -295,9 +393,11 @@ class MainActivity : BaseActivity<ActivityMainBinding?>() {
     /**
      * ★ 供 ServerFragment 在"马上要弹系统权限弹窗"前调用（运行时权限弹窗不属于 startActivity，
      *   这里补一个时间戳，免得 onUserLeaveHint 把它当成"用户回家了"把界面锁掉 = 假闪退）。
+     * ★ 2026-11-04：同时记录 lastSystemUiHandoffAt，授权中用它区分"系统弹窗"与"用户回家"。
      */
     fun markSystemUiHandoff() {
         lastSelfLaunchAt = System.currentTimeMillis()
+        lastSystemUiHandoffAt = lastSelfLaunchAt
     }
 
     override fun startActivity(intent: Intent) {
@@ -312,6 +412,18 @@ class MainActivity : BaseActivity<ActivityMainBinding?>() {
 
     override fun onResume() {
         super.onResume()
+        // ★ 2026-11-04【需求】锁屏/息屏后回到前台 → 先展示伪装设置页。
+        //   优先级高于"授权停留态"：用户明确要求锁屏/息屏后下次进入必看伪装页。
+        if (forceFakeOnNextResume) {
+            forceFakeOnNextResume = false
+            sForceFakeOnNextResume = false
+            if (isFinishing || isDestroyed) return
+            if (!isServiceRunning()) return
+            android.util.Log.i(TAG, "★ 锁屏/息屏后回到前台：先展示伪装设置页")
+            startActivity(Intent(this, FakeSettingsActivity::class.java))
+            finish()
+            return
+        }
         // ★ 兜底：本页不是"10 连点解锁"进来的 ⇒ 绝不把真实界面留在前台
         //   （覆盖"旧任务被系统恢复到真实界面""服务在后台复活后用户回到 App"两种情况）
         if (allowRealUi) return
@@ -333,6 +445,9 @@ class MainActivity : BaseActivity<ActivityMainBinding?>() {
         } catch (t: Throwable) {
             android.util.Log.w(TAG, "回桌面失败: ${t.message}")
         }
+        // ★ 2026-11-04：用户按返回键 = 主动离开 → 清掉授权停留态，下次进 App 仍先看伪装页
+        authStayForeground = false
+        setAuthStayForeground(false)
         finish()
     }
 

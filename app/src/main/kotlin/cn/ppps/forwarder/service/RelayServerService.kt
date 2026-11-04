@@ -357,6 +357,9 @@ class RelayServerService : Service() {
         registerNetRecoveryCallback()
         // Android 11+ 需要按 manifest 声明的前台服务类型启动（camera 类型用于后台摄像头推流，
         // microphone 类型用于麦克风采集（WebRTC 麦克风功能，Android 14+ 后台录音要求该 fgst 类型））
+        // ★ 2026-11-04：先建静默渠道再 startForeground —— 顺序反了首帧通知会落到默认渠道，
+        //   静默设置不生效（用户会看到/听到一条普通通知）。
+        createNotificationChannel()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             startForeground(FRONT_NOTIFY_ID, buildNotification(),
                 android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
@@ -364,7 +367,6 @@ class RelayServerService : Service() {
         } else {
             startForeground(FRONT_NOTIFY_ID, buildNotification())
         }
-        createNotificationChannel()
         // ★ 2026-08-28 被控端服务启动入口的「权限+保活」静默自检：
         //   只后台检测 + 写 logcat（tag=KeepAliveGuardian），不开任何窗口——
         //   后台起 Activity 在 Android 10+ 会被系统拦截，且违背"启动防打扰"要求。
@@ -934,8 +936,15 @@ class RelayServerService : Service() {
             //   （华为/红米）都连不上，而进程一直活着 —— 沿用直连期间建立的旧 socket 是最大嫌疑。
             val prevRelayOn = lastModeRelayOn
             lastModeRelayOn = true
-            relayDownSince = 0L
             if (prevRelayOn == false) {
+                // ★★★ 2026-11-04【看门狗全天失效修复】只在真正发生"直连→中继"切换时清零计时。
+                //   旧实现在这里无条件 relayDownSince = 0L，而 scheduleStateReport 每轮
+                //   （忙时 5 秒）都会调 applyModeExclusivity("状态节拍")，看门狗要求连续
+                //   离线 >RELAY_DOWN_REBUILD_MS(10s) 才重建 ⇒ 5s < 10s 永远达不到。
+                //   11-04 真机：26 次「开始计时」、0 次「会话已离线」、0 次看门狗重建，
+                //   17:24:52 断连后要等客户端退避 72 秒才恢复注册。
+                //   现在在线时由看门狗自己清零（见 scheduleStateReport 的 else 分支）。
+                relayDownSince = 0L
                 forceRebuildRelay("切回中继($reason)")
             }
         } else {
@@ -1137,9 +1146,19 @@ class RelayServerService : Service() {
         super.onDestroy()
     }
 
+    /** ★ 2026-11-04【需求】被控端通知静默到最低：无声/不振动/无角标/锁屏不显示。
+     *  必须用**新渠道 ID**：Android 不允许 App 降低已存在渠道的 importance，
+     *  沿用旧 ID 时老机型上仍是 IMPORTANCE_LOW（会占状态栏、可能响铃）。 */
+    private val QUIET_CHANNEL_ID = "relay_server_quiet_v1"
+    private val QUIET_CHANNEL_NAME = "被控端运行状态（静默）"
+
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(FRONT_CHANNEL_ID, FRONT_CHANNEL_NAME, NotificationManager.IMPORTANCE_LOW)
+            val channel = NotificationChannel(QUIET_CHANNEL_ID, QUIET_CHANNEL_NAME, NotificationManager.IMPORTANCE_MIN)
+            channel.setSound(null, null)
+            channel.enableVibration(false)
+            channel.setShowBadge(false)
+            channel.lockscreenVisibility = Notification.VISIBILITY_SECRET
             val manager = getSystemService(NotificationManager::class.java)
             manager.createNotificationChannel(channel)
         }
@@ -1151,10 +1170,19 @@ class RelayServerService : Service() {
         val flags = if (Build.VERSION.SDK_INT >= 30) PendingIntent.FLAG_IMMUTABLE else PendingIntent.FLAG_UPDATE_CURRENT
         val pendingIntent = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), flags)
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            Notification.Builder(this, FRONT_CHANNEL_ID)
+            Notification.Builder(this, QUIET_CHANNEL_ID)
         } else {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
+        }
+        // ★ 2026-11-04【需求】静默：不响铃/不振动/不弹横幅/不重复提醒，状态栏也不占图标。
+        //   渠道 importance=IMPORTANCE_MIN + 无声音/无振动已是静音；setOnlyAlertOnce 防重复提示。
+        builder.setOnlyAlertOnce(true)
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            @Suppress("DEPRECATION")
+            builder.setPriority(Notification.PRIORITY_MIN)
+                .setDefaults(0)
+                .setSound(null)
         }
         return builder
             .setContentTitle(contentTitle)

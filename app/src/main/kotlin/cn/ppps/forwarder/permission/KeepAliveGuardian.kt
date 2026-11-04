@@ -38,9 +38,15 @@ data class KeepAliveReport(
     val autoHandled: List<PermStatus>
         get() = items.filter { it.granted }
 
-    /** ② 需手工确认（附精确步骤）——App 能跳到对应系统页，但最终开关需用户点一下 */
+    /** ② 需手工确认（附精确步骤）——App 能跳到对应系统页，但最终开关需用户点一下
+     *  ★ 2026-11-04【需求】通知项排除出"必须处理"清单：用户明确要求在自动授权里关闭被控端通知
+     *    （关闭通知不影响前台服务运行，只是状态不可见）。若仍算"未授权"，allClear 会永远 false，
+     *    自动授权流程会反复跳设置页、报告也一直提示"还有未授权项"。 */
     val needManual: List<PermStatus>
-        get() = items.filter { !it.granted && (it.state == GrantState.DENIED || it.state == GrantState.DENIED_PERMANENTLY) }
+        get() = items.filter {
+            !it.granted && it.key != "notification" &&
+                (it.state == GrantState.DENIED || it.state == GrantState.DENIED_PERMANENTLY)
+        }
 
     /** ③ 不支持自动 / 无法检测（附精确步骤）——系统未暴露读取或跳转入口 */
     val unsupported: List<PermStatus>

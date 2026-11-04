@@ -49,6 +49,14 @@ class RelayServerClient(
     private val TAG = "RelayServerClient"
     private val sendLock = Any()
 
+    /** ★★★ 2026-11-04【40s 无下行帧→周期性断连】修复：
+     *  服务器并不会定时推下行帧（真机 17:24:12 收到一次探活后 40.004s 就 Read timed out），
+     *  旧实现把"一次读超时"直接当成连接已死并断开重注册 → 11-04 华为被控端全天 21 次断连。
+     *  现在放宽到 90s，且必须连续 2 次读空闲（180s 无任何下行字节）才判定半死连接；
+     *  期间 TCP 保持，控制端一发命令立刻能被读到，避免"谁都连不上"的空窗。 */
+    private val SO_TIMEOUT_MS = 90_000
+    private val MAX_CONSECUTIVE_IDLE_READS = 2
+
     /** ★ 省电：忙时（亮屏/有人在用）重连间隔，与改造前一致 */
     private val reconnectBusyMs = 5000L
 
@@ -324,21 +332,38 @@ class RelayServerClient(
 
     private fun receiveLoop(s: Socket) {
         val input = try {
-            // ★ 修复：半开连接检测——中继进程被杀/网络分区未发FIN时，read会永久阻塞，
-            //   导致 onDisconnected 永不触发 → setRelayConnected(false) 不执行 → VPN 永不开启。
-            //   与控制端 RelayControllerClient 一致设 40s 读超时：无下行数据即判定失效，主动断开进入重连，
-            //   重连成功后 onConnected 再 setRelayConnected(true) 关闭VPN。
-            s.soTimeout = 40000
+            // ★ 半开连接检测仍保留：中继进程被杀/网络分区未发 FIN 时 read 会永久阻塞。
+            //   但 ★ 2026-11-04 起不再"一次 40s 没下行数据就判死"：
+            //   服务器并不定时推帧，旧实现因此全天反复断连重注册（详见 SO_TIMEOUT_MS 注释）。
+            s.soTimeout = SO_TIMEOUT_MS
             s.getInputStream()
         } catch (e: IOException) {
             return
         }
         val streamBuffer = StreamBuffer()
         val tmp = ByteArray(4096)
+        var idleReads = 0
         try {
             while (running && !s.isClosed) {
-                val n = input.read(tmp)
+                var timedOut = false
+                val n = try {
+                    input.read(tmp)
+                } catch (e: java.net.SocketTimeoutException) {
+                    timedOut = true
+                    -1
+                }
+                if (timedOut) {
+                    idleReads++
+                    Log.i(TAG, "★ 中继读空闲 $idleReads/$MAX_CONSECUTIVE_IDLE_READS："
+                            + "${SO_TIMEOUT_MS}ms 无下行帧（连接仍在，继续等待）")
+                    if (idleReads >= MAX_CONSECUTIVE_IDLE_READS) {
+                        Log.w(TAG, "★ 中继连续 $idleReads 次读空闲 → 判定半死连接，主动断开重连")
+                        break
+                    }
+                    continue
+                }
                 if (n < 0) break
+                idleReads = 0
                 // ★ 2026-11-03【B】收到任何下行字节都刷新"活着的证据"
                 lastFrameAtMs = System.currentTimeMillis()
                 streamBuffer.append(tmp.copyOf(n))

