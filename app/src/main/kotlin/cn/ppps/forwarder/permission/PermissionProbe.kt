@@ -670,18 +670,17 @@ object PermissionProbe {
             )
         }
         run {
-            val st = if (isVpnAuthorized(ctx)) GrantState.GRANTED else GrantState.DENIED
             out.add(
+                // ★ 2026-11-05【被控端去 VPN】改用 tsnet 用户态通道后不再需要系统 VPN 授权，
+                //   本项仅为兼容旧界面保留，恒为已授权（无系统弹窗、无 tun、状态栏无钥匙图标）。
                 PermStatus(
                     key = "vpn_consent",
-                    label = "VPN 授权（Tailscale 直连）",
+                    label = "网络通道（用户态，无需 VPN）",
                     kind = PermissionKind.SPECIAL,
-                    state = st,
-                    autoFixable = true,
-                    manualSteps = if (st == GrantState.DENIED)
-                        "点「一键授权」→ 在「连接 SmsForwarder 的 VPN？」弹窗点允许；MIUI 若弹出「仅本次允许」请选择「始终允许」，否则锁屏后通道会断"
-                    else "",
-                    detector = "VpnService.prepare == null",
+                    state = GrantState.GRANTED,
+                    autoFixable = false,
+                    manualSteps = "",
+                    detector = "tsnet 用户态节点（无 VpnService）",
                 )
             )
         }

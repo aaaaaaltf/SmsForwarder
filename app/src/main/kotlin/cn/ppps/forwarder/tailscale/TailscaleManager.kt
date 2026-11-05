@@ -29,6 +29,15 @@ object TailscaleManager {
     private const val TAG = "TailscaleMgr"
 
     /**
+     * ★ 2026-11-05【被控端去 VPN】通道总开关。
+     *   true  = 用户态 tsnet（netstack）：不启动 Android VpnService、不建 tun、不申请 VPN 授权，
+     *           与原 libtailscale 后端在同一个 AAR/同一个 Go 运行时内共存（见 TsnetTransport）；
+     *   false = 回退到旧行为（libtailscale + VpnService），用于灰度/回退。
+     *   注意：切回 false 需要重新编译（常量内联），这里不做运行期开关。
+     */
+    const val USE_TSNET = true
+
+    /**
      * ★ 2026-08-29：这里**故意留空**。原先硬编码的那把内置 authkey（kHFoj…）早已被判定失效
      *   （日志 `invalid key: API key … not valid`），继续留在源码里既没用又是泄密面。
      *   authkey 读取顺序见 getAuthkey()：构建期注入 → SP（含 OAuth 自动签发所得）→ 空则跳过登录并打日志。
@@ -339,6 +348,8 @@ object TailscaleManager {
      *   但 Go 后端 builder.establish() 返回 null（华为拒绝），全程无 emit 无重试 → VPN 永不建立。
      *   VpnService.prepare 是轻量级系统调用，每次复查无性能问题。 */
     fun isVpnAuthorized(ctx: Context): Boolean {
+        // ★ 2026-11-05【被控端去 VPN】tsnet 模式不需要 VPN 授权，直接视为已就绪
+        if (USE_TSNET) return true
         vpnAuthorized = (VpnService.prepare(ctx) == null)
         return vpnAuthorized
     }
@@ -346,6 +357,11 @@ object TailscaleManager {
     /** 启动 Tailscale：初始化后端 + authkey 登录（幂等，可在服务/Application 任意处调用） */
     @Synchronized
     fun ensureStarted(ctx: Context) {
+        // ★ 2026-11-05【被控端去 VPN】tsnet 模式：只启动用户态节点，绝不走 libtailscale/VpnService
+        if (USE_TSNET) {
+            TsnetTransport.ensureStarted(ctx)
+            return
+        }
         if (initialized) {
             // ★★★ 2026-09-22 修复被控端"VPN 永不建立"根因：旧实现首行就是 `if (initialized) return`，
             //   于是只要【首次】startLogin 没拿到节点身份（凭证尚未下发 / 网络未就绪 / key 失效），
@@ -402,6 +418,11 @@ object TailscaleManager {
     // ★ 2026-10-19 放开为 public：TailscaleCredBootstrap（NAS 自助补凭证）保存 authkey 后
     //   需要立即用新 key 重登；startLogin 本身有 LOGIN_IN_FLIGHT 在途保护，重入安全。
     fun startLogin(ctx: Context) {
+        // ★ 2026-11-05【被控端去 VPN】tsnet 模式：凭证更新后只让用户态节点用新 key 重试
+        if (USE_TSNET) {
+            TsnetTransport.onCredentialUpdated(ctx)
+            return
+        }
         val a = app ?: return
         try {
             var authkey = getAuthkey(ctx)
@@ -663,6 +684,13 @@ object TailscaleManager {
     /** VPN 授权后调用：拉起 VpnService 使 Go 后端建立 tun 通道（幂等，VPN 已在运行时跳过） */
     @SuppressLint("StartActivityAndCollapseDeprecated")
     fun startVpnService(ctx: Context) {
+        // ★ 2026-11-05【被控端去 VPN】tsnet 模式下本函数是空操作：
+        //   所有调用点（看门狗/中继联动/授权回调/启动重试）都汇到这里，
+        //   在此拦一次即可保证全进程不会创建任何 VpnService/tun。
+        if (USE_TSNET) {
+            TsnetTransport.ensureStarted(ctx)
+            return
+        }
         if (!isVpnAuthorized(ctx)) {
             // ★ 2026-08-25 修复：未授权时不再静默返回，触发 vpn_consent_needed 事件，
             //   由界面（ServerFragment/MainActivity）重新 requestVpnConsent 拉起授权弹窗。
@@ -741,6 +769,11 @@ object TailscaleManager {
      *  后台定时重试（最多5次×3秒），中继已连接或VPN已建立时停止。
      *  中继模式下由 setRelayConnected(true) 自动关闭 VPN（节省资源），此处乐观开启无副作用。 */
     fun ensureVpnUp(ctx: Context) {
+        // ★ 2026-11-05【被控端去 VPN】tsnet 模式只保证用户态节点在线，没有任何 VPN 重试/看门狗
+        if (USE_TSNET) {
+            ensureStarted(ctx)
+            return
+        }
         ensureStarted(ctx)
         // ★ 2026-08-26 修复ANR + 权限冻结：
         //   Android 14+ 后台启动 FGS 会临时冻结 camera/microphone 权限（约3秒）。
@@ -805,6 +838,8 @@ object TailscaleManager {
     }
 
     fun startVpnWatchdog(ctx: Context) {
+        // ★ 2026-11-05【被控端去 VPN】tsnet 模式没有 tun 可守；节点存活由 TsnetTransport 自己负责
+        if (USE_TSNET) return
         if (vpnWatchdogRunning) return
         vpnWatchdogRunning = true
         Thread({
@@ -1083,6 +1118,8 @@ object TailscaleManager {
 
     /** 手动关闭 Tailscale VPN（保留 Go 后端） */
     fun stopVpn() {
+        // ★ 2026-11-05【被控端去 VPN】tsnet 模式没有 VPN 可关；用户态节点保持在线以维持直连
+        if (USE_TSNET) return
         TailscaleVpnService.shutdown()
     }
 
@@ -1122,6 +1159,11 @@ object TailscaleManager {
 
     /** 需要 VPN 授权时从 Activity 发起授权（首次安装后必现的一次性系统弹窗） */
     fun requestVpnConsent(activity: Activity): Boolean {
+        // ★ 2026-11-05【被控端去 VPN】tsnet 模式不需要系统 VPN 授权弹窗
+        if (USE_TSNET) {
+            vpnAuthorized = true
+            return true
+        }
         val intent = VpnService.prepare(activity) ?: run {
             vpnAuthorized = true
             return true
@@ -1156,8 +1198,22 @@ object TailscaleManager {
         }
     }
 
-    /** 是否已建立 VPN 通道（tun） */
-    fun isVpnUp(): Boolean = TailscaleVpnService.vpnEstablished
+    /** 是否已建立通道（tsnet 模式下为"用户态节点在线"，旧模式下为"tun 已建立"） */
+    fun isVpnUp(): Boolean {
+        if (USE_TSNET) return TsnetTransport.isUp()
+        return TailscaleVpnService.vpnEstablished
+    }
+
+    /**
+     * ★ 2026-11-05【被控端去 VPN】用户态节点上线回调（由 TsnetTransport 调用）：
+     *   沿用原 VPN 上线时的事件语义，界面/监听逻辑无需改动即可感知"通道已就绪"。
+     */
+    fun onTsnetReady(ip: String?) {
+        if (!USE_TSNET) return
+        vpnAuthorized = true
+        emit("connected")
+        if (!ip.isNullOrBlank()) emit("ip:$ip")
+    }
 
     // ==================== 状态查询（localapi /status） ====================
 
@@ -1175,6 +1231,8 @@ object TailscaleManager {
 
     /** 获取本机 Tailscale IP（100.64.x，取第一个 IPv4） */
     fun getSelfIp(): String? {
+        // ★ 2026-11-05【被控端去 VPN】tsnet 模式：节点 IP 由用户态节点 Status 提供
+        if (USE_TSNET) return TsnetTransport.selfIp
         val json = statusJson() ?: return null
         return try {
             val obj = JSONObject(json)
@@ -1200,6 +1258,8 @@ object TailscaleManager {
      *   可达性完全交给 TailscaleDirectScanner 的实际 TCP 探测判定。
      */
     fun getOnlineMemberIps(): List<String> {
+        // ★ 2026-11-05【被控端去 VPN】tsnet 模式：成员列表由用户态节点 Status 解析（在线优先 + 离线兜底）
+        if (USE_TSNET) return TsnetTransport.memberIps()
         val json = statusJson() ?: return emptyList()
         return try {
             val obj = JSONObject(json)

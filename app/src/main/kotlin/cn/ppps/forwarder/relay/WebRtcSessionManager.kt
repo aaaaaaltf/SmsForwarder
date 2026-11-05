@@ -505,13 +505,13 @@ class WebRtcSessionManager(
                 (PeerConnectionFactory.Options.ADAPTER_TYPE_LOOPBACK
                     or PeerConnectionFactory.Options.ADAPTER_TYPE_UNKNOWN)
             } else {
-                Log.i(TAG, "$stepTag ★ 直连兜底: networkIgnoreMask=仅保留VPN（TS直连候选修复）")
-                (PeerConnectionFactory.Options.ADAPTER_TYPE_UNKNOWN
-                    or PeerConnectionFactory.Options.ADAPTER_TYPE_ETHERNET
-                    or PeerConnectionFactory.Options.ADAPTER_TYPE_WIFI
-                    or PeerConnectionFactory.Options.ADAPTER_TYPE_CELLULAR
-                    or PeerConnectionFactory.Options.ADAPTER_TYPE_LOOPBACK
-                    or PeerConnectionFactory.Options.ADAPTER_TYPE_ANY)
+                // ★★★ 2026-11-05【直连模式高清修复】原策略"仅保留VPN"会过滤掉 WiFi/蜂窝，
+                //   而 tsnet 用户态方案下本机没有 tun0（100.x 不可达），真实网络是唯一可用路径：
+                //   放开除 loopback/unknown 之外的全部网络（WiFi/蜂窝/VPN 都参与候选），
+                //   让直连模式走真实网络的 host/srflx（STUN 打洞），不再依赖虚拟网 UDP。
+                Log.i(TAG, "$stepTag ★ 直连模式: networkIgnoreMask=忽略loopback/unknown（真实网络全参与，STUN 打洞）")
+                (PeerConnectionFactory.Options.ADAPTER_TYPE_LOOPBACK
+                    or PeerConnectionFactory.Options.ADAPTER_TYPE_UNKNOWN)
             }
         } catch (t: Throwable) {
             Log.w(TAG, "$stepTag 设置networkIgnoreMask失败(忽略): ${t.message}")
@@ -707,8 +707,31 @@ class WebRtcSessionManager(
                 //   —— relayPreferred=false（中继离线/直连模式）才发送TS候选兜底。
                 if ("host" == candType && !relayPreferred) {
                     try {
-                        val tsIp = findTsIpAddress()
-                        if (tsIp != null && tsIp != candIp) {
+                        // ★★★ 2026-11-05【直连模式 ICE-TCP】candidate sdp 第 3 段是传输协议
+                        //   （udp/tcp）。tsnet 用户态只有 TCP 能进出尾网：本端把 WebRTC 的 TCP
+                        //   候选端口经 tsnet 暴露到 100.x，再把候选 IP 改写为 100.x 发给控制端。
+                        //   控制端（VPN tun）用 TCP 连 100.x:port → tsnet 转发回本机真实候选端口。
+                        val proto = candidate.sdp.split(" ").getOrNull(2) ?: "udp"
+                        val tsIp: String? = if ("tcp" == proto) {
+                            cn.ppps.forwarder.tailscale.TsnetTransport.selfIp
+                        } else {
+                            findTsIpAddress()
+                        }
+                        // TCP 候选必须先暴露端口；暴露失败就不发改写候选（否则对端连一个没人监听的端口）
+                        var canRewrite = true
+                        if ("tcp" == proto) {
+                            val portNum = candPort.toIntOrNull()
+                            canRewrite = portNum != null &&
+                                cn.ppps.forwarder.tailscale.TsnetTransport
+                                    .exposeTcpPort(portNum, "$candIp:$candPort")
+                            if (canRewrite) {
+                                Log.i(TAG, "★ [ICE-TCP] TCP host候选 ${candIp}:${candPort} 已暴露到尾网 :$portNum"
+                                    + "，候选IP将改写为 $tsIp")
+                            } else {
+                                Log.w(TAG, "★ [ICE-TCP] 端口暴露失败，跳过改写候选 $candIp:$candPort")
+                            }
+                        }
+                        if (canRewrite && tsIp != null && tsIp != candIp) {
                             val parts = candidate.sdp.split(" ").toMutableList()
                             if (parts.size > 5) {
                                 parts[4] = tsIp
@@ -718,7 +741,7 @@ class WebRtcSessionManager(
                                     tsCand.sdp.toByteArray(StandardCharsets.UTF_8))
                                 val tsPayload = "ANSWERER|${candidate.sdpMid}|${candidate.sdpMLineIndex}|$tsSdp64"
                                 cb.onSignalingMessage(RelayCommands.CMD_WEBRTC_CANDIDATE, tsPayload)
-                                Log.i(TAG, "★ [TS修复] host候选IP ${candIp}:${candPort} 改写为Tailscale IP $tsIp 发送")
+                                Log.i(TAG, "★ [TS修复] ${proto} host候选IP ${candIp}:${candPort} 改写为 $tsIp 发送")
                             }
                         }
                     } catch (_: Throwable) {}
@@ -759,9 +782,15 @@ class WebRtcSessionManager(
             rtcpMuxPolicy = PeerConnection.RtcpMuxPolicy.REQUIRE
             continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
             iceTransportsType = iceType
+            // ★★★ 2026-11-05【直连模式 ICE-TCP】tsnet 用户态只有 TCP 能进出尾网：
+            //   直连模式启用 ICE-TCP，本端生成 TCP host 候选并由 tsnet 在 100.x 上监听转发，
+            //   控制端经 VPN tun 用 TCP 连进来；UDP 仍保留作打洞兜底。中继模式不动。
+            tcpCandidatePolicy = if (relayPreferred) PeerConnection.TcpCandidatePolicy.DISABLED
+                                 else PeerConnection.TcpCandidatePolicy.ENABLED
             // ★ 必须留痕：本端到底用了哪种策略（真机排查看这一行，并与控制端 [STEP-F] 那行对照）
             Log.i(TAG, "$stepTag ★★★ [6/8] iceTransportsType=$iceType "
-                    + "(relayPreferred=$relayPreferred；中继=RELAY 与控制端/PC被控端对称，直连=ALL 走 host/srflx)")
+                    + "tcpCandidatePolicy=$tcpCandidatePolicy "
+                    + "(relayPreferred=$relayPreferred；中继=RELAY 与控制端/PC被控端对称，直连=ALL 走 host/srflx+ICE-TCP)")
         }
         val pc = try {
             Log.i(TAG, "$stepTag [6/8] createPeerConnection 开始...")
@@ -1869,7 +1898,16 @@ class TsOnlyNetworkDetectorFactory(
                 //   这样保证"中继服务在线时媒体必走中继"，不被TS host候选抢占。
                 val out = mutableListOf<NetworkChangeDetector.NetworkInformation>()
                 orig?.forEach { ni ->
-                    if (ni.type == NetworkChangeDetector.ConnectionType.CONNECTION_WIFI) out.add(ni)
+                    // ★★★ 2026-11-05【直连模式高清修复】直连时真实网络（WiFi/蜂窝/以太网）全部保留，
+                    //   tsnet 无 tun 时靠 WiFi/蜂窝的 host+srflx 做公网 P2P；中继模式仍只留 WiFi。
+                    val keep = if (relayPreferred) {
+                        ni.type == NetworkChangeDetector.ConnectionType.CONNECTION_WIFI
+                    } else {
+                        ni.type == NetworkChangeDetector.ConnectionType.CONNECTION_WIFI ||
+                                ni.type == NetworkChangeDetector.ConnectionType.CONNECTION_ETHERNET ||
+                                isCellularType(ni.type)
+                    }
+                    if (keep) out.add(ni)
                 }
                 if (!relayPreferred && tunNet != null && tsIpBytes != null) {
                     // 直连兜底模式：修正IP后的TS网络（tun0）
@@ -1888,6 +1926,14 @@ class TsOnlyNetworkDetectorFactory(
             override fun destroy() { base.destroy() }
         }
     }
+
+    /** ★ 2026-11-05【直连模式】WebRTC 114 没有统一的 CELLULAR 枚举，蜂窝按代际分散 */
+    private fun isCellularType(t: NetworkChangeDetector.ConnectionType): Boolean =
+        t == NetworkChangeDetector.ConnectionType.CONNECTION_4G ||
+                t == NetworkChangeDetector.ConnectionType.CONNECTION_5G ||
+                t == NetworkChangeDetector.ConnectionType.CONNECTION_3G ||
+                t == NetworkChangeDetector.ConnectionType.CONNECTION_2G ||
+                t == NetworkChangeDetector.ConnectionType.CONNECTION_UNKNOWN_CELLULAR
 
     private fun isTsNetwork(ni: NetworkChangeDetector.NetworkInformation): Boolean {
         if (ni.type == NetworkChangeDetector.ConnectionType.CONNECTION_VPN) return true

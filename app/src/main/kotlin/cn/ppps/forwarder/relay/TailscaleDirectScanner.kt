@@ -324,6 +324,15 @@ class TailscaleDirectScanner(
      * 连接成功 + 2秒内收到数据（控制端接受连接后会立即下发CMD_GET_VERSION帧）即确认。
      */
     private fun probeControl(ip: String): Boolean {
+        // ★ 2026-11-05【被控端去 VPN】tsnet 模式：探测必须走用户态隧道，
+        //   没有 tun 时裸 Socket 连 100.x 必然超时 → 会被误判为"控制端不在线"。
+        if (cn.ppps.forwarder.tailscale.TailscaleManager.USE_TSNET) {
+            return try {
+                cn.ppps.forwarder.tailscale.TsnetTransport.probe(ip, CONTROL_PORT)
+            } catch (_: Throwable) {
+                false
+            }
+        }
         var s: Socket? = null
         return try {
             s = Socket()

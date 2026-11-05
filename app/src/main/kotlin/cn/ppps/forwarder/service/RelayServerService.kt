@@ -523,6 +523,11 @@ class RelayServerService : Service() {
             listenerHolder[0] = l
             l.start()
             listener = l
+            // ★ 2026-11-05【被控端去 VPN】tsnet 模式：把尾网 :56786 的连接转发到本机真实监听端口，
+            //   这样控制端连 100.x:56786 的入站直连语义保持不变（不再依赖 tun/系统路由）。
+            if (cn.ppps.forwarder.tailscale.TailscaleManager.USE_TSNET) {
+                cn.ppps.forwarder.tailscale.TsnetTransport.startInboundWhenReady(RelaySettings.relayServerPort)
+            }
             // ★ 注册直连监听为摄像头帧发送通道（直连模式下摄像头仍可用）
             cn.ppps.forwarder.relay.CameraStreamManager.addSender(l)
         }
@@ -863,6 +868,13 @@ class RelayServerService : Service() {
                         // ★★★ 2026-10-04【模式互斥·兜底裁决】每轮状态上报都重新对齐一次（幂等、零额外开销），
                         //   覆盖"同机控制端广播 RELAY_STATE_CHANGED"等不经本服务回调的状态来源。
                         applyModeExclusivity("状态节拍")
+                        // ★ 2026-11-05【被控端去 VPN】用户态节点自愈（幂等）：
+                        //   没有 VPN 看门狗后，节点首次未起来或中途掉线必须有人重试，
+                        //   这里复用 5s/30s 的状态上报节拍，代价几乎为零。
+                        if (cn.ppps.forwarder.tailscale.TailscaleManager.USE_TSNET
+                            && !cn.ppps.forwarder.tailscale.TsnetTransport.isUp()) {
+                            cn.ppps.forwarder.tailscale.TsnetTransport.ensureStarted(this@RelayServerService)
+                        }
                         val state = buildDeviceState()
                         // ★ 设备状态上报：中继连接 + 直连监听（广播所有已接入控制端）+ TS直连（广播所有控制端）
                         client?.send(RelayCommands.CMD_DEV_STATE, state)
@@ -934,6 +946,7 @@ class RelayServerService : Service() {
         //   历史：ae39130 那次提交把这行漏掉了 ⇒ 控制端列表里"主动探活有版本、被动上报没版本"，
         //   表现为版本号时有时无地闪烁，回归断言 4.196 因此长期红。
         return "$name|${if (locked) 1 else 0}|${if (screenOn) 1 else 0}|$battery|$charging|${DeviceIdentity.uniqueDeviceId(this)}|ver=${appVersionNameSafe()}"
+    }
 
     /**
      * ★ 2026-10-28 版本名（取不到回 "?"，绝不抛异常）。
@@ -953,7 +966,6 @@ class RelayServerService : Service() {
         } catch (e: Exception) {
             "?"
         }
-    }
     }
 
     override fun onDestroy() {

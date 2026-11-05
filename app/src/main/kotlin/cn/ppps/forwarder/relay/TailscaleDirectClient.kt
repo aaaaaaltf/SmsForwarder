@@ -76,9 +76,27 @@ class TailscaleDirectClient(
         var retries = 0
         while (running && retries < maxReconnect) {
             try {
+                // ★ 2026-11-05【被控端去 VPN】tsnet 模式：
+                //   不直接连 host:port（那需要 tun 路由），而是连 Go 在 127.0.0.1 起的拨号代理，
+                //   由用户态 netstack 完成到控制端的 TCP。帧协议与下面的收发逻辑完全不变。
+                val useTsnet = cn.ppps.forwarder.tailscale.TailscaleManager.USE_TSNET
+                val proxy = if (useTsnet) {
+                    cn.ppps.forwarder.tailscale.TsnetTransport.dialProxy(host, port)
+                } else null
+                if (useTsnet && proxy == null) {
+                    // 节点尚未在线：直接走重试（不要退化成"裸 Socket"，那在没有 tun 时必然超时）
+                    throw IOException("用户态节点未就绪，等待重试: $host:$port")
+                }
+                val (dialHost, dialPort) = if (proxy != null) {
+                    val h = proxy.substringBeforeLast(':')
+                    val p = proxy.substringAfterLast(':').toIntOrNull() ?: port
+                    h to p
+                } else {
+                    host to port
+                }
                 val s = Socket()
                 s.tcpNoDelay = true
-                s.connect(InetSocketAddress(host, port), 8000)
+                s.connect(InetSocketAddress(dialHost, dialPort), 8000)
                 if (!running) {
                     try {
                         s.close()

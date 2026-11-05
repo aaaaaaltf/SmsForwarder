@@ -31,12 +31,11 @@ if (keyPropsFile.exists()) {
     keyProps.load(new FileInputStream(keyPropsFile))
 }
 
-// ★★★ 2026-10-09（配置中心 P3）【ABI 单旋钮】：ndk.abiFilters 与 splits.include 都读此处，
-//   缺省 = 4 ABI（与改动前完全一致，产物清单不变）；单 ABI 调试：
-//     gradlew assembleDebug -PappAbis=arm64-v8a
+// ★★★ 2026-10-09（配置中心 P3）【ABI 单旋钮】：ndk.abiFilters 与 splits.include 都读此处。
 //   旋钮本体在 gradle.properties 的 appAbis=（-P 优先于 gradle.properties，Gradle 标准语义）。
 //   （与父仓库 android_controller/app/build.gradle 同约定。）
-def appAbis = (findProperty('appAbis') ?: 'armeabi-v7a,arm64-v8a,x86,x86_64')
+// ★ 2026-11-05 缺省改为仅 arm64-v8a（用户要求：以后打包只构建 arm64）。
+def appAbis = (findProperty('appAbis') ?: 'arm64-v8a')
         .toString().split(',').collect { it.trim() }.findAll { !it.isEmpty() }
 
 //打包时，记得设置true启用
@@ -301,7 +300,10 @@ tasks.withType(Test).configureEach {
 dependencies {
     implementation fileTree(dir: 'libs', include: ['*.jar'])
     // ★ 2026-08-16 Tailscale 集成：libtailscale.aar（golang 编译的被控端 VPN 内核）
-    implementation files('libs/libtailscale.aar')
+    // ★ 2026-11-05【被控端去 VPN】改用合并 AAR：同一次 gomobile bind 产出 libtailscale + tsnetpoc，
+    //   只保留一份 go.Seq / libgojni.so（两个独立 AAR 会因同名 JNI 库与重复类无法共存）。
+    //   运行时只启动 tsnet 用户态节点，不再创建 VpnService/tun。
+    implementation files('libs/tailscale-tsnet.aar')
 
     testImplementation deps.junit
     androidTestImplementation 'androidx.test.ext:junit:1.3.0'
