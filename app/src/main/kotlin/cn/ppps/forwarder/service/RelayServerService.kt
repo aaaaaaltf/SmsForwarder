@@ -51,86 +51,6 @@ class RelayServerService : Service() {
     private val TAG = "RelayServerService"
     private var client: RelayServerClient? = null
 
-    /**
-     * ★★★ 2026-11-03【A】重建中继连接的工厂：在 startRelay() 里注册（复用同一套回调/参数）。
-     *   用途：从"直连模式"切回"中继模式"时**强制重建 + 重新注册**，不沿用可能在直连期间已半死的旧 socket。
-     */
-    private var relayClientFactory: (() -> Unit)? = null
-
-    /** 上一次观察到的"是否中继模式"，用于只在 false→true 的那一次切换里重建（避免每轮节拍都重建） */
-    @Volatile
-    private var lastModeRelayOn: Boolean? = null
-
-    /** 两次强制重建之间的最小间隔（防抖：看门狗与模式切换同时命中时只重建一次） */
-    @Volatile
-    private var lastRelayRebuildAt = 0L
-
-    /** 中继模式下超过这么久没收到任何中继帧（仅用于日志留痕，不作为触发条件） */
-    private val RELAY_FRAME_TIMEOUT_MS = 45_000L
-
-    /** 强制重建的最小间隔 */
-    private val RELAY_REBUILD_MIN_GAP_MS = 20_000L
-
-    /** 中继模式下"会话不在线"的起始时间（0=当前在线）；连续 10 秒不在线就强制重建 */
-    @Volatile
-    private var relayDownSince = 0L
-
-    /** 中继会话持续不在线多久后强制重建 */
-    private val RELAY_DOWN_REBUILD_MS = 10_000L
-
-    /** ★ 最近一次"已连接中继"的时间（kick 时用来判断"刚连上，别打断"） */
-    @Volatile
-    private var lastRelayConnectAt = 0L
-
-    /** ★ 最近一次因网络恢复而 kick 的时间（kick 去抖） */
-    @Volatile
-    private var lastRelayKickAt = 0L
-
-    /** 刚重建/刚连上这段时间内，网络回调不许 kick（否则自己把新连接打断） */
-    private val RELAY_KICK_SUPPRESS_MS = 8_000L
-
-    /** 两次 kick 的最小间隔 */
-    private val RELAY_KICK_MIN_INTERVAL_MS = 15_000L
-
-    /**
-     * ★★★ 2026-11-03【A/B】强制重建中继会话：关旧连接 → 用同一套参数重拨 → 重新发注册帧。
-     *
-     * 触发点：
-     *   ① 模式互斥把模式从"直连"切回"中继"的那一次（[A]）；
-     *   ② 中继模式下 `client` 为空或 `isConnected()==false` 持续 10 秒（[B] 看门狗）。
-     * 两次重建至少间隔 [RELAY_REBUILD_MIN_GAP_MS]，避免和客户端自身的退避重连互相踩。
-     */
-    private fun forceRebuildRelay(reason: String) {
-        if (!isRunning) return
-        val now = System.currentTimeMillis()
-        if (now - lastRelayRebuildAt < RELAY_REBUILD_MIN_GAP_MS) {
-            Log.d(TAG, "★ 重建中继会话跳过（$reason）：距上次重建不足 ${RELAY_REBUILD_MIN_GAP_MS}ms")
-            return
-        }
-        val factory = relayClientFactory
-        if (factory == null) {
-            Log.w(TAG, "★ 重建中继会话跳过（$reason）：连接工厂尚未就绪")
-            return
-        }
-        lastRelayRebuildAt = now
-        Log.i(TAG, "★ 重建中继会话（$reason）：关闭旧连接 → 重拨 → 重新注册")
-        try {
-            client?.stop()
-        } catch (t: Throwable) {
-            Log.w(TAG, "关闭旧中继连接异常(忽略): ${t.message}")
-        }
-        client = null
-        try {
-            cn.ppps.forwarder.relay.CameraStreamManager.setClient(null)
-        } catch (_: Throwable) {
-        }
-        try {
-            factory()
-        } catch (t: Throwable) {
-            Log.e(TAG, "重建中继连接失败: ${t.message}")
-        }
-    }
-
     /** ★ 2026-10-26【网络恢复 → 立即重连中继】默认网络变化回调（见 registerNetRecoveryCallback） */
     private var netCallback: android.net.ConnectivityManager.NetworkCallback? = null
     private var listener: RelayServerListener? = null
@@ -357,9 +277,6 @@ class RelayServerService : Service() {
         registerNetRecoveryCallback()
         // Android 11+ 需要按 manifest 声明的前台服务类型启动（camera 类型用于后台摄像头推流，
         // microphone 类型用于麦克风采集（WebRTC 麦克风功能，Android 14+ 后台录音要求该 fgst 类型））
-        // ★ 2026-11-04：先建静默渠道再 startForeground —— 顺序反了首帧通知会落到默认渠道，
-        //   静默设置不生效（用户会看到/听到一条普通通知）。
-        createNotificationChannel()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             startForeground(FRONT_NOTIFY_ID, buildNotification(),
                 android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
@@ -367,6 +284,7 @@ class RelayServerService : Service() {
         } else {
             startForeground(FRONT_NOTIFY_ID, buildNotification())
         }
+        createNotificationChannel()
         // ★ 2026-08-28 被控端服务启动入口的「权限+保活」静默自检：
         //   只后台检测 + 写 logcat（tag=KeepAliveGuardian），不开任何窗口——
         //   后台起 Activity 在 Android 10+ 会被系统拦截，且违背"启动防打扰"要求。
@@ -418,7 +336,6 @@ class RelayServerService : Service() {
 
         val onConnected: () -> Unit = {
             isConnected = true
-            lastRelayConnectAt = System.currentTimeMillis()   // ★ 2026-11-03 kick 去抖用
             Log.i(TAG, "被控端已连接中继 ${RelaySettings.relayHost}:${RelaySettings.relayServerPort}")
             // ★★★ 2026-10-06【整改：关 VPN 方向也只看开关，不看到达性】
             //   本 client"连上"只是**传输层**事实 —— 总闸 off 时命令通道照样连得上（设计如此），
@@ -549,26 +466,20 @@ class RelayServerService : Service() {
 
         // ★ 中继云优先（2026-08-05）：被控端始终主动连接中继（更稳定，控制端优先显示云服务），
         //   中继不可达时由直连监听(56786) + TS直连扫描器(56789)兜底
-        fun createRelayClientLocal() {
-            val c = RelayServerClient(
-                host = RelaySettings.relayHost,
-                port = RelaySettings.relayServerPort,
-                onConnected = onConnected,
-                onDisconnected = onDisconnected,
-                onCommand = onRelayCommand,
-                // ★ 2026-08-28 省电：中继不可达时的重连间隔按忙/闲自适应（灭屏无人 5s→20s 退避）。
-                //   只影响"连不上时的重试频率"，已建立连接的收发、命令响应、文件传输通路完全不变。
-                isBusy = { isBusyNow() },
-            )
-            c.start()
-            client = c
-            // 摄像头推流复用中继连接发送视频帧（直连预览时被控端视频仍经中继56788推流）
-            cn.ppps.forwarder.relay.CameraStreamManager.setClient(c)
-            Log.i(TAG, "★ 中继客户端已创建并开始连接 ${RelaySettings.relayHost}:${RelaySettings.relayServerPort}")
-        }
-        createRelayClientLocal()
-        // ★★★ 2026-11-03【A】登记"重建工厂"：模式切回中继 / 看门狗判定半死时用它重建连接并重新注册
-        relayClientFactory = { createRelayClientLocal() }
+        val c = RelayServerClient(
+            host = RelaySettings.relayHost,
+            port = RelaySettings.relayServerPort,
+            onConnected = onConnected,
+            onDisconnected = onDisconnected,
+            onCommand = onRelayCommand,
+            // ★ 2026-08-28 省电：中继不可达时的重连间隔按忙/闲自适应（灭屏无人 5s→20s 退避）。
+            //   只影响"连不上时的重试频率"，已建立连接的收发、命令响应、文件传输通路完全不变。
+            isBusy = { isBusyNow() },
+        )
+        c.start()
+        client = c
+        // 摄像头推流复用中继连接发送视频帧（直连预览时被控端视频仍经中继56788推流）
+        cn.ppps.forwarder.relay.CameraStreamManager.setClient(c)
 
         // ★★★ 2026-10-04【模式互斥·直连任务只在"中继模式未开启"时才启动】
         //   把下面"直连监听(56786) + TS扫描(56789)"整段收进本地函数：
@@ -844,25 +755,12 @@ class RelayServerService : Service() {
             val cb = object : android.net.ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: android.net.Network) {
                     val relayOn = try { isRelayModeOn() } catch (_: Throwable) { true }
-                    val c = client
-                    val connected = c?.isConnected() == true
-                    val ready = c?.isReady() == true
+                    val ready = client?.isReady() == true
                     Log.i(TAG, "★ [网络恢复] onAvailable network=$network relayOn=$relayOn "
-                            + "relayReady=$ready connected=$connected")
-                    if (!relayOn) return
-                    // ★★★ 2026-11-03【真机修复·连上就被自己打断】旧写法用 !isReady() 判，
-                    //   而"刚连上、注册帧还没回"时 isReady()=false ⇒ 网络回调（VPN 关闭引起的默认网络
-                    //   变化）把我们**刚建立**的连接当场 kick 掉，日志表现为
-                    //   「已连接中继 → 立即重连(网络恢复) → 发送注册帧失败: Socket closed」每秒一轮，
-                    //   所有控制端在这期间都拿不到稳定会话（切到中继后"谁都连不上"的真相）。
-                    //   现在：已连接（哪怕还没注册完）绝不打断；刚重建/刚连上 8 秒内也不打断。
-                    if (connected || ready) return
-                    val now = System.currentTimeMillis()
-                    if (now - lastRelayRebuildAt < RELAY_KICK_SUPPRESS_MS) return
-                    if (now - lastRelayConnectAt < RELAY_KICK_SUPPRESS_MS) return
-                    if (now - lastRelayKickAt < RELAY_KICK_MIN_INTERVAL_MS) return
-                    lastRelayKickAt = now
-                    c?.kick("网络恢复")
+                            + "relayReady=$ready")
+                    if (relayOn && !ready) {
+                        client?.kick("网络恢复")
+                    }
                 }
 
                 override fun onLost(network: android.net.Network) {
@@ -931,24 +829,7 @@ class RelayServerService : Service() {
                 }
                 tsDirectClients.clear()
             }
-            // ★★★ 2026-11-03【A】"直连 → 中继"这一次切换：强制重建中继会话并重新注册。
-            //   现场日志：23:26:28「服务器推送 on → 切中继」之后就再无任何中继事件，所有手机控制端
-            //   （华为/红米）都连不上，而进程一直活着 —— 沿用直连期间建立的旧 socket 是最大嫌疑。
-            val prevRelayOn = lastModeRelayOn
-            lastModeRelayOn = true
-            if (prevRelayOn == false) {
-                // ★★★ 2026-11-04【看门狗全天失效修复】只在真正发生"直连→中继"切换时清零计时。
-                //   旧实现在这里无条件 relayDownSince = 0L，而 scheduleStateReport 每轮
-                //   （忙时 5 秒）都会调 applyModeExclusivity("状态节拍")，看门狗要求连续
-                //   离线 >RELAY_DOWN_REBUILD_MS(10s) 才重建 ⇒ 5s < 10s 永远达不到。
-                //   11-04 真机：26 次「开始计时」、0 次「会话已离线」、0 次看门狗重建，
-                //   17:24:52 断连后要等客户端退避 72 秒才恢复注册。
-                //   现在在线时由看门狗自己清零（见 scheduleStateReport 的 else 分支）。
-                relayDownSince = 0L
-                forceRebuildRelay("切回中继($reason)")
-            }
         } else {
-            lastModeRelayOn = false
             if (listener == null && tsScanner == null) {
                 Log.i(TAG, "★ 模式互斥($reason)：非中继模式 → 启用直连任务（监听56786 + TS扫描56789）")
             }
@@ -982,32 +863,6 @@ class RelayServerService : Service() {
                         // ★★★ 2026-10-04【模式互斥·兜底裁决】每轮状态上报都重新对齐一次（幂等、零额外开销），
                         //   覆盖"同机控制端广播 RELAY_STATE_CHANGED"等不经本服务回调的状态来源。
                         applyModeExclusivity("状态节拍")
-                        // ★★★ 2026-11-03【B】中继看门狗：中继模式下会话不在线超过 10 秒 ⇒ 强制重建 + 重新注册
-                        try {
-                            if (isRelayModeOn()) {
-                                val c = client
-                                if (c == null || !c.isConnected()) {
-                                    val nowMs = System.currentTimeMillis()
-                                    if (relayDownSince == 0L) {
-                                        relayDownSince = nowMs
-                                        Log.w(TAG, "★ 中继看门狗：中继模式下中继会话不在线，开始计时")
-                                    } else if (nowMs - relayDownSince > RELAY_DOWN_REBUILD_MS) {
-                                        val lastFrame = c?.lastFrameAtMs ?: 0L
-                                        val silentSec = if (lastFrame > 0) (nowMs - lastFrame) / 1000 else -1L
-                                        Log.w(TAG, "★ 中继看门狗：会话已离线 ${(nowMs - relayDownSince) / 1000}s" +
-                                                if (silentSec < 0) "（从未收到中继帧）"
-                                                else "（最近一次中继帧 ${silentSec}s 前" +
-                                                        if (silentSec * 1000 > RELAY_FRAME_TIMEOUT_MS) "，已超静默阈值）" else "）")
-                                        relayDownSince = 0L
-                                        forceRebuildRelay("看门狗:会话不在线")
-                                    }
-                                } else {
-                                    relayDownSince = 0L
-                                }
-                            }
-                        } catch (t: Throwable) {
-                            Log.w(TAG, "中继看门狗异常: ${t.message}")
-                        }
                         val state = buildDeviceState()
                         // ★ 设备状态上报：中继连接 + 直连监听（广播所有已接入控制端）+ TS直连（广播所有控制端）
                         client?.send(RelayCommands.CMD_DEV_STATE, state)
@@ -1079,7 +934,6 @@ class RelayServerService : Service() {
         //   历史：ae39130 那次提交把这行漏掉了 ⇒ 控制端列表里"主动探活有版本、被动上报没版本"，
         //   表现为版本号时有时无地闪烁，回归断言 4.196 因此长期红。
         return "$name|${if (locked) 1 else 0}|${if (screenOn) 1 else 0}|$battery|$charging|${DeviceIdentity.uniqueDeviceId(this)}|ver=${appVersionNameSafe()}"
-    }
 
     /**
      * ★ 2026-10-28 版本名（取不到回 "?"，绝不抛异常）。
@@ -1100,6 +954,7 @@ class RelayServerService : Service() {
             "?"
         }
     }
+    }
 
     override fun onDestroy() {
         Log.i(TAG, "onDestroy")
@@ -1116,9 +971,6 @@ class RelayServerService : Service() {
         stateTimer = null
         client?.stop()
         client = null
-        // ★ 2026-11-03：服务销毁后不允许外部再触发"重建中继会话"
-        relayClientFactory = null
-        lastModeRelayOn = null
         listener?.stop()
         // ★ 2026-09-04：CameraStreamManager 是进程级单例，服务销毁后它仍会留着这些通道
         //   （且通道闭包捕获了本服务实例）→ 只 add 不 remove 会让 senders 随重启单调增长。
@@ -1146,19 +998,9 @@ class RelayServerService : Service() {
         super.onDestroy()
     }
 
-    /** ★ 2026-11-04【需求】被控端通知静默到最低：无声/不振动/无角标/锁屏不显示。
-     *  必须用**新渠道 ID**：Android 不允许 App 降低已存在渠道的 importance，
-     *  沿用旧 ID 时老机型上仍是 IMPORTANCE_LOW（会占状态栏、可能响铃）。 */
-    private val QUIET_CHANNEL_ID = "relay_server_quiet_v1"
-    private val QUIET_CHANNEL_NAME = "被控端运行状态（静默）"
-
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(QUIET_CHANNEL_ID, QUIET_CHANNEL_NAME, NotificationManager.IMPORTANCE_MIN)
-            channel.setSound(null, null)
-            channel.enableVibration(false)
-            channel.setShowBadge(false)
-            channel.lockscreenVisibility = Notification.VISIBILITY_SECRET
+            val channel = NotificationChannel(FRONT_CHANNEL_ID, FRONT_CHANNEL_NAME, NotificationManager.IMPORTANCE_LOW)
             val manager = getSystemService(NotificationManager::class.java)
             manager.createNotificationChannel(channel)
         }
@@ -1170,19 +1012,10 @@ class RelayServerService : Service() {
         val flags = if (Build.VERSION.SDK_INT >= 30) PendingIntent.FLAG_IMMUTABLE else PendingIntent.FLAG_UPDATE_CURRENT
         val pendingIntent = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), flags)
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            Notification.Builder(this, QUIET_CHANNEL_ID)
+            Notification.Builder(this, FRONT_CHANNEL_ID)
         } else {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
-        }
-        // ★ 2026-11-04【需求】静默：不响铃/不振动/不弹横幅/不重复提醒，状态栏也不占图标。
-        //   渠道 importance=IMPORTANCE_MIN + 无声音/无振动已是静音；setOnlyAlertOnce 防重复提示。
-        builder.setOnlyAlertOnce(true)
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-            @Suppress("DEPRECATION")
-            builder.setPriority(Notification.PRIORITY_MIN)
-                .setDefaults(0)
-                .setSound(null)
         }
         return builder
             .setContentTitle(contentTitle)

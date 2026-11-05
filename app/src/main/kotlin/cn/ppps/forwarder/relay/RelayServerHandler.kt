@@ -753,15 +753,10 @@ object RelayServerHandler {
                     // 负载格式与PC被控端一致: 版本|设备名|用户|isAdmin|isService（纯ASCII，编码安全）
                     // ★★★ 2026-10-04 尾部追加协商字段（老控制端按下标取前 5 段，多出来的字段被忽略）：
                     //   proto=本端协议版本；caps=屏幕能力位（控制端据此决定"屏幕用 WebRTC 高清还是 JPEG"）。
-                    // ★★★ 2026-11-03【设备唯一ID】尾部追加 did=<32位hex>（本机首次生成后固定不变，
-                    //   卸载重装/清数据才会变）。控制端把它当作"同机"唯一判据：中继同出口 IP 下，
-                    //   两台同名设备靠 did 区分，正常重连 clientId 变了但 did 不变仍合并为一条。
-                    //   老控制端按下标取前 5 段，会忽略尾部字段 ⇒ 向后兼容。
                     RelayCommands.CMD_VERSION_INFO to
                             ("$versionName|$deviceName|Android|0|0"
                                     + "|proto=" + RelayProtoState.OWN_PROTO_VERSION
-                                    + "|caps=0x" + Integer.toHexString(RelayProtoState.ownCaps())
-                                    + "|did=" + DeviceUid.get())
+                                    + "|caps=0x" + Integer.toHexString(RelayProtoState.ownCaps()))
                 }
 
                 // ★★★ 2026-08-17 方案C：反向查询设备状态（控制端主动探活心跳）
