@@ -88,6 +88,12 @@ object TsnetTransport {
             }
             node = null
             selfIp = null
+            // ★★★ 2026-11-06 修复：重建节点后旧 node 的 Listen 代理已随 close() 消失，
+            //   必须复位这些"已建立"标记，否则 startInboundIfNeeded 会早退，
+            //   尾网 :56786/:56783/:56791 永远不再监听（控制端连上即 RST，且无日志）。
+            inboundStarted = false
+            dialProxies.clear()
+            exposedTcpPorts.clear()
         }
         Thread({
             try {
@@ -236,41 +242,88 @@ object TsnetTransport {
         java.util.Collections.newSetFromMap(ConcurrentHashMap<Int, Boolean>())
 
     /**
+     * ★ 2026-11-06【直连模式媒体端口】节点尚未在线时先排队的暴露请求。
+     *   冷启动时屏幕/麦克风推流可能早于 tsnet Up 完成，直接 expose 会返回 false；
+     *   原先没有补建机制，只能靠用户手动重试预览。这里排队，Up 后自动补建。
+     */
+    private val pendingExposes = ConcurrentHashMap<Int, String>()
+
+    /**
      * ★ 2026-11-05【直连模式 ICE-TCP】把本机 WebRTC 的 TCP 候选端口暴露到尾网：
      *   控制端（VPN tun）连 100.x:port → tsnet 接受 → 转发到 localAddr（候选真实 IP:port）。
-     *   返回 true=已暴露（含此前已暴露过的端口）。
+     * ★ 2026-11-06 复用为直连模式媒体端口（56783 屏幕 / 56791 麦克风）的暴露入口。
+     *   返回 true=已暴露（含此前已暴露过的端口）；节点未在线时排队并返回 false。
      */
     fun exposeTcpPort(port: Int, localAddr: String): Boolean {
         if (port <= 0 || localAddr.isBlank()) return false
-        val n = node ?: return false
-        if (!up) return false
+        val n = node
+        if (!up || n == null) {
+            pendingExposes[port] = localAddr
+            Log.i(TAG, "★ 端口暴露排队（节点未在线）：尾网 :$port → $localAddr")
+            return false
+        }
         synchronized(this) {
             if (!exposedTcpPorts.add(port)) return true
             return try {
                 n.startListenProxy(port.toLong(), localAddr)
-                Log.i(TAG, "★ ICE-TCP 端口已暴露：尾网 :$port → $localAddr")
+                Log.i(TAG, "★ 媒体/直连端口已暴露：尾网 :$port → $localAddr")
                 true
             } catch (t: Throwable) {
                 exposedTcpPorts.remove(port)
-                Log.w(TAG, "ICE-TCP 端口暴露失败 :$port → $localAddr：${t.message}")
+                Log.w(TAG, "端口暴露失败 :$port → $localAddr：${t.message}")
                 false
             }
         }
     }
 
-    private fun startInboundIfNeeded() {
-        if (inboundStarted || inboundPort <= 0) return
+    /**
+     * ★ 2026-11-06【媒体端口回收】会话结束时撤掉尾网监听（Go 侧 StopListenProxy）。
+     *   幂等：未暴露过/节点已关闭时静默返回。停止推流后端口不应继续接受连接。
+     */
+    fun unexposeTcpPort(port: Int) {
+        if (port <= 0) return
+        pendingExposes.remove(port)
+        if (!exposedTcpPorts.remove(port)) return
         val n = node ?: return
-        synchronized(this) {
-            if (inboundStarted) return
-            try {
-                n.startListenProxy(inboundPort.toLong(), "127.0.0.1:$inboundPort")
-                inboundStarted = true
-                Log.i(TAG, "★ 入站代理已建立：尾网 :$inboundPort → 本机 127.0.0.1:$inboundPort")
-            } catch (t: Throwable) {
-                Log.w(TAG, "建立入站代理失败: ${t.message}")
+        try {
+            n.stopListenProxy(port.toLong())
+            Log.i(TAG, "★ 端口已回收：尾网 :$port")
+        } catch (t: Throwable) {
+            Log.w(TAG, "端口回收失败 :$port：${t.message}")
+        }
+    }
+
+    /** 节点 Up 后补建所有排队中的端口暴露（由 startInboundIfNeeded 调用） */
+    private fun flushPendingExposes() {
+        if (!up || node == null || pendingExposes.isEmpty()) return
+        val it = pendingExposes.entries.iterator()
+        while (it.hasNext()) {
+            val e = it.next()
+            if (exposeTcpPort(e.key, e.value)) {
+                it.remove()
             }
         }
+    }
+
+    private fun startInboundIfNeeded() {
+        if (inboundStarted || inboundPort <= 0) {
+            // ★ 命令端口可能已建立过（inboundStarted=true），但媒体端口仍可能排队待建
+            flushPendingExposes()
+            return
+        }
+        val n = node ?: return
+        synchronized(this) {
+            if (!inboundStarted) {
+                try {
+                    n.startListenProxy(inboundPort.toLong(), "127.0.0.1:$inboundPort")
+                    inboundStarted = true
+                    Log.i(TAG, "★ 入站代理已建立：尾网 :$inboundPort → 本机 127.0.0.1:$inboundPort")
+                } catch (t: Throwable) {
+                    Log.w(TAG, "建立入站代理失败: ${t.message}")
+                }
+            }
+        }
+        flushPendingExposes()
     }
 
     /** 停机（服务销毁/调试用）：关闭节点、代理与状态 */
@@ -288,6 +341,7 @@ object TsnetTransport {
         inboundPort = 0
         dialProxies.clear()
         exposedTcpPorts.clear()
+        pendingExposes.clear()
     }
 
     /** 解析 Up/Status 返回的 JSON，更新 selfIp/up */

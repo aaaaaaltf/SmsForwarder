@@ -47,8 +47,9 @@ class TailscaleDirectClient(
     private var running = false
     private var thread: Thread? = null
 
-    /** ★ 最多重连次数：触发后保持一段时间窗口（每5秒1次），连接建立后重置 */
-    private val maxReconnect = 20
+    /** ★ 重连退避上限：原 maxReconnect=20 次用尽后线程直接结束、对象留在 map 里不再重连，
+     *   控制端离线超过约 100 秒后即使回来也要等扫描器重建对象。改为无限重试 + 60s 封顶退避。 */
+    private val maxBackoffMs = 60000L
 
     override fun isConnected(): Boolean {
         val s = socket ?: return false
@@ -74,7 +75,7 @@ class TailscaleDirectClient(
 
     private fun connectLoop() {
         var retries = 0
-        while (running && retries < maxReconnect) {
+        while (running) {
             try {
                 // ★ 2026-11-05【被控端去 VPN】tsnet 模式：
                 //   不直接连 host:port（那需要 tun 路由），而是连 Go 在 127.0.0.1 起的拨号代理，
@@ -110,19 +111,20 @@ class TailscaleDirectClient(
                 onConnected()
                 receiveLoop(s)
             } catch (e: Exception) {
-                if (running) Log.w(TAG, "TS直连失败(${e.message})，剩余重试=${maxReconnect - retries - 1}")
+                if (running) Log.w(TAG, "TS直连失败(${e.message})，第${retries + 1}次，将退避重试")
             }
             socket = null
             if (running) onDisconnected()
             retries++
-            if (running && retries < maxReconnect) {
+            if (running) {
+                val backoff = minOf(5000L * retries, maxBackoffMs)
                 try {
-                    Thread.sleep(5000)
+                    Thread.sleep(backoff)
                 } catch (_: InterruptedException) {
                 }
             }
         }
-        if (running) Log.w(TAG, "TS直连停止重试（已达最大次数）")
+        Log.i(TAG, "TS直连线程退出（running=false）")
     }
 
     private fun receiveLoop(s: Socket) {

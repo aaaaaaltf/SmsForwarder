@@ -46,9 +46,19 @@ class RelayServerListener(
      */
     private inner class ConnChannel(val connId: Long, val socket: Socket) {
         val sendLock = Any()
-        val sendExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
-            Thread(r, "RelaySrvSend-$connId").apply { isDaemon = true }
-        }
+        /**
+         * ★ 2026-11-06【内存保护】单线程发送池改用**有界队列**：
+         *   原 newSingleThreadExecutor 的队列无上限，弱网/半开连接时摄像头 10fps×几十 KB、
+         *   麦克风 25fps 帧会无限积压 → 堆暴涨被杀。媒体帧允许丢（实时性优先），
+         *   命令/文件帧在队列满时退化为调用线程直接写（背压），不丢。
+         */
+        val sendExecutor: ExecutorService = java.util.concurrent.ThreadPoolExecutor(
+            1, 1, 0L, java.util.concurrent.TimeUnit.MILLISECONDS,
+            java.util.concurrent.ArrayBlockingQueue<Runnable>(128),
+            { r -> Thread(r, "RelaySrvSend-$connId").apply { isDaemon = true } },
+            java.util.concurrent.ThreadPoolExecutor.AbortPolicy()
+        )
+        private val droppedMediaFrames = AtomicLong(0)
         val heartBeatExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
             Thread(r, "RelaySrvHb-$connId").apply { isDaemon = true }
         }
@@ -69,25 +79,41 @@ class RelayServerListener(
             if (!alive()) return
             val frame = encode(cmd, payload)
             val executor = if (isHeartBeatCmd(cmd)) heartBeatExecutor else sendExecutor
-            try {
-                executor.execute {
-                    if (!alive()) return@execute
-                    try {
-                        synchronized(sendLock) {
-                            val out = socket.getOutputStream()
-                            out.write(frame)
-                            out.flush()
-                        }
-                    } catch (e: Exception) {
-                        // 日志限流：断连瞬间积压任务会连续报错，10秒内仅记录一次
-                        logSendError("发送失败#$connId，关闭本连接", e)
-                        closeQuietly()
+            val task = Runnable {
+                if (!alive()) return@Runnable
+                try {
+                    synchronized(sendLock) {
+                        val out = socket.getOutputStream()
+                        out.write(frame)
+                        out.flush()
                     }
+                } catch (e: Exception) {
+                    // 日志限流：断连瞬间积压任务会连续报错，10秒内仅记录一次
+                    logSendError("发送失败#$connId，关闭本连接", e)
+                    closeQuietly()
                 }
+            }
+            try {
+                executor.execute(task)
+            } catch (e: java.util.concurrent.RejectedExecutionException) {
+                if (isMediaFrameCmd(cmd)) {
+                    val n = droppedMediaFrames.incrementAndGet()
+                    if (n == 1L || n % 50L == 0L) {
+                        Log.w(TAG, "发送队列积压(#$connId)，丢弃媒体帧($cmd)，累计=$n")
+                    }
+                    return
+                }
+                // 非媒体帧（命令/文件/信令）：在调用线程同步写出，提供背压且不丢帧
+                Log.w(TAG, "发送队列积压(#$connId)，命令帧改同步写出: $cmd")
+                task.run()
             } catch (e: Exception) {
                 Log.w(TAG, "提交发送任务失败#$connId: ${e.message}")
             }
         }
+
+        /** 摄像头/麦克风实时帧：队列满时允许丢弃 */
+        private fun isMediaFrameCmd(cmd: String): Boolean =
+            cmd == RelayCommands.CMD_CAMERA_STREAM_FRAME || cmd == RelayCommands.CMD_MIC_FRAME
 
         /**
          * 同步写入本连接，等待实际flush完成。
@@ -254,21 +280,75 @@ class RelayServerListener(
         }
         val streamBuffer = StreamBuffer()
         val tmp = ByteArray(4096)
+        // ★★★ 2026-11-06【直连首包鉴权】accept 后先发一次性挑战；5 秒内未应答则断开。
+        //   ★ 只读探测命令（GET_VERSION/GET_DEV_STATE/PING）在认证前放行：
+        //     控制端的设备发现/身份校验使用独立 socket，不会应答挑战；放行这些无敏感信息的
+        //     命令才能避免"设备列表全部探测失败"。业务命令在认证前只缓冲、不执行。
+        //   ★ PC 被控端不实现该挑战，控制端所有路径对 PC 的行为保持不变。
+        val challengeBytes = ByteArray(16)
+        java.security.SecureRandom().nextBytes(challengeBytes)
+        val challenge = buildString {
+            for (b in challengeBytes) append("%02x".format(b.toInt() and 0xFF))
+        }
+        var authenticated = false
+        val authDeadline = System.currentTimeMillis() + DirectAuth.CMD_AUTH_TIMEOUT_MS
+        val pending = ArrayList<Pair<String, ByteArray>>()
         try {
+            s.soTimeout = 1000
+            channels[id]?.submit(DirectAuth.CMD_CHALLENGE, challenge.toByteArray(Charsets.UTF_8))
+            Log.i(TAG, "直连鉴权挑战已发送#$id")
             while (running && !s.isClosed) {
-                val n = input.read(tmp)
+                val n = try {
+                    input.read(tmp)
+                } catch (_: java.net.SocketTimeoutException) {
+                    if (!authenticated && System.currentTimeMillis() > authDeadline) {
+                        Log.w(TAG, "直连鉴权超时#$id，断开")
+                        break
+                    }
+                    continue
+                }
                 if (n < 0) break
                 streamBuffer.append(tmp.copyOf(n))
                 while (true) {
                     val frame = streamBuffer.readFrame() ?: break
                     if (frame.size <= 4) continue
                     val (cmd, payload) = RelayCommands.parse(frame.copyOfRange(4, frame.size))
-                    if (cmd.isNotEmpty()) {
-                        try {
-                            onCommand(id, cmd, payload)
-                        } catch (e: Exception) {
-                            Log.e(TAG, "处理命令异常: ${e.message}")
+                    if (cmd.isEmpty()) continue
+                    if (!authenticated) {
+                        if (cmd == DirectAuth.CMD_RESPONSE) {
+                            val response = String(payload, Charsets.US_ASCII).trim()
+                            if (DirectAuth.verifyResponse(challenge, response)) {
+                                authenticated = true
+                                s.soTimeout = 0
+                                Log.i(TAG, "直连鉴权通过#$id（缓冲命令 ${pending.size} 条）")
+                                for ((c, p) in pending) {
+                                    try {
+                                        onCommand(id, c, p)
+                                    } catch (e: Exception) {
+                                        Log.e(TAG, "处理缓冲命令异常: ${e.message}")
+                                    }
+                                }
+                                pending.clear()
+                            } else {
+                                Log.w(TAG, "直连鉴权失败#$id，断开")
+                                return
+                            }
+                        } else if (isProbeCommand(cmd)) {
+                            // 只读探测放行（不回敏感数据，也不改变设备状态）
+                            try {
+                                onCommand(id, cmd, payload)
+                            } catch (e: Exception) {
+                                Log.e(TAG, "处理探测命令异常: ${e.message}")
+                            }
+                        } else if (pending.size < 64) {
+                            pending.add(cmd to payload)
                         }
+                        continue
+                    }
+                    try {
+                        onCommand(id, cmd, payload)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "处理命令异常: ${e.message}")
                     }
                 }
             }
@@ -284,6 +364,12 @@ class RelayServerListener(
             if (running) onDisconnected()
         }
     }
+
+    /** 认证前允许放行的只读探测命令（无敏感信息、不改变设备状态） */
+    private fun isProbeCommand(cmd: String): Boolean =
+        cmd == RelayCommands.CMD_GET_VERSION ||
+        cmd == RelayCommands.CMD_GET_DEV_STATE ||
+        cmd == RelayCommands.CMD_PING
 
     /** 发送给最新接入的连接（视频帧/心跳等单播用途，预览控制端通常为最新连接） */
     override fun send(cmd: String, payload: ByteArray) {

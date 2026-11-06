@@ -80,6 +80,19 @@ class WebRtcSessionManager(
                 } catch (t: Throwable) {
                     Log.w(TAG, "★ [TURN] 添加TURN失败(忽略): ${t.message}")
                 }
+            } else {
+                // ★★★ 2026-11-06【直连模式 TURN over TCP 兜底】tsnet 用户态无 tun/无 UDP，
+                //   蜂窝↔蜂窝打洞失败；本 SDK 无 ICE-TCP，但 TURN 的 TCP 传输独立可用（coturn 已实测）。
+                //   两端都加同一个 turn:...?transport=tcp，relay 候选在 TURN 服务器汇合。
+                try {
+                    servers.add(PeerConnection.IceServer.builder(TURN_SERVER_URL + "?transport=tcp")
+                        .setUsername(TURN_USERNAME)
+                        .setPassword(TURN_PASSWORD)
+                        .createIceServer())
+                    Log.i(TAG, "★ [TURN] 直连模式已追加 TURN over TCP 兜底 $TURN_SERVER_URL?transport=tcp")
+                } catch (t: Throwable) {
+                    Log.w(TAG, "★ [TURN] 直连模式追加 TURN-TCP 失败(忽略): ${t.message}")
+                }
             }
             return servers
         }
@@ -925,13 +938,33 @@ class WebRtcSessionManager(
                         var useSdp: SessionDescription = sdp
                         var dtxModified = false
                         try {
-                            val desc = sdp.description.replace("usedtx=1", "usedtx=0")
+                            val desc0 = sdp.description.replace("usedtx=1", "usedtx=0")
+                            // ★★★ 2026-11-07【对讲下行音质】Opus 默认码率偏低（下行听感发闷/有编码噪声）。
+                            //   在 ANSWER 的 Opus fmtp 行内追加 maxaveragebitrate/stereo（只改同一行，
+                            //   不增删行，避免 native SDP 解析失败）。控制端 OFFER 已用同口径 96000。
+                            var desc = desc0
+                            try {
+                                if (!desc.contains("maxaveragebitrate")) {
+                                    val opusPt = Regex("a=rtpmap:(\\d+) opus/48000/2", RegexOption.IGNORE_CASE)
+                                        .find(desc)?.groupValues?.get(1)
+                                    if (opusPt != null) {
+                                        val fmtp = Regex("(a=fmtp:$opusPt [^\\r\\n]*)")
+                                        desc = fmtp.replace(desc) { m ->
+                                            m.groupValues[1] + ";maxaveragebitrate=96000;stereo=0;useinbandfec=1"
+                                        }
+                                        Log.i(TAG, "$stepTag [8/8] ★对讲音质：Opus pt=$opusPt 追加 96000bps/立体声关闭")
+                                    }
+                                }
+                            } catch (t: Throwable) {
+                                Log.w(TAG, "$stepTag [8/8] Opus 码率修改失败(用原SDP): ${t.message}")
+                                desc = desc0
+                            }
                             if (desc != sdp.description) {
                                 dtxModified = true
                                 useSdp = SessionDescription(sdp.type, desc)
-                                Log.i(TAG, "$stepTag [8/8] ★★★禁用DTX：usedtx=1→usedtx=0（Opus静音期不发包→录制音频覆盖率仅20%，禁用后静音期也持续发舒适音）")
+                                Log.i(TAG, "$stepTag [8/8] ★SDP已修改（DTX/Opus码率），len=${desc.length}")
                             } else {
-                                Log.i(TAG, "$stepTag [8/8] SDP中未发现usedtx=1（DTX未启用，无需修改）")
+                                Log.i(TAG, "$stepTag [8/8] SDP无需修改（DTX未启用且已有码率）")
                             }
                         } catch (t: Throwable) {
                             Log.w(TAG, "$stepTag [8/8] SDP修改usedtx异常(用原始): ${t.message}")
@@ -1431,10 +1464,16 @@ class WebRtcSessionManager(
             //   【根因】createAudioSource(空MediaConstraints) → 软件音频处理未启用 → 麦克风采集
             //     无回声消除/噪声抑制/增益控制 → 声学反馈增益过大 → 啸叫(呼啸声)。
             //   【方案】保持 MIC 源+关闭硬件AEC/NS(防机器人声)，软件AEC/NS/AGC保留启用(抑制啸叫)。
+            // ★★★ 2026-11-07【对讲音质：放大但不噪音】
+            //   用户要求音量更大但不能有底噪。策略与"开麦克风"对齐但补降噪：
+            //     · AEC 开启（双向对讲防啸叫）
+            //     · NS 开启（抑制底噪；AGC 关闭，避免 AGC 在安静时把底噪泵大）
+            //     · 高通开启（去低频轰隆）
+            //   音量放大放在控制端系统通话音量（线性、不改变信噪比），不用 +15dB。
             val audioConstraints = MediaConstraints()
             audioConstraints.mandatory.add(MediaConstraints.KeyValuePair("googEchoCancellation", "true"))
             audioConstraints.mandatory.add(MediaConstraints.KeyValuePair("googNoiseSuppression", "true"))
-            audioConstraints.mandatory.add(MediaConstraints.KeyValuePair("googAutoGainControl", "true"))
+            audioConstraints.mandatory.add(MediaConstraints.KeyValuePair("googAutoGainControl", "false"))
             audioConstraints.mandatory.add(MediaConstraints.KeyValuePair("googHighpassFilter", "true"))
             f.createAudioSource(audioConstraints)
         } catch (t: Throwable) {

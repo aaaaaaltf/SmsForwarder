@@ -43,6 +43,9 @@ object MicrophoneStreamManager {
     private var running = false
     @Volatile
     private var audioRecord: AudioRecord? = null
+    /** ★ 2026-11-06：AudioRecord 是否已真正开始采集（通道就绪后才启动，避免 accept 15s 期间缓冲溢出） */
+    @Volatile
+    private var recordingStarted = false
     private var captureThread: Thread? = null
     /**
      * ★ 当前会话的"属主线程"：只有它可以清理公共字段。
@@ -169,6 +172,17 @@ object MicrophoneStreamManager {
      *  避免返回WiFi热点IP导致控制端无法连接。
      */
     private fun getLocalIpAddress(): String {
+        // ★★★ 2026-11-06【直连模式 tsnet】被控端改用 tsnet 用户态后本机**没有 100.x 网卡**，
+        //   下面按 NetworkInterface 枚举永远选不到 Tailscale IP，控制端会拿到 WiFi 地址
+        //   （华为蜂窝网络下不可达）→ 数据通道必然超时回退。这里先取 tsnet 的 self IP。
+        try {
+            val tsIp = cn.ppps.forwarder.tailscale.TsnetTransport.selfIp
+            if (!tsIp.isNullOrBlank() && isTailscaleCgnat(tsIp)) {
+                Log.i(TAG, "getLocalIpAddress 选择tsnet IP: $tsIp")
+                return tsIp
+            }
+        } catch (_: Throwable) {
+        }
         try {
             val interfaces = NetworkInterface.getNetworkInterfaces()?.toList() ?: return "127.0.0.1"
             var fallbackIp: String? = null
@@ -322,7 +336,10 @@ object MicrophoneStreamManager {
                 try { recorder.release() } catch (_: Exception) {}
                 return null
             }
-            recorder.startRecording()
+            // ★★★ 2026-11-06【性能修复】不再在这里 startRecording()：
+            //   直连模式随后要 accept 控制端（最长 15 秒），期间没人 read()，
+            //   AudioRecord 环形缓冲会溢出，回退命令通道后先送出的是 15 秒前的陈旧音频（听感=先静音后断续）。
+            //   改为通道就绪（数据通道接入 / 回退命令通道 / 中继连接成功）后再启动采集。
             audioRecord = recorder
             sender = s
             running = true
@@ -348,6 +365,12 @@ object MicrophoneStreamManager {
                         ss.soTimeout = 15000  // ★ 修复：accept最多等15秒，超时自动回退命令通道（避免卡死无日志）
                         serverSocket = ss
                         Log.i(TAG, "麦克风数据通道监听 ${RelayCommands.MIC_DATA_PORT}，等待控制端接入(最多15秒)...")
+                        // ★★★ 2026-11-06【直连模式媒体端口】与屏幕同理：tsnet 用户态下必须把
+                        //   尾网 :56791 转发到本机 127.0.0.1:56791，控制端才能经 100.x 接入数据通道。
+                        cn.ppps.forwarder.tailscale.TsnetTransport.exposeTcpPort(
+                            RelayCommands.MIC_DATA_PORT,
+                            "127.0.0.1:${RelayCommands.MIC_DATA_PORT}"
+                        )
 
                         // ★★★ 先通知控制端数据通道就绪，再等待接入（原逻辑相反导致死锁）
                         try {
@@ -372,7 +395,10 @@ object MicrophoneStreamManager {
                             try { ss.close() } catch (_: Exception) {}
                             // ★ 只有还持有属主身份时才清公共句柄：
                             //   被顶替后 field 里已是新会话的 ServerSocket，清空会让下次 STOP 关不掉它
-                            if (ownsSession()) serverSocket = null
+                            if (ownsSession()) {
+                                serverSocket = null
+                                cn.ppps.forwarder.tailscale.TsnetTransport.unexposeTcpPort(RelayCommands.MIC_DATA_PORT)
+                            }
                             if (running && ownsSession()) {
                                 Log.i(TAG, "★ 回退到命令通道模式（直连超时无人接入）")
                                 captureLoopCommandChannel()
@@ -380,6 +406,32 @@ object MicrophoneStreamManager {
                             return@Thread
                         }
                         accepted.tcpNoDelay = true
+                        // ★★★ 2026-11-06【媒体首包鉴权】直连麦克风通道：控制端须先发
+                        //   DAUTH|<port>|<ts>|<HMAC>，5 秒内校验不过则拒绝并回退命令通道
+                        //   （命令通道本身已通过 dautc/dautr 认证，回退不会降低安全性）。
+                        try {
+                            accepted.soTimeout = 5000
+                            val authLine = DirectAuth.readAuthLine(accepted.getInputStream())
+                            if (!DirectAuth.verifyMediaLine(RelayCommands.MIC_DATA_PORT, authLine ?: "")) {
+                                Log.w(TAG, "麦克风媒体鉴权失败，拒绝连接: ${accepted.inetAddress.hostAddress}")
+                                try { accepted.close() } catch (_: Exception) {}
+                                try { ss.close() } catch (_: Exception) {}
+                                if (ownsSession()) {
+                                serverSocket = null
+                                cn.ppps.forwarder.tailscale.TsnetTransport.unexposeTcpPort(RelayCommands.MIC_DATA_PORT)
+                            }
+                                if (running && ownsSession()) {
+                                    Log.i(TAG, "★ 回退到命令通道模式（媒体鉴权失败）")
+                                    captureLoopCommandChannel()
+                                }
+                                return@Thread
+                            }
+                            accepted.soTimeout = 0
+                        } catch (e: Exception) {
+                            Log.w(TAG, "麦克风媒体鉴权异常，拒绝连接: ${e.message}")
+                            try { accepted.close() } catch (_: Exception) {}
+                            return@Thread
+                        }
                         // ★ 等待接入期间已被 STOP/新会话顶替：绝不把 socket 挂到新会话的公共字段上
                         if (!ownsSession()) {
                             Log.i(TAG, "★ 等待接入期间会话已被顶替，关闭本次接入并退出")
@@ -534,6 +586,7 @@ object MicrophoneStreamManager {
                 return false
             }
             recorder.startRecording()
+            recordingStarted = true
             audioRecord = recorder
             sender = s
             running = true
@@ -582,6 +635,8 @@ object MicrophoneStreamManager {
         try { captureThread?.interrupt() } catch (_: Exception) {}
         try { serverSocket?.close() } catch (_: Exception) {}
         serverSocket = null
+        // ★ 2026-11-06：会话停止 → 撤掉尾网 :56791 监听
+        cn.ppps.forwarder.tailscale.TsnetTransport.unexposeTcpPort(RelayCommands.MIC_DATA_PORT)
         try { dataSocket?.close() } catch (_: Exception) {}
         dataSocket = null
         captureThread = null
@@ -592,6 +647,7 @@ object MicrophoneStreamManager {
             }
         } catch (_: Exception) {}
         audioRecord = null
+        recordingStarted = false
         sender = null
         releaseWakeLock()
     }
@@ -630,6 +686,27 @@ object MicrophoneStreamManager {
         }, "MicConsumerWatch").apply { isDaemon = true }.start()
     }
 
+    /** ★ 2026-11-06：通道就绪后再启动 AudioRecord（幂等）；失败返回 false 并记录原因 */
+    private fun ensureRecordingStarted(): Boolean {
+        if (recordingStarted) return true
+        val rec = audioRecord ?: return false
+        return try {
+            rec.startRecording()
+            recordingStarted = rec.recordingState == AudioRecord.RECORDSTATE_RECORDING
+            if (recordingStarted) {
+                Log.i(TAG, "AudioRecord 开始采集（通道已就绪，延迟启动）")
+            } else {
+                lastErrMsg = "AudioRecord 启动后未进入录音状态"
+                Log.w(TAG, lastErrMsg!!)
+            }
+            recordingStarted
+        } catch (t: Throwable) {
+            lastErrMsg = "AudioRecord 启动失败: ${t.message}"
+            Log.e(TAG, lastErrMsg!!)
+            false
+        }
+    }
+
     private fun cleanup() {
         // ★ 被顶替的旧采集线程不能清理公共字段：它一视会把**新**会话的
         //   AudioRecord 停掉、running 置回 false，控制端从此只听不到声音。
@@ -641,6 +718,8 @@ object MicrophoneStreamManager {
         running = false
         try { serverSocket?.close() } catch (_: Exception) {}
         serverSocket = null
+        // ★ 2026-11-06：采集会话收尾 → 撤掉尾网 :56791 监听
+        cn.ppps.forwarder.tailscale.TsnetTransport.unexposeTcpPort(RelayCommands.MIC_DATA_PORT)
         try { dataSocket?.close() } catch (_: Exception) {}
         dataSocket = null
         try {
@@ -650,6 +729,7 @@ object MicrophoneStreamManager {
             }
         } catch (_: Exception) {}
         audioRecord = null
+        recordingStarted = false
         releaseWakeLock()
     }
 
@@ -657,6 +737,7 @@ object MicrophoneStreamManager {
      * @return true=正常结束（running=false），false=写入异常（应回退命令通道）
      */
     private fun captureLoop(out: java.io.OutputStream): Boolean {
+        if (!ensureRecordingStarted()) return false
         val buffer = ShortArray(FRAME_SAMPLES)
         val byteBuffer = ByteArray(FRAME_SAMPLES * 2)
         var frameCount = 0
@@ -738,6 +819,7 @@ object MicrophoneStreamManager {
 
     /** 采集循环：命令通道模式（CMD_MIC_FRAME） */
     private fun captureLoopCommandChannel() {
+        if (!ensureRecordingStarted()) return
         val buffer = ShortArray(FRAME_SAMPLES)
         val byteBuffer = ByteArray(FRAME_SAMPLES * 2)
         var frameCount = 0
@@ -780,7 +862,9 @@ object MicrophoneStreamManager {
                         break
                     }
                 }
-                Thread.sleep(40)
+                // ★ 2026-11-06【性能修复】原实现 read(320) 已阻塞到 40ms 音频到齐，末尾再 sleep(40)
+                //   → 每 80ms 才取走 40ms 数据，命令通道实际吞吐只剩一半（听感断续、延迟累积）。
+                //   阻塞读本身就是节拍，删掉 sleep。
             }
         } catch (ie: InterruptedException) {
         } catch (e: Exception) {

@@ -173,16 +173,37 @@ class TailscaleDirectScanner(
         val own = RelayServerHandler.getOwnTsIps()
         val connected = connectedIps()
         val now = System.currentTimeMillis()
+        val owner = Thread.currentThread()
+        val pool = probePool
+        // ★★★ 2026-11-06【性能】原实现**串行**对每个成员调 probeControl（tsnet 单次最长 10s），
+        //   多成员时一轮远超 15s，扫描间隔形同虚设，控制端上线后很久才被发现。
+        //   改为并发探测（复用局域网扫描的 probePool），一轮总耗时≈单个探测耗时。
+        val futures = ArrayList<Pair<String, java.util.concurrent.Future<Boolean>>>(members.size)
         for (ip in members) {
-            if (!isCurrentScan()) break
+            if (!isCurrentScan(owner)) return
             if (ip in own) continue
             // ★ 已连接的控制端跳过（多控制端各自独立建连，避免重复探测已连接的IP）
             if (ip in connected) continue
-            // ★ 2026-08-25 修复：遍历所有成员而非命中一个即break——否则同机自连节点/冷却期会
-            //   卡住扫描，导致真实外部控制端（如对方手机56789）永不触发直连。
-            if (probeControl(ip)) {
-                tryTrigger(ip, now)
+            val fut = try {
+                pool?.submit<Boolean> { isCurrentScan(owner) && probeControl(ip) }
+            } catch (_: Exception) {
+                null
             }
+            if (fut == null) {
+                // 线程池不可用（已 stop）→ 退化串行，保持原行为
+                if (probeControl(ip)) tryTrigger(ip, now)
+            } else {
+                futures.add(ip to fut)
+            }
+        }
+        for ((ip, f) in futures) {
+            if (!isCurrentScan(owner)) return
+            val ok = try {
+                f.get(15, java.util.concurrent.TimeUnit.SECONDS)
+            } catch (_: Exception) {
+                false
+            }
+            if (ok) tryTrigger(ip, now)
         }
     }
 

@@ -118,8 +118,9 @@ func ensureEnvDir(key, dir string) {
 type Node struct {
 	srv *tsnet.Server
 
-	mu      sync.Mutex
-	closers []io.Closer
+	mu        sync.Mutex
+	closers   []io.Closer
+	listeners map[int]net.Listener
 }
 
 // ---------- ★ 2026-11-05【被控端去 VPN】Taildrop FileOps 兜底 ----------
@@ -300,7 +301,7 @@ func Start(stateDir, hostname, authKey, controlURL string, ephemeral bool) (*Nod
 			log.Printf("[tsnetpoc] "+format, args...)
 		},
 	}
-	return &Node{srv: s}, nil
+	return &Node{srv: s, listeners: make(map[int]net.Listener)}, nil
 }
 
 // Up 启动并登录，阻塞到在线或超时。
@@ -495,6 +496,14 @@ func (n *Node) StartListenProxy(tsPort int, localAddr string) (string, error) {
 		return "", fmt.Errorf("tsnetpoc: 尾网监听 %d 失败: %w", tsPort, err)
 	}
 	n.mu.Lock()
+	if n.listeners == nil {
+		n.listeners = make(map[int]net.Listener)
+	}
+	// 同端口重复 expose：先关旧 listener，避免"Leak"式端口占用（Kotlin 侧虽幂等，仍兜一层）
+	if old, ok := n.listeners[tsPort]; ok && old != nil {
+		_ = old.Close()
+	}
+	n.listeners[tsPort] = ln
 	n.closers = append(n.closers, ln)
 	n.mu.Unlock()
 
@@ -517,6 +526,28 @@ func (n *Node) StartListenProxy(tsPort int, localAddr string) (string, error) {
 	}()
 	log.Printf("[tsnetpoc] 入站代理就绪: 尾网 :%d → %s", tsPort, localAddr)
 	return fmt.Sprintf(":%d", tsPort), nil
+}
+
+// StopListenProxy 回收指定尾网端口的入站代理（幂等）。
+// ★ 2026-11-06：会话结束后必须能回收，否则端口长期监听、连接转入失败分支。
+// 注意：关闭 listener 会让该端口上已建立的连接在下次读写时报错（符合"会话结束"语义）。
+func (n *Node) StopListenProxy(tsPort int) error {
+	defer logPanic("StopListenProxy")
+	if n == nil || tsPort <= 0 {
+		return nil
+	}
+	n.mu.Lock()
+	ln := n.listeners[tsPort]
+	delete(n.listeners, tsPort)
+	n.mu.Unlock()
+	if ln == nil {
+		return nil
+	}
+	if err := ln.Close(); err != nil {
+		return fmt.Errorf("tsnetpoc: 关闭尾网监听 %d 失败: %w", tsPort, err)
+	}
+	log.Printf("[tsnetpoc] 入站代理已回收: 尾网 :%d", tsPort)
+	return nil
 }
 
 // pipe 双向复制字节流，任一端结束即关闭两端。
@@ -547,6 +578,7 @@ func (n *Node) Close() error {
 		_ = c.Close()
 	}
 	n.closers = nil
+	n.listeners = nil
 	n.mu.Unlock()
 	return n.srv.Close()
 }

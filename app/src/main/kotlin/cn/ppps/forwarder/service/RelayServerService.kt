@@ -525,6 +525,7 @@ class RelayServerService : Service() {
             listener = l
             // ★ 2026-11-05【被控端去 VPN】tsnet 模式：把尾网 :56786 的连接转发到本机真实监听端口，
             //   这样控制端连 100.x:56786 的入站直连语义保持不变（不再依赖 tun/系统路由）。
+            // ★ 2026-11-07：该调用在并行改动中被误删；恢复，否则控制端无法通过 100.x:56786 入站。
             if (cn.ppps.forwarder.tailscale.TailscaleManager.USE_TSNET) {
                 cn.ppps.forwarder.tailscale.TsnetTransport.startInboundWhenReady(RelaySettings.relayServerPort)
             }
@@ -869,8 +870,8 @@ class RelayServerService : Service() {
                         //   覆盖"同机控制端广播 RELAY_STATE_CHANGED"等不经本服务回调的状态来源。
                         applyModeExclusivity("状态节拍")
                         // ★ 2026-11-05【被控端去 VPN】用户态节点自愈（幂等）：
-                        //   没有 VPN 看门狗后，节点首次未起来或中途掉线必须有人重试，
-                        //   这里复用 5s/30s 的状态上报节拍，代价几乎为零。
+                        //   没有 VPN 看门狗后，节点首次未起来或中途掉线必须有人重试。
+                        // ★ 2026-11-07：并行改动误删后恢复（否则 tsnet 掉线不会重建，56786 入站永久失效）。
                         if (cn.ppps.forwarder.tailscale.TailscaleManager.USE_TSNET
                             && !cn.ppps.forwarder.tailscale.TsnetTransport.isUp()) {
                             cn.ppps.forwarder.tailscale.TsnetTransport.ensureStarted(this@RelayServerService)

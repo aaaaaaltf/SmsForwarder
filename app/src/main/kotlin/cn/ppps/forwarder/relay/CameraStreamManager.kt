@@ -115,6 +115,17 @@ object CameraStreamManager {
 
     @Volatile
     private var running = false
+    /**
+     * ★ 2026-11-06【发送/节流移出 ImageReader 回调线程】
+     *   原实现直接在 cameraHandler（onConfigured/onClosed/onClosed 都跑在这个 Looper）里
+     *   逐通道发送并 Thread.sleep(frameInterval)：弱网写阻塞或 10fps 节流都会把相机状态回调卡住，
+     *   真机上表现为 onConfigured 迟到/被丢弃（代码里已有"迟到丢弃"防护，说明确实发生过）。
+     *   现在回调只做 YUV→JPEG 并入单槽队列；发送与节流交给独立线程。
+     */
+    private val frameQueue = java.util.concurrent.ArrayBlockingQueue<ByteArray>(1)
+    @Volatile
+    private var senderRunning = false
+    private var frameSender: Thread? = null
     private var cameraDevice: CameraDevice? = null
     private var imageReader: ImageReader? = null
     private var cameraThread: HandlerThread? = null
@@ -426,9 +437,63 @@ object CameraStreamManager {
         running = true
         acquireWakeLock()
         startIdleWatchdog()
+        startFrameSender()
         // ★★★ 2026-08-29 启动成功 → 回传"实际打开的 facing"给控制端，让控制端 UI 显示文字与真实摄像头匹配
         reportCameraReadyToControl()
         return true
+    }
+
+    /** ★ 2026-11-06：启动独立发送线程（幂等）。帧间隔在这里 sleep，不再阻塞 cameraHandler。 */
+    private fun startFrameSender() {
+        if (senderRunning) return
+        senderRunning = true
+        frameSender = Thread({
+            while (senderRunning && running) {
+                val data = try {
+                    frameQueue.take()
+                } catch (_: InterruptedException) {
+                    break
+                }
+                if (!running) break
+                try {
+                    sendFrameToChannels(data)
+                } catch (_: Throwable) {
+                }
+                // ★ 流控：帧间隔由控制端档位的 fps 决定；只阻塞本线程
+                try {
+                    Thread.sleep(capFrameIntervalMs)
+                } catch (_: InterruptedException) {
+                    break
+                }
+            }
+        }, "CameraFrameSender").apply { isDaemon = true }.also { it.start() }
+    }
+
+    private fun stopFrameSender() {
+        senderRunning = false
+        try { frameSender?.interrupt() } catch (_: Throwable) {}
+        frameSender = null
+        frameQueue.clear()
+    }
+
+    /** 逐通道发送一帧（中继/直连监听/TS直连），并回写 QoS/消费者心跳。 */
+    private fun sendFrameToChannels(data: ByteArray) {
+        val t0 = System.currentTimeMillis()
+        var sent = false
+        // 只在锁内复制通道快照，send/isConnected 在锁外（避免多控制端时每帧持锁做网络判断）
+        val snapshot = synchronized(senders) { senders.toList() }
+        for (s in snapshot) {
+            if (s.isConnected()) {
+                try {
+                    s.send(RelayCommands.CMD_CAMERA_STREAM_FRAME, data)
+                    sent = true
+                } catch (_: Exception) {
+                }
+            }
+        }
+        if (!sent) client?.send(RelayCommands.CMD_CAMERA_STREAM_FRAME, data)
+        updateQos(System.currentTimeMillis() - t0)
+        if (sent) touchConsumer()
     }
 
     /** 把"协议朝向语义"翻译为中文名称（供日志/状态回传使用；只区分后置/前置） */
@@ -586,34 +651,11 @@ object CameraStreamManager {
                         //   已**删除**：摄像头价值在于实时（PC 侧实测降帧率后 20fps 档位只跑到 9.7fps，
                         //   观感卡顿）。静止抑制只保留在**屏幕**路（ScreenStreamManager）。
                         val data = header + jpeg
-                        try {
-                            // ★ 2026-08-05：逐通道发送——中继/直连监听/TS直连，只要有连接就推（直连模式下摄像头仍可用）
-                            // ★ 2026-10-05【自适应码率】包住计时：发送耗时是本模块唯一的拥塞信号
-                            val t0 = System.currentTimeMillis()
-                            var sent = false
-                            synchronized(senders) {
-                                for (s in senders) {
-                                    if (s.isConnected()) {
-                                        try {
-                                            s.send(RelayCommands.CMD_CAMERA_STREAM_FRAME, data)
-                                            sent = true
-                                        } catch (_: Exception) {
-                                        }
-                                    }
-                                }
-                            }
-                            if (!sent) client?.send(RelayCommands.CMD_CAMERA_STREAM_FRAME, data)
-                            updateQos(System.currentTimeMillis() - t0)
-                            // ★ 省电：本帧确实送达了至少一条已连接通道 → 记为"有人在收流"
-                            if (sent) touchConsumer()
-                        } catch (_: Exception) {
+                        // ★ 2026-11-06：只入队（深度 1，最新帧优先），发送/节流在 CameraFrameSender 线程。
+                        if (!frameQueue.offer(data)) {
+                            frameQueue.poll()
+                            frameQueue.offer(data)
                         }
-                        // ★ 流控：帧发送后sleep，防止中继服务器缓冲区溢出导致画面卡死
-                        // 与文件下载的流控逻辑一致，每帧间隔100ms（约10fps）
-                        try {
-                            // ★ 2026-10-05【摄像头画质】帧间隔由控制端档位的 fps 决定
-                        Thread.sleep(capFrameIntervalMs)
-                        } catch (_: InterruptedException) {}
                     }
                 } finally {
                     image.close()
@@ -760,6 +802,7 @@ object CameraStreamManager {
         try {
             // ★ 立即置 false：正在执行的取帧回调会因此不再发送视频流
             running = false
+            stopFrameSender()
             releaseWakeLock()
             try {
                 imageReader?.close()
@@ -845,13 +888,17 @@ object CameraStreamManager {
     private fun rotateJpegBySensorOrientation(jpeg: ByteArray): ByteArray? {
         return try {
             if (sensorOrientation == 0) return jpeg
+            // ★★★ 2026-11-06【性能】先算旋转角：后置 sensorOrientation=90 → rotateDeg=0，
+            //   原实现在这里仍然 decode + createBitmap + 再 compress 一遍（每帧多 15~40ms CPU 与一次分配），
+            //   画面完全不变。rotateDeg=0 直接返回原 JPEG。
+            val rotateDeg = (sensorOrientation - 90 + 360) % 360
+            if (rotateDeg == 0) return jpeg
             val bmp = android.graphics.BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size) ?: return jpeg
             val matrix = android.graphics.Matrix()
             // ★ 后置(sensorOrientation=90): 旋转0度（不变）；前置(sensorOrientation=270): 旋转180度
-            val rotateDeg = (sensorOrientation - 90 + 360) % 360
             matrix.postRotate(rotateDeg.toFloat())
             val rotated = android.graphics.Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
-            val out = java.io.ByteArrayOutputStream()
+            val out = java.io.ByteArrayOutputStream(jpeg.size)
             // ★ 2026-10-05【摄像头画质】二次编码的质量原来**写死 70**（自适应完全管不到它），
             //   这是"用户把画质调低但画面没变糊"的漏点之一。改用自适应的 qosQuality。
             rotated.compress(android.graphics.Bitmap.CompressFormat.JPEG, qosQuality, out)

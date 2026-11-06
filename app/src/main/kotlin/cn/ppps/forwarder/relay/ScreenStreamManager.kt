@@ -338,9 +338,34 @@ object ScreenStreamManager {
                 ss.bind(InetSocketAddress("0.0.0.0", RelayCommands.RELAY_VIDEO_PORT))
                 serverSocket = ss
                 Log.i(TAG, "直连通道已监听 ${RelayCommands.RELAY_VIDEO_PORT}，等待控制端接入...")
+                // ★★★ 2026-11-06【直连模式媒体端口】被控端已改 tsnet 用户态（无 tun），
+                //   控制端只能通过 100.x 的 TCP 到达本机；本机 0.0.0.0:56783 在 tsnet 里不可见，
+                //   必须把尾网 :56783 转发到 127.0.0.1:56783，否则控制端连 100.x:56783 直接 RST。
+                //   tsnet 未在线时 expose 内部会排队，Up 后自动补建。
+                cn.ppps.forwarder.tailscale.TsnetTransport.exposeTcpPort(
+                    RelayCommands.RELAY_VIDEO_PORT,
+                    "127.0.0.1:${RelayCommands.RELAY_VIDEO_PORT}"
+                )
                 val accepted = if (running) ss.accept() else null
                 if (accepted != null) {
                     accepted.tcpNoDelay = true
+                    // ★★★ 2026-11-06【媒体首包鉴权】直连屏幕通道不再"连上即推流"：
+                    //   控制端须先发 DAUTH|<port>|<ts>|<HMAC>，5 秒内校验不过直接断开。
+                    //   中继模式（PUSHER 分支）不经过这里，由中继的 PUSHER/LISTENER 配对保证。
+                    try {
+                        accepted.soTimeout = 5000
+                        val authLine = DirectAuth.readAuthLine(accepted.getInputStream())
+                        if (!DirectAuth.verifyMediaLine(RelayCommands.RELAY_VIDEO_PORT, authLine ?: "")) {
+                            Log.w(TAG, "屏幕媒体鉴权失败，拒绝连接: ${accepted.inetAddress.hostAddress}")
+                            accepted.close()
+                            return
+                        }
+                        accepted.soTimeout = 0
+                    } catch (e: Exception) {
+                        Log.w(TAG, "屏幕媒体鉴权异常，拒绝连接: ${e.message}")
+                        try { accepted.close() } catch (_: Exception) {}
+                        return
+                    }
                     socket = accepted
                     Log.i(TAG, "控制端已直连接入屏幕推流: ${accepted.inetAddress.hostAddress}")
                     val out = accepted.getOutputStream()
@@ -363,6 +388,8 @@ object ScreenStreamManager {
         } catch (_: Exception) {
         }
         serverSocket = null
+        // ★ 2026-11-06：推流结束 → 撤掉尾网 :56783 监听（Go StopListenProxy），避免端口长期可连
+        cn.ppps.forwarder.tailscale.TsnetTransport.unexposeTcpPort(RelayCommands.RELAY_VIDEO_PORT)
         try {
             socket?.close()
         } catch (_: Exception) {
