@@ -267,7 +267,7 @@ class XPageWebViewFragment : BaseFragment<FragmentAgentwebBinding?>(), View.OnCl
      */
     private val settings: IAgentWebSettings<*>
         get() = object : AbsAgentWebSettings() {
-            private val mAgentWeb: AgentWeb? = null
+            private var mAgentWeb: AgentWeb? = null
             override fun bindAgentWebSupport(agentWeb: AgentWeb) {
                 this.mAgentWeb = agentWeb
             }
@@ -291,7 +291,7 @@ class XPageWebViewFragment : BaseFragment<FragmentAgentwebBinding?>(), View.OnCl
                             webView,
                             mDownloadListenerAdapter,
                             mDownloadListenerAdapter,
-                            mAgentWeb.permissionInterceptor
+                            mAgentWeb!!.permissionInterceptor
                         )
                 )
             }

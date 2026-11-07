@@ -212,25 +212,35 @@ object OemGuide {
     }
 
     /**
-     * 跳转自启动/后台管理页：优先直达厂商组件；EMUI 直达被拒时退回本应用详情页；
-     * 全部失败只返回结果码，由调用方在 UI 上展示手工步骤。
+     * 跳转自启动/后台管理页。
+     * ★★★ 2026-11-07【"发现未授权也不导航"修复】：
+     *   旧实现先 `resolveActivity`，targetSdk 33 的包可见性下若 `<queries>` 未声明厂商包，
+     *   即使系统里真有"自启动管理"页也返回 null → COMPONENT_MISSING → 直接放弃跳转。
+     *   现在：① 已在 Manifest `<queries>` 声明各厂商包；② 即便 resolve 不到，也逐个
+     *   `startActivity` 尝试（显式组件，失败只捕获异常）；③ 全部失败才退回应用详情页。
      */
     fun openAutostartPage(ctx: Context): OpenResult {
-        val comp = resolveComponent(ctx)
-        if (comp == null) {
-            Log.w(TAG, "未找到 ${RomType.describe()} 的自启动管理组件")
-            return OpenResult.COMPONENT_MISSING
+        val all = candidates().map { ComponentName(it.first, it.second) }
+        val resolved = resolveComponent(ctx)
+        val order = if (resolved != null) listOf(resolved) + all.filter { it != resolved } else all
+        for (comp in order) {
+            try {
+                val intent = Intent().setComponent(comp)
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                ctx.startActivity(intent)
+                Log.i(TAG, "已打开 ${RomType.describe()} 自启动/后台管理页: ${comp.flattenToShortString()}")
+                return OpenResult.OPENED
+            } catch (t: Throwable) {
+                Log.w(TAG, "拉起 ${comp.flattenToShortString()} 失败: ${t.message}")
+            }
         }
-        return try {
-            val intent = Intent().setComponent(comp)
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            ctx.startActivity(intent)
-            OpenResult.OPENED
-        } catch (t: Throwable) {
-            Log.w(TAG, "拉起 ${comp.flattenToShortString()} 失败: ${t.message}")
-            // EMUI：启动管理页要求系统权限 → 退回本应用详情页（详情页内有启动管理入口）
-            if (RomType.isHuawei && PermissionRequests.openAppDetails(ctx) == OpenResult.OPENED) OpenResult.OPENED else OpenResult.FAILED
-        }
+        // 全部直达失败（EMUI 新版本会 SecurityException）→ 所有 ROM 统一退回应用详情页，
+        // 调用方会同时弹出该 ROM 的精确手工步骤。
+        Log.w(TAG, "未找到可直达的 ${RomType.describe()} 自启动页，退回应用详情页")
+        PermissionRequests.openAppDetails(ctx)
+        // 注意：这里返回 FAILED（不是 OPENED）——打开的只是详情页，调用方必须弹出精确步骤，
+        // 不能误报“请在打开的页面里允许自启动”。
+        return OpenResult.FAILED
     }
 }
 

@@ -33,6 +33,10 @@ class WebRtcSessionManager(
 
     companion object {
         private const val TAG = "WebRtcSessionMgr"
+        /** ★ 2026-11-07【N1】活跃 WebRTC 会话计数：只有全部会话关闭时才恢复全局音频模式，
+         *   避免屏幕+摄像头/麦克风并发时，关闭任一会话把仍在通话的会话音频重置回听筒。 */
+        private val ACTIVE_SESSIONS = java.util.concurrent.atomic.AtomicInteger(0)
+        private val AUDIO_ROUTE_LOCK = Any()
         // ★ 2026-08-11 ICE修复(2)：只保留国内稳定STUN + 腾讯云 + 阿里云 + 全球STUN兜底。
         //   之前的欧洲STUN(stun.sipnet.net / ideasip / ekiga等)在国内延迟极高或不可达，
         //   造成srflx候选收集成功但实际无法传输→ICE瞬时CONNECTED后立刻FAILED。
@@ -96,6 +100,42 @@ class WebRtcSessionManager(
             }
             return servers
         }
+
+        /** ★ 2026-11-07【接替预占】OFFER 替换旧会话时，`old.close()` 会先把 ACTIVE_SESSIONS
+         *   减到 0 → 立刻 resetAudioRoute（退出 MODE_IN_COMMUNICATION/恢复默认输出），而新会话
+         *   的 startWithOffer 是**异步线程**启动的 ⇒ 两者之间存在"路由已按无会话重置、新会话
+         *   尚未接管"的窗口（接通头几秒声音走听筒/外放异常）。
+         *   这里在关闭旧会话**之前**先预占一个名额，使旧会话关闭时计数不归零；新会话在
+         *   startWithOffer 里递增后再由 finally 释放预占。 */
+        internal fun holdAudioRouteForReplacement() {
+            synchronized(AUDIO_ROUTE_LOCK) { ACTIVE_SESSIONS.incrementAndGet() }
+        }
+
+        /** 释放 holdAudioRouteForReplacement 预占的名额；真正归零时才恢复默认音频路由。 */
+        internal fun releaseAudioRouteHold(context: Context) {
+            val shouldReset = synchronized(AUDIO_ROUTE_LOCK) {
+                ACTIVE_SESSIONS.decrementAndGet() == 0
+            }
+            if (shouldReset) resetAudioRouteToDefault(context.applicationContext)
+        }
+
+        /** ★ 2026-11-07【B3】无活跃会话时恢复音频模式/路由，避免被控端长期停留在 MODE_IN_COMMUNICATION */
+        private fun resetAudioRouteToDefault(ctx: Context) {
+            try {
+                val am = ctx.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+                if (android.os.Build.VERSION.SDK_INT >= 31) {
+                    try { am.clearCommunicationDevice() } catch (_: Throwable) {}
+                } else {
+                    try { am.stopBluetoothSco() } catch (_: Throwable) {}
+                    am.isBluetoothScoOn = false
+                    am.isSpeakerphoneOn = false
+                }
+                am.mode = android.media.AudioManager.MODE_NORMAL
+                Log.i(TAG, "★ [音频路由] 会话关闭 → 恢复 MODE_NORMAL/默认输出")
+            } catch (t: Throwable) {
+                Log.w(TAG, "★ [音频路由] 恢复失败: ${t.message}")
+            }
+        }
     }
 
     interface SignalingCallback {
@@ -109,6 +149,11 @@ class WebRtcSessionManager(
 
     @Volatile private var factory: PeerConnectionFactory? = null
     @Volatile private var peerConnection: PeerConnection? = null
+    @Volatile private var audioDeviceModule: JavaAudioDeviceModule? = null
+    @Volatile private var localAudioSource: AudioSource? = null
+    @Volatile private var localAudioTrackRef: AudioTrack? = null
+    @Volatile private var closed = false
+    private val errorReported = java.util.concurrent.atomic.AtomicBoolean(false)
     /** ★★★ 2026-10-09 修复【控制端 relay 候选早到被丢弃 → ICE 永远无候选对 → 回退 JPEG】：
      *   中继模式下控制端在 OFFER 后约 190ms 就 trickle 出它**唯一**的 relay 候选，而本端
      *   createPeerConnection（~60ms）与 setRemoteDescription(OFFER) 仍是异步进行中。
@@ -313,11 +358,28 @@ class WebRtcSessionManager(
                        camFps: Int = 0, camMaxW: Int = 0, camMaxH: Int = 0,
                        intercom: Boolean = false) {
         val stepTag = "[WebRTC-INIT]"
-        if (running) {
-            Log.w(TAG, "$stepTag 已在运行中，先关闭旧会话")
-            closeInternal(false)
+        if (closed || running) {
+            Log.w(TAG, "$stepTag 忽略已关闭或已启动实例的 OFFER")
+            return
         }
-        running = true
+        synchronized(AUDIO_ROUTE_LOCK) {
+            running = true
+            ACTIVE_SESSIONS.incrementAndGet()
+        }
+        this.signalingCallback = cb
+        try {
+            startInternal(cameraFacing, offerSdpBase64, cb, relayPreferred, screenMode, screenFps,
+                screenMaxW, screenMaxH, camFps, camMaxW, camMaxH, intercom)
+        } catch (t: Throwable) {
+            reportError("startWithOffer failed: ${t.message}")
+        }
+    }
+
+    private fun startInternal(cameraFacing: Int, offerSdpBase64: String, cb: SignalingCallback,
+                              relayPreferred: Boolean, screenMode: Boolean, screenFps: Int,
+                              screenMaxW: Int, screenMaxH: Int,
+                              camFps: Int, camMaxW: Int, camMaxH: Int, intercom: Boolean) {
+        val stepTag = "[WebRTC-INIT]"
         // ★★★ 2026-10-09 新会话重置远端描述标志（addIceCandidate 必须在其后）
         //   ★★★ 2026-10-19【删除 pendingRemoteCandidates.clear()——真机铁证】华为 23:11-23:12
         //     三次预览两败一成：失败轮中继把 200B 候选小帧插到 5380B OFFER 大帧之前送达 ⇒
@@ -384,7 +446,7 @@ class WebRtcSessionManager(
             Log.i(TAG, "$stepTag [1/8] getClassLoader() 调用成功 ✓ returned=${ret?.javaClass?.name}")
         } catch (t: Throwable) {
             Log.e(TAG, "$stepTag [1/8] WebRtcClassLoader 检测失败！type=${t.javaClass.name}, msg=${t.message}", t)
-            cb.onError("WebRtcClassLoader missing: ${t.message}")
+            reportError("WebRtcClassLoader missing: ${t.message}")
             return
         }
 
@@ -402,7 +464,7 @@ class WebRtcSessionManager(
             Log.w(TAG, "$stepTag [2/8] UnsatisfiedLinkError（可能已加载过/系统已自动加载）: ${ule.message}")
         } catch (t: Throwable) {
             Log.e(TAG, "$stepTag [2/8] loadLibrary Throwable type=${t.javaClass.name} msg=${t.message}", t)
-            cb.onError("loadLibrary failed: ${t.message}")
+            reportError("loadLibrary failed: ${t.message}")
             return
         }
 
@@ -430,8 +492,12 @@ class WebRtcSessionManager(
             if (busyPkg != null) {
                 val reason = "被控端麦克风被【$busyPkg】占用（可能正在视频通话），无法录音"
                 Log.e(TAG, "$stepTag ★ 麦克风被占用，拒绝启动纯音频会话: $reason")
-                cb.onStatus("mic_failed", reason)
-                closeInternal(false)
+                if (intercom) {
+                    reportError(reason)
+                } else {
+                    cb.onStatus("mic_failed", reason)
+                    closeInternal(false)
+                }
                 return
             }
         }
@@ -447,13 +513,33 @@ class WebRtcSessionManager(
             //   【修复】改回原始MIC源 + 关闭硬件AEC/NS（硬件处理同样会整形音色）。
             //     WebRTC软件AEC/NS/AGC保留（由MediaConstraints控制），对音色影响远小于
             //     厂商VOICE_COMMUNICATION链路。
+            // ★★★ 2026-11-07【对讲前 2-3 秒呼啸声修复】单向实测已定位：
+            //   切"单向(控制端不上行)"后开始对讲 → 红米完全无声；切回双向则前 2-3 秒必现呼啸。
+            //   ⇒ 呼啸来自**控制端上行内容**，是声学正反馈：红米外放 → 红米麦克风(无AEC)原样上行
+            //   → 控制端外放 → 控制端麦克风 → 回到红米；控制端 AEC 在会话起始 2-3 秒未收敛时
+            //   环路增益>1 才啸叫，收敛后消失。
+            //   根因：被控端为"原声修复"关闭了硬件 AEC/NS；而 `createAudioSource(MediaConstraints)`
+            //   里的 googEchoCancellation 等约束在新版 WebRTC SDK 已不生效 ⇒ 被控端实际没有任何 AEC。
+            //   对讲(intercom)必须启用硬件 AEC/NS 打断环路；其余模式(开麦克风/监听)保持原始 MIC + 关闭
+            //   硬件处理，避免"机器人声"回归。音源保持 MIC（不切 VOICE_COMMUNICATION），减小音色变化。
             val builtAdm = b
-                .setUseHardwareAcousticEchoCanceler(false)
-                .setUseHardwareNoiseSuppressor(false)
+                .setUseHardwareAcousticEchoCanceler(intercom)
+                .setUseHardwareNoiseSuppressor(intercom)
                 .setAudioSource(android.media.MediaRecorder.AudioSource.MIC)
                 .setSamplesReadyCallback(null)
-                .createAudioDeviceModule()
-            Log.i(TAG, "$stepTag [3/8] createAudioDeviceModule 成功 ✓（音频源=原始MIC，硬件AEC/NS已关闭→原声修复）")
+                .setAudioRecordErrorCallback(object : JavaAudioDeviceModule.AudioRecordErrorCallback {
+                    override fun onWebRtcAudioRecordInitError(message: String?) = reportError("AudioRecord init: $message")
+                    override fun onWebRtcAudioRecordStartError(code: JavaAudioDeviceModule.AudioRecordStartErrorCode?, message: String?) = reportError("AudioRecord start ($code): $message")
+                    override fun onWebRtcAudioRecordError(message: String?) = reportError("AudioRecord: $message")
+                })
+                .setAudioTrackErrorCallback(object : JavaAudioDeviceModule.AudioTrackErrorCallback {
+                    override fun onWebRtcAudioTrackInitError(message: String?) = reportError("AudioTrack init: $message")
+                    override fun onWebRtcAudioTrackStartError(code: JavaAudioDeviceModule.AudioTrackStartErrorCode?, message: String?) = reportError("AudioTrack start ($code): $message")
+                    override fun onWebRtcAudioTrackError(message: String?) = reportError("AudioTrack: $message")
+                })
+                .createAudioDeviceModule().also { audioDeviceModule = it }
+            Log.i(TAG, "$stepTag [3/8] createAudioDeviceModule 成功 ✓（音频源=原始MIC，硬件AEC/NS="
+                    + (if (intercom) "开启·对讲防啸叫" else "关闭·原声") + "）")
             // ★★★ 2026-08-12 啸叫(呼啸声)修复：纯音频(麦克风)会话中被控端是纯采集端，扬声器必须静音，
             //   否则扬声器→麦克风声学反馈 → 啸叫。摄像头会话(可能双向对讲)保留扬声器。
             // ★★★ 2026-10-09【独立对讲】但"对讲"是纯音频会话里的例外：控制端会上行说话，
@@ -467,7 +553,7 @@ class WebRtcSessionManager(
             builtAdm
         } catch (t: Throwable) {
             Log.e(TAG, "$stepTag [3/8] AudioDeviceModule 失败 type=${t.javaClass.name} msg=${t.message}", t)
-            cb.onError("AudioDeviceModule init failed: ${t.message}")
+            reportError("AudioDeviceModule init failed: ${t.message}")
             return
         }
 
@@ -552,7 +638,7 @@ class WebRtcSessionManager(
             Log.w(TAG, "$stepTag [4/8] 已初始化过(进程级单例)，跳过二次initialize: ${alreadyInit.message}")
         } catch (initT: Throwable) {
             Log.e(TAG, "$stepTag [4/8] initialize 失败 type=${initT.javaClass.name} msg=${initT.message}", initT)
-            cb.onError("PeerConnectionFactory.initialize 失败: ${initT.message}")
+            reportError("PeerConnectionFactory.initialize 失败: ${initT.message}")
             return
         }
         val f = try {
@@ -599,7 +685,7 @@ class WebRtcSessionManager(
             built
         } catch (t: Throwable) {
             Log.e(TAG, "$stepTag [5/8] PeerConnectionFactory 构建失败 type=${t.javaClass.name} msg=${t.message}", t)
-            cb.onError("PeerConnectionFactory create failed: ${t.message}")
+            reportError("PeerConnectionFactory create failed: ${t.message}")
             return
         }
         factory = f
@@ -610,6 +696,7 @@ class WebRtcSessionManager(
                 Log.i(TAG, "onSignalingChange: $state")
             }
             override fun onIceConnectionChange(state: PeerConnection.IceConnectionState?) {
+                if (closed || errorReported.get()) return
                 Log.i(TAG, "onIceConnectionChange: $state everConnected=$everConnected")
                 // ★ 2026-09-26：记录最新 ICE 状态，供存活看门狗兜底判据使用（见 lastIceState 说明）
                 lastIceState = state
@@ -637,7 +724,7 @@ class WebRtcSessionManager(
                             val pending = Runnable {
                                 // ★ 先再检查一下everConnected——45秒内如果有过任何CONNECTED/COMPLETED/CHECKING都说明在恢复
                                 Log.e(TAG, "★ ICE=FAILED 宽容${ICE_FAILED_TOLERANCE_MS}ms仍未稳定 → 判定真正失败，启动回退")
-                                cb.onError("ICE连接失败(45秒宽容期内未能自动恢复)")
+                                reportError("ICE连接失败(45秒宽容期内未能自动恢复)")
                             }
                             iceFailedPendingRunnable = pending
                             iceMainHandler.postDelayed(pending, ICE_FAILED_TOLERANCE_MS)
@@ -648,7 +735,7 @@ class WebRtcSessionManager(
                             val pending = Runnable {
                                 if (!everConnected) {
                                     Log.e(TAG, "★ ICE=FAILED (初始化阶段, 30秒仍未通过) → 回退")
-                                    cb.onError("ICE连接失败(对端无响应或NAT穿透受阻)")
+                                    reportError("ICE连接失败(对端无响应或NAT穿透受阻)")
                                 } else {
                                     Log.i(TAG, "★ ICE宽容期间 everConnected 变为true → 取消回退 ✓")
                                 }
@@ -813,7 +900,7 @@ class WebRtcSessionManager(
             created
         } catch (t: Throwable) {
             Log.e(TAG, "$stepTag [6/8] createPeerConnection 失败 type=${t.javaClass.name} msg=${t.message}", t)
-            cb.onError("PeerConnection create failed: ${t.message}")
+            reportError("PeerConnection create failed: ${t.message}")
             return
         }
         peerConnection = pc
@@ -884,7 +971,7 @@ class WebRtcSessionManager(
             sdp
         } catch (t: Throwable) {
             Log.e(TAG, "$stepTag [7.0/8] Base64 decode 失败 type=${t.javaClass.name} msg=${t.message}", t)
-            cb.onError("OFFER base64 decode failed: ${t.message}")
+            reportError("OFFER base64 decode failed: ${t.message}")
             return
         }
         Log.i(TAG, "$stepTag [7.0/8] ★ 纯音频模式(麦克风WebRTC)=$audioOnly (SDP含m=video=${offerSdp.contains("m=video")})")
@@ -896,7 +983,7 @@ class WebRtcSessionManager(
             Log.i(TAG, "$stepTag [7/8] addTracks 成功 ✓ 轨道已加入（audioOnly=$audioOnly）")
         } catch (t: Throwable) {
             Log.e(TAG, "$stepTag [7/8] addTracks 失败 type=${t.javaClass.name} msg=${t.message}", t)
-            cb.onError("addTracks failed: ${t.message}")
+            reportError("addTracks failed: ${t.message}")
             return
         }
 
@@ -905,6 +992,7 @@ class WebRtcSessionManager(
         Log.i(TAG, "$stepTag [8/8] setRemoteDescription(OFFER) 异步开始...")
         pc.setRemoteDescription(object : SdpObserverAdapter() {
             override fun onSetSuccess() {
+                if (closed || errorReported.get()) return
                 Log.i(TAG, "$stepTag [8/8] setRemoteDescription(OFFER) 成功 ✓，开始 createAnswer")
                 // ★★★ 2026-10-09 修复：远端描述就绪 → 补投此前缓冲的远端候选（控制端 relay 候选早到被丢弃的根因）
                 try { flushPendingRemoteCandidates() } catch (t: Throwable) {
@@ -918,9 +1006,10 @@ class WebRtcSessionManager(
                 }
                 pc.createAnswer(object : SdpObserverAdapter() {
                     override fun onCreateSuccess(sdp: SessionDescription?) {
+                        if (closed || errorReported.get()) return
                         if (sdp == null) {
                             Log.e(TAG, "$stepTag [8/8] createAnswer 返回null")
-                            cb.onError("createAnswer returned null")
+                            reportError("createAnswer returned null")
                             return
                         }
                         Log.i(TAG, "$stepTag [8/8] createAnswer 成功 ✓ sdp len=${sdp.description.length} type=${sdp.type}")
@@ -970,7 +1059,8 @@ class WebRtcSessionManager(
                             Log.w(TAG, "$stepTag [8/8] SDP修改usedtx异常(用原始): ${t.message}")
                         }
                         // 提取"answer就绪"动作（视频码率下限修复+发送ANSWER），供正常路径与回退路径复用
-                        val onAnswerReady: (SessionDescription) -> Unit = { sd ->
+                        val onAnswerReady: (SessionDescription) -> Unit = answerReady@ { sd ->
+                            if (closed || errorReported.get()) return@answerReady
                             try {
                                 val senders = pc.senders
                                 for (sender in senders) {
@@ -981,7 +1071,6 @@ class WebRtcSessionManager(
                                         //   enable(false→true)每2秒中断视频轨200ms → 控制端画面冻结闪动。
                                         //   "只传一帧"根本问题改由【时间戳矫正改用本机单调时钟】(tsFixObserver)彻底解决：
                                         //   传感器时间戳异常→RTP时间戳乱序→P帧解码失败的本质已消除，无需周期性中断画面。
-                                        videoTrackRef = track
                                         // startKeyFrameTimer()  // ← 已禁用（闪屏根源）
                                         val p = sender.parameters
                                         try {
@@ -1038,6 +1127,7 @@ class WebRtcSessionManager(
                         pc.setLocalDescription(object : SdpObserverAdapter() {
                             override fun onSetSuccess() { onAnswerReady(useSdp) }
                             override fun onSetFailure(e: String?) {
+                                if (closed || errorReported.get()) return
                                 if (dtxModified) {
                                     // ★ DTX修改后解析失败：回退原始SDP重试（历史教训：SDP修改可能触发"Invalid SDP line"）
                                     Log.w(TAG, "$stepTag [8/8] ★修改SDP setLocalDescription失败($e)，回退原始SDP重试")
@@ -1045,26 +1135,26 @@ class WebRtcSessionManager(
                                         override fun onSetSuccess() { onAnswerReady(rawSdp) }
                                         override fun onSetFailure(e2: String?) {
                                             Log.e(TAG, "$stepTag [8/8] setLocalDescription 失败(原始SDP): $e2")
-                                            cb.onError("setLocalDescription failed: $e2")
+                                            reportError("setLocalDescription failed: $e2")
                                         }
                                     }, rawSdp)
                                 } else {
                                     Log.e(TAG, "$stepTag [8/8] setLocalDescription 失败: $e")
                                     Log.e(TAG, "$stepTag [8/8] ★失败时useSdp type=${useSdp.type} len=${useSdp.description.length} 内容(前700):\n${useSdp.description.take(700)}")
-                                    cb.onError("setLocalDescription failed: $e")
+                                    reportError("setLocalDescription failed: $e")
                                 }
                             }
                         }, useSdp)
                     }
                     override fun onCreateFailure(e: String?) {
                         Log.e(TAG, "$stepTag [8/8] createAnswer 失败: $e")
-                        cb.onError("createAnswer failed: $e")
+                        reportError("createAnswer failed: $e")
                     }
                 }, mediaConstraints)
             }
             override fun onSetFailure(e: String?) {
                 Log.e(TAG, "$stepTag [8/8] setRemoteDescription(OFFER) 失败: $e")
-                cb.onError("setRemoteDescription(OFFER) failed: $e")
+                reportError("setRemoteDescription(OFFER) failed: $e")
             }
         }, SessionDescription(SessionDescription.Type.OFFER, offerSdp))
         Log.i(TAG, "$stepTag ★★ 全部 8 步异步初始化启动完成（ANSWER 发送后见回调日志） ★★")
@@ -1089,6 +1179,7 @@ class WebRtcSessionManager(
         //   返回值带出锁外，规避"可空 peerConnection 传入非空参数"的编译错误，
         //   且锁内判定/锁外注入的死锁纪律保持不变（锁内绝不调用原生方法）。
         val ready: PeerConnection? = synchronized(candidateLock) {
+            if (closed || errorReported.get()) return
             val pc = peerConnection
             if (pc == null || !remoteDescriptionSet) {
                 pendingRemoteCandidates.add(Triple(sdpMid, sdpMLineIndex, candidateSdpBase64))
@@ -1146,6 +1237,7 @@ class WebRtcSessionManager(
         //   "缓冲 or 直投"判定也在同一把锁里 ⇒ 快照之后到达的候选必然看到
         //   remoteDescriptionSet=true 走直投，不可能再滞留（配合上面的修复）。
         val list = synchronized(candidateLock) {
+            if (closed || errorReported.get()) return
             remoteDescriptionSet = true
             if (pendingRemoteCandidates.isEmpty()) emptyList()
             else pendingRemoteCandidates.toList().also { pendingRemoteCandidates.clear() }
@@ -1214,7 +1306,7 @@ class WebRtcSessionManager(
             )
         } catch (t: Throwable) {
             Log.w(TAG, "switchCamera failed: ${t.message}")
-            signalingCallback?.onError("切换摄像头失败: ${t.message}")
+            reportError("切换摄像头失败: ${t.message}")
         }
     }
 
@@ -1407,6 +1499,18 @@ class WebRtcSessionManager(
         }, "WebRtcKeyFrameTimer").apply { isDaemon = true }.also { it.start() }
     }
 
+    private fun reportError(reason: String) {
+        if (closed || !running || !errorReported.compareAndSet(false, true)) return
+        val cb = signalingCallback
+        Thread({
+            try { cb?.onError(reason) } catch (t: Throwable) {
+                Log.w(TAG, "WebRTC 错误回调失败: ${t.message}")
+            } finally {
+                closeInternal(false)
+            }
+        }, "WebRtcErrorCleanup").start()
+    }
+
     @Synchronized
     fun close() {
         closeInternal(true)
@@ -1414,47 +1518,141 @@ class WebRtcSessionManager(
 
     @Synchronized
     private fun closeInternal(notifyCb: Boolean) {
-        running = false
-        // ★★★ 2026-10-09 会话关闭：清空候选缓冲/远端描述标志（防止残留候选影响下一个会话）
-        remoteDescriptionSet = false
-        synchronized(candidateLock) { pendingRemoteCandidates.clear() }
-        // ★★★ 2026-08-14 停止周期关键帧线程
+        if (closed) return
+        val wasRunning = running
+        synchronized(AUDIO_ROUTE_LOCK) {
+            closed = true
+            running = false
+        }
+        synchronized(candidateLock) {
+            remoteDescriptionSet = false
+            pendingRemoteCandidates.clear()
+        }
+        audioThreadTunerStop?.set(true)
+        audioThreadTunerStop = null
+        iceFailedPendingRunnable?.let { iceMainHandler.removeCallbacks(it) }
+        iceFailedPendingRunnable = null
         try { keyFrameTimer?.interrupt() } catch (_: Throwable) {}
-        // ★ 2026-08-28 省电：会话结束一并收掉对端存活看门狗（防止残留线程误关下一个会话）
         stopLivenessWatchdog()
         iceReceiving = false
         lastInboundActivityTime = 0L
-        // ★ 2026-09-26：一并清掉入站指纹，防止残留值影响下一个会话的首轮判定
         inboundBytesFingerprint = -1L
         inboundReportFingerprint = 0.0
         lastIceState = null
         keyFrameTimer = null
-        videoTrackRef = null
         try { videoCapturer?.stopCapture() } catch (_: Throwable) {}
         try { videoCapturer?.dispose() } catch (_: Throwable) {}
         videoCapturer = null
+        try { peerConnection?.close() } catch (_: Throwable) {}
+        try { peerConnection?.dispose() } catch (_: Throwable) {}
+        peerConnection = null
+        try { localAudioTrackRef?.dispose() } catch (_: Throwable) {}
+        localAudioTrackRef = null
+        try { localAudioSource?.dispose() } catch (_: Throwable) {}
+        localAudioSource = null
+        try { videoTrackRef?.dispose() } catch (_: Throwable) {}
+        videoTrackRef = null
         try { videoSource?.dispose() } catch (_: Throwable) {}
         videoSource = null
         try { surfaceTextureHelper?.dispose() } catch (_: Throwable) {}
         surfaceTextureHelper = null
-        try { captureEglBase?.release() } catch (_: Throwable) {}
-        captureEglBase = null
-        try { encodeEglBase?.release() } catch (_: Throwable) {}
-        encodeEglBase = null
-        try { decodeEglBase?.release() } catch (_: Throwable) {}
-        decodeEglBase = null
-        try { peerConnection?.close() } catch (_: Throwable) {}
-        try { peerConnection?.dispose() } catch (_: Throwable) {}
-        peerConnection = null
         try { factory?.dispose() } catch (_: Throwable) {}
         factory = null
-        if (notifyCb) {
+        try { audioDeviceModule?.release() } catch (_: Throwable) {}
+        audioDeviceModule = null
+        val eglBases = java.util.Collections.newSetFromMap(java.util.IdentityHashMap<EglBase, Boolean>())
+        listOfNotNull(captureEglBase, encodeEglBase, decodeEglBase).forEach { eglBases.add(it) }
+        eglBases.forEach { try { it.release() } catch (_: Throwable) {} }
+        captureEglBase = null
+        encodeEglBase = null
+        decodeEglBase = null
+        synchronized(AUDIO_ROUTE_LOCK) {
+            if (wasRunning && ACTIVE_SESSIONS.decrementAndGet() == 0) resetAudioRoute()
+        }
+        if (notifyCb && !errorReported.get()) {
             try { signalingCallback?.onStatus("closed", "会话已关闭") } catch (_: Throwable) {}
         }
         signalingCallback = null
     }
 
+    /** ★ 2026-11-07【B3】会话结束恢复音频模式/路由，避免被控端长期停留在 MODE_IN_COMMUNICATION */
+    private fun resetAudioRoute() {
+        resetAudioRouteToDefault(appContext)
+    }
+
     // ==================== 内部工具 ====================
+
+    /** ★ 2026-11-07：被控端播放路由 —— 优先蓝牙 SCO / 有线 / USB 耳机，没有耳机才外放。 */
+    private fun applyPreferredAudioRoute() {
+        synchronized(AUDIO_ROUTE_LOCK) {
+            if (closed || !running || errorReported.get()) return
+            applyPreferredAudioRouteLocked()
+        }
+    }
+
+    private fun applyPreferredAudioRouteLocked() {
+        try {
+            val am = appContext.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+            am.mode = android.media.AudioManager.MODE_IN_COMMUNICATION
+            val headset: android.media.AudioDeviceInfo? = if (android.os.Build.VERSION.SDK_INT >= 31) {
+                am.availableCommunicationDevices.firstOrNull {
+                    it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                    it.type == android.media.AudioDeviceInfo.TYPE_BLE_HEADSET ||
+                    it.type == android.media.AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+                    it.type == android.media.AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+                    it.type == android.media.AudioDeviceInfo.TYPE_USB_HEADSET
+                }
+            } else {
+                am.getDevices(android.media.AudioManager.GET_DEVICES_OUTPUTS).firstOrNull {
+                    it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                    it.type == android.media.AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+                    it.type == android.media.AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+                    it.type == android.media.AudioDeviceInfo.TYPE_USB_HEADSET
+                }
+            }
+            if (headset != null) {
+                if (android.os.Build.VERSION.SDK_INT >= 31) {
+                    try { am.setCommunicationDevice(headset) } catch (_: Throwable) {}
+                } else {
+                    if (headset.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
+                        try { am.startBluetoothSco() } catch (_: Throwable) {}
+                        am.isBluetoothScoOn = true
+                    }
+                    am.isSpeakerphoneOn = false
+                }
+                Log.i(TAG, "★ [音频路由] 被控端播放走蓝牙/耳机 type=${headset.type}")
+                return
+            }
+            val a2dp = am.getDevices(android.media.AudioManager.GET_DEVICES_OUTPUTS)
+                .any { it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_A2DP }
+            if (a2dp) {
+                try { am.startBluetoothSco() } catch (_: Throwable) {}
+                am.isBluetoothScoOn = true
+                am.isSpeakerphoneOn = false
+                if (android.os.Build.VERSION.SDK_INT >= 31) {
+                    val sco = am.availableCommunicationDevices.firstOrNull {
+                        it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                        it.type == android.media.AudioDeviceInfo.TYPE_BLE_HEADSET
+                    }
+                    if (sco != null) {
+                        try { am.setCommunicationDevice(sco) } catch (_: Throwable) {}
+                        Log.i(TAG, "★ [音频路由] 被控端蓝牙 SCO 已就绪")
+                        return
+                    }
+                } else {
+                    Log.i(TAG, "★ [音频路由] 被控端检测到蓝牙 A2DP，已请求 SCO")
+                    return
+                }
+                // ★★★ 2026-11-07【B1 修复】A2DP 但 SCO 未就绪时不能直接 return（否则外放也不选、
+                //   音频落到听筒/无声），先回退外放。
+                Log.w(TAG, "★ [音频路由] 被控端 A2DP 但 SCO 未就绪 → 先回退外放")
+            }
+            am.isSpeakerphoneOn = true
+            Log.i(TAG, "★ [音频路由] 被控端未连接耳机 → 外放")
+        } catch (t: Throwable) {
+            Log.w(TAG, "★ [音频路由] 被控端选择失败: ${t.message}")
+        }
+    }
 
     private fun addTracks(f: PeerConnectionFactory, pc: PeerConnection, facingTarget: Int, audioOnly: Boolean) {
         val tag = "[addTracks]"
@@ -1473,23 +1671,28 @@ class WebRtcSessionManager(
             val audioConstraints = MediaConstraints()
             audioConstraints.mandatory.add(MediaConstraints.KeyValuePair("googEchoCancellation", "true"))
             audioConstraints.mandatory.add(MediaConstraints.KeyValuePair("googNoiseSuppression", "true"))
-            audioConstraints.mandatory.add(MediaConstraints.KeyValuePair("googAutoGainControl", "false"))
+            // ★★★ 2026-11-07【实时音量过低根因】原为 false（"避免 AGC 在安静时泵大底噪"），
+            //   真机实测：红米 MIC 原始电平只有约 -38dBFS（安静时仅 4 LSB），控制端听到的声音
+            //   极小、波形几乎是一条直线。WebRTC 的 AGC 是"语音自适应增益"（静音时不会无限放大），
+            //   配合已开启的 NS/高通即可做到"放大但不明显增噪"，因此恢复启用。
+            audioConstraints.mandatory.add(MediaConstraints.KeyValuePair("googAutoGainControl", "true"))
             audioConstraints.mandatory.add(MediaConstraints.KeyValuePair("googHighpassFilter", "true"))
-            f.createAudioSource(audioConstraints)
+            f.createAudioSource(audioConstraints).also { localAudioSource = it }
         } catch (t: Throwable) {
             Log.e(TAG, "$tag [a1] createAudioSource 失败 type=${t.javaClass.name} msg=${t.message}", t)
             throw t
         }
         Log.i(TAG, "$tag [a2] createAudioTrack 开始...")
         val localAudioTrack = try {
-            f.createAudioTrack("ARDAMSa0", audioSource)
+            f.createAudioTrack("ARDAMSa0", audioSource).also { localAudioTrackRef = it }
         } catch (t: Throwable) {
             Log.e(TAG, "$tag [a2] createAudioTrack 失败 type=${t.javaClass.name} msg=${t.message}", t)
             throw t
         }
         try {
-            val am = appContext.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
-            am.isSpeakerphoneOn = true
+            // ★ 2026-11-07【蓝牙/耳机路由】原来无条件 isSpeakerphoneOn=true，会覆盖蓝牙/耳机，
+            //   导致两端都只能外放。改为优先蓝牙 SCO / 有线 / USB 耳机，没有耳机才外放。
+            applyPreferredAudioRoute()
         } catch (_: Throwable) {}
         val audioRet = try {
             pc.addTrack(localAudioTrack, listOf("ARDAMS"))
@@ -1647,7 +1850,7 @@ class WebRtcSessionManager(
                 //   绝不能"静默黑屏"（JPEG 通道的黑屏史就是靠"报错+回退"治好的）。
                 val reason = "被控端屏幕捕获未授权（需先在 App 内授权屏幕预览）"
                 Log.e(TAG, "$tag [v5] $reason")
-                try { signalingCallback?.onError(reason) } catch (_: Throwable) {}
+                try { reportError(reason) } catch (_: Throwable) {}
                 throw RuntimeException(reason)
             }
             // ★ 2026-10-05【画面质量】把档位的分辨率上限交给采集器（0 已在上游被规范化，
@@ -1687,7 +1890,7 @@ class WebRtcSessionManager(
                     if (!success) {
                         val reason = "被控端摄像头无法打开（被其他应用占用如视频通话，或摄像头权限被收回）"
                         Log.e(TAG, "$tag ★★★ [v6] 摄像头打开失败(onCapturerStarted=false) → $reason")
-                        try { signalingCallback?.onError(reason) } catch (_: Throwable) {}
+                        try { reportError(reason) } catch (_: Throwable) {}
                         try { realObserver.onCapturerStarted(false) } catch (_: Throwable) {}
                         return
                     }
@@ -1739,7 +1942,7 @@ class WebRtcSessionManager(
         }
         Log.i(TAG, "$tag [v8] createVideoTrack 开始...")
         val localVideoTrack = try {
-            f.createVideoTrack("ARDAMSv0", videoSource)
+            f.createVideoTrack("ARDAMSv0", videoSource).also { videoTrackRef = it }
         } catch (t: Throwable) {
             Log.e(TAG, "$tag [v8] createVideoTrack 失败 type=${t.javaClass.name} msg=${t.message}", t)
             throw t

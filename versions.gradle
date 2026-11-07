@@ -34,7 +34,7 @@ versions.gson = "2.10.1" //https://github.com/google/gson
 versions.okhttp3 = "3.12.13" //不可升级，为了支持 API 19
 versions.leakcanary = "2.14" //https://github.com/square/leakcanary
 versions.lifecycle = "2.2.0"
-versions.kotlin = '1.9.22'
+versions.kotlin = '2.2.21'  // ★ 2026-11-07 升级：Kotlin 1.9.22 不支持 JDK 25（KSP 崩溃 IllegalArgumentException: 25.0.4.1）
 
 //========xlibrary start========//
 

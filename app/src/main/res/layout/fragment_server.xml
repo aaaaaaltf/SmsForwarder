@@ -225,7 +225,9 @@
             <LinearLayout
                 style="@style/BarStyle"
                 android:layout_width="match_parent"
-                android:layout_height="wrap_content">
+                android:layout_height="wrap_content"
+                android:id="@+id/row_api_sms"
+                android:visibility="gone">
 
                 <LinearLayout
                     android:layout_width="0dp"
@@ -259,7 +261,9 @@
             <LinearLayout
                 style="@style/BarStyle"
                 android:layout_width="match_parent"
-                android:layout_height="wrap_content">
+                android:layout_height="wrap_content"
+                android:id="@+id/row_api_call"
+                android:visibility="gone">
 
                 <LinearLayout
                     android:layout_width="0dp"
@@ -293,7 +297,9 @@
             <LinearLayout
                 style="@style/BarStyle"
                 android:layout_width="match_parent"
-                android:layout_height="wrap_content">
+                android:layout_height="wrap_content"
+                android:id="@+id/row_api_contacts"
+                android:visibility="gone">
 
                 <LinearLayout
                     android:layout_width="0dp"
@@ -327,7 +333,9 @@
             <LinearLayout
                 style="@style/BarStyle"
                 android:layout_width="match_parent"
-                android:layout_height="wrap_content">
+                android:layout_height="wrap_content"
+                android:id="@+id/row_api_add_contacts"
+                android:visibility="gone">
 
                 <LinearLayout
                     android:layout_width="0dp"
@@ -361,7 +369,9 @@
             <LinearLayout
                 style="@style/BarStyle"
                 android:layout_width="match_parent"
-                android:layout_height="wrap_content">
+                android:layout_height="wrap_content"
+                android:id="@+id/row_api_location"
+                android:visibility="gone">
 
                 <LinearLayout
                     android:layout_width="0dp"
@@ -395,7 +405,9 @@
             <LinearLayout
                 style="@style/BarStyle"
                 android:layout_width="match_parent"
-                android:layout_height="wrap_content">
+                android:layout_height="wrap_content"
+                android:id="@+id/row_api_battery"
+                android:visibility="gone">
 
                 <LinearLayout
                     android:layout_width="0dp"
@@ -429,7 +441,9 @@
             <LinearLayout
                 style="@style/BarStyle"
                 android:layout_width="match_parent"
-                android:layout_height="wrap_content">
+                android:layout_height="wrap_content"
+                android:id="@+id/row_api_screen"
+                android:visibility="gone">
 
                 <LinearLayout
                     android:layout_width="0dp"
@@ -464,7 +478,9 @@
             <LinearLayout
                 style="@style/BarStyle"
                 android:layout_width="match_parent"
-                android:layout_height="wrap_content">
+                android:layout_height="wrap_content"
+                android:id="@+id/card_perm_touch"
+                android:visibility="gone">
 
                 <LinearLayout
                     android:layout_width="0dp"
@@ -503,7 +519,9 @@
             <LinearLayout
                 style="@style/BarStyle"
                 android:layout_width="match_parent"
-                android:layout_height="wrap_content">
+                android:layout_height="wrap_content"
+                android:id="@+id/card_perm_mic"
+                android:visibility="gone">
 
                 <LinearLayout
                     android:layout_width="0dp"
@@ -542,7 +560,9 @@
             <LinearLayout
                 style="@style/BarStyle"
                 android:layout_width="match_parent"
-                android:layout_height="wrap_content">
+                android:layout_height="wrap_content"
+                android:id="@+id/card_perm_storage"
+                android:visibility="gone">
 
                 <LinearLayout
                     android:layout_width="0dp"
@@ -581,7 +601,9 @@
             <LinearLayout
                 style="@style/BarStyle"
                 android:layout_width="match_parent"
-                android:layout_height="wrap_content">
+                android:layout_height="wrap_content"
+                android:id="@+id/card_perm_notification"
+                android:visibility="gone">
 
                 <LinearLayout
                     android:layout_width="0dp"
@@ -620,7 +642,9 @@
             <LinearLayout
                 style="@style/BarStyle"
                 android:layout_width="match_parent"
-                android:layout_height="wrap_content">
+                android:layout_height="wrap_content"
+                android:id="@+id/card_perm_overlay"
+                android:visibility="gone">
 
                 <LinearLayout
                     android:layout_width="0dp"
@@ -659,7 +683,9 @@
             <LinearLayout
                 style="@style/BarStyle"
                 android:layout_width="match_parent"
-                android:layout_height="wrap_content">
+                android:layout_height="wrap_content"
+                android:id="@+id/card_perm_battery"
+                android:visibility="gone">
 
                 <LinearLayout
                     android:layout_width="0dp"
@@ -698,7 +724,9 @@
             <LinearLayout
                 style="@style/BarStyle"
                 android:layout_width="match_parent"
-                android:layout_height="wrap_content">
+                android:layout_height="wrap_content"
+                android:id="@+id/card_perm_screen"
+                android:visibility="gone">
 
                 <LinearLayout
                     android:layout_width="0dp"
@@ -737,7 +765,9 @@
             <LinearLayout
                 style="@style/BarStyle"
                 android:layout_width="match_parent"
-                android:layout_height="wrap_content">
+                android:layout_height="wrap_content"
+                android:id="@+id/card_perm_vpn"
+                android:visibility="gone">
 
                 <LinearLayout
                     android:layout_width="0dp"
@@ -772,10 +802,53 @@
 
             </LinearLayout>
 
+            <!-- 8. 自启动 / 后台活动（系统不开放读取，必须按机型跳转引导） -->
+            <LinearLayout
+                android:id="@+id/card_perm_autostart"
+                style="@style/BarStyle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:visibility="gone">
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="自启动 / 后台活动（保活）"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/tv_perm_autostart_status"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="系统不开放读取，需按机型手动开启"
+                        android:textSize="@dimen/text_size_mini"
+                        tools:ignore="SmallSp" />
+
+                </LinearLayout>
+
+                <com.xuexiang.xui.widget.button.ButtonView
+                    android:id="@+id/btn_perm_autostart"
+                    style="@style/ButtonView.Blue"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:minWidth="110dp"
+                    android:padding="5dp"
+                    android:text="去开启" />
+
+            </LinearLayout>
+
             <LinearLayout
                 style="@style/BarStyle"
                 android:layout_width="match_parent"
-                android:layout_height="wrap_content">
+                android:layout_height="wrap_content"
+                android:id="@+id/row_api_camera"
+                android:visibility="gone">
 
                 <LinearLayout
                     android:layout_width="0dp"

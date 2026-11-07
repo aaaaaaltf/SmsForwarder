@@ -35,6 +35,36 @@ class SettingUtils private constructor() {
         //★★★ 2026-10-26 首次安装启动的「权限 + 保活」总向导是否已展示过（持久化，只跑一次）
         var keepAliveOnboardDone: Boolean by SharedPreference(SP_KEEPALIVE_ONBOARD_DONE, false)
 
+        // ★★★ 2026-11-07 用户"我已按步骤设置"的确认记录。
+        //   ★ 语义修正：确认【只降低重复提示频率】，绝不代表已授权，也不参与"全部授权完成"判定。
+        //   格式 "key:expireAtMs,key2:expireAtMs"；无冒号的旧格式视为已过期（升级后自动失效）。
+        var permConfirmedKeysCsv: String by SharedPreference(SP_PERM_CONFIRMED_KEYS, "")
+
+        /** 只返回仍在有效期内的确认项（默认 24 小时）。 */
+        val permConfirmedKeys: Set<String>
+            get() {
+                val now = System.currentTimeMillis()
+                return permConfirmedKeysCsv.split(',').mapNotNull { item ->
+                    val i = item.lastIndexOf(':')
+                    if (i <= 0) return@mapNotNull null
+                    val k = item.substring(0, i).trim()
+                    val exp = item.substring(i + 1).toLongOrNull() ?: 0L
+                    if (k.isNotEmpty() && exp > now) k else null
+                }.toSet()
+            }
+
+        fun confirmPermKeys(keys: Collection<String>, ttlMs: Long = 24L * 60L * 60L * 1000L) {
+            if (keys.isEmpty()) return
+            val now = System.currentTimeMillis()
+            val merged = permConfirmedKeys.associateWith { now + ttlMs }.toMutableMap()
+            keys.forEach { merged[it] = now + ttlMs }
+            permConfirmedKeysCsv = merged.entries.joinToString(",") { "${it.key}:${it.value}" }
+        }
+
+        fun clearPermConfirmedKeys() {
+            permConfirmedKeysCsv = ""
+        }
+
         //是否转发短信
         var enableSms: Boolean by SharedPreference(SP_ENABLE_SMS, false)
 

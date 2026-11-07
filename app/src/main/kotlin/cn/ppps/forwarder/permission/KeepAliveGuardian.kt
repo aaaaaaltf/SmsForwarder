@@ -34,66 +34,118 @@ data class KeepAliveReport(
     val generatedAt: Long,
     val items: List<PermStatus>,
 ) {
-    /** ① 已自动处理 / 已授予 / 无需处理 */
-    val autoHandled: List<PermStatus>
-        get() = items.filter { it.granted }
+    companion object {
+        /**
+         * ★★★ 2026-11-07【"全部已完成授权"不真实】根因修复：
+         *   旧版 allClear 只看"可点击确认的未授予项"（needManual），把 UNKNOWN（系统不开放读取，
+         *   如 MIUI/EMUI 自启动、EMUI 休眠网络、任务锁）和通知项直接忽略 → 明明自启动没开、
+         *   无障碍没开，报告标题仍是"全部就绪"。
+         *
+         * 以下为【按需/明确不要求】的项，不参与"全部完成"判定：
+         * - notification：用户明确要求自动授权时关闭被控端通知（不影响前台服务运行）
+         * - media_projection / install_unknown_apps：屏幕预览、自升级为按需功能
+         * - write_settings：依赖库带入，项目代码未使用
+         * - vpn_consent：被控端走 tsnet 用户态通道，无需系统 VPN
+         * - recents_lock：多任务上锁为可选项
+         * - system_location_switch：仅远程定位功能需要
+         */
+        private val OPTIONAL_KEYS = setOf(
+            "notification",
+            "media_projection",
+            "install_unknown_apps",
+            "write_settings",
+            "vpn_consent",
+            "recents_lock",
+            "system_location_switch",
+        )
+    }
 
-    /** ② 需手工确认（附精确步骤）——App 能跳到对应系统页，但最终开关需用户点一下
-     *  ★ 2026-11-04【需求】通知项排除出"必须处理"清单：用户明确要求在自动授权里关闭被控端通知
-     *    （关闭通知不影响前台服务运行，只是状态不可见）。若仍算"未授权"，allClear 会永远 false，
-     *    自动授权流程会反复跳设置页、报告也一直提示"还有未授权项"。 */
-    val needManual: List<PermStatus>
-        get() = items.filter {
-            !it.granted && it.key != "notification" &&
-                (it.state == GrantState.DENIED || it.state == GrantState.DENIED_PERMANENTLY)
-        }
+    /** 必需项：影响被控端核心运行（远程命令/相机/麦克风/文件/保活）。 */
+    val required: List<PermStatus>
+        get() = items.filter { it.key !in OPTIONAL_KEYS && it.state != GrantState.NOT_APPLICABLE }
 
-    /** ③ 不支持自动 / 无法检测（附精确步骤）——系统未暴露读取或跳转入口 */
-    val unsupported: List<PermStatus>
-        get() = items.filter { !it.granted && it.state == GrantState.UNKNOWN }
+    /** 用户"我已按步骤设置"的项（24h 有效）。只用于降低重复提示频率，绝不代表已授权。 */
+    private val softConfirmedKeys: Set<String>
+        get() = cn.ppps.forwarder.utils.SettingUtils.permConfirmedKeys
 
     /**
-     * 是否"可核验项全部就绪"。
-     * 注意：③（系统不开放读取，如 MIUI 自启动开关）属于"无法自动判定"，
-     * 只作为提示项展示，不参与 allClear 判定——否则国产 ROM 上这个标志永远为 false，
-     * 界面会一直提示"还有未授权项"，反而掩盖了真正需要处理的东西。
+     * 真实未完成项：必需 + 未授予。
+     * ★★★ 2026-11-07【误报"全部完成"根因修复】UNKNOWN（系统不开放读取，如 MIUI 自启动）
+     *   一律计入，且**不受"我已按步骤设置"影响** —— 读不到 ≠ 已授权，人工确认不能替代授权。
      */
-    val allClear: Boolean
-        get() = needManual.isEmpty()
+    val pending: List<PermStatus>
+        get() = required.filter { !it.granted }
+
+    /** 仍需要提示的未完成项（24h 内点过"我已按步骤设置"的 UNKNOWN 项暂时不打扰）。 */
+    val pendingNeedsAttention: List<PermStatus>
+        get() = pending.filter { it.state != GrantState.UNKNOWN || it.key !in softConfirmedKeys }
+
+    /** pending 中"系统不开放读取、无法自动核验"的项。 */
+    val pendingUnverifiable: List<PermStatus>
+        get() = pending.filter { it.state == GrantState.UNKNOWN }
+
+    /** 所有未完成项（含按需功能），用于授权页卡片显示。通知项按用户要求不提示。 */
+    val unfinishedAll: List<PermStatus>
+        get() = items.filter { !it.granted && it.key != "notification" }
+
+    /** 未开启的按需功能（屏幕预览/安装未知应用/定位总开关等），不影响被控端核心运行。 */
+    val optionalUnfinished: List<PermStatus>
+        get() = unfinishedAll.filter { it.key in OPTIONAL_KEYS }
+
+    /** 可自动核验的必需项是否全部就绪（UNKNOWN 不计入——它们永远无法自动核验）。 */
+    val detectableClear: Boolean
+        get() = required.none { !it.granted && it.state != GrantState.UNKNOWN }
+
+    /** 只有【所有必需项真实已授予】才算全部完成；UNKNOWN 永远不满足。 */
+    val allClear: Boolean get() = pending.isEmpty()
+
+    /** 所有项（含按需）都真实已授予 —— 只有此时才允许提示"已全部授权"。 */
+    val fullyClear: Boolean get() = allClear && unfinishedAll.isEmpty()
 
     private fun stateText(state: GrantState): String = when (state) {
         GrantState.GRANTED -> "✓ 已授予"
         GrantState.DENIED -> "✗ 未授予"
         GrantState.DENIED_PERMANENTLY -> "✗ 已被永久拒绝（系统不再弹框，只能去设置里改）"
         GrantState.NOT_APPLICABLE -> "— 当前系统无需处理"
-        GrantState.UNKNOWN -> "? 系统不开放读取，无法自动判定"
+        GrantState.UNKNOWN -> "? 系统不开放读取，必须人工确认"
     }
 
+    /**
+     * ★★★ 2026-11-07 用户要求：只显示【未完成】项，已完成项一律不显示。
+     *   若全部完成，明确输出"已完成全部授权"（此时一定是真的全部完成）。
+     */
     fun toDisplayText(): String {
         val sb = StringBuilder()
         val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date(generatedAt))
         sb.append("系统：${RomType.describe()}  Android ${Build.VERSION.RELEASE}(API ${Build.VERSION.SDK_INT})  $time\n")
-        sb.append("==================== ① 已自动处理 / 已授予 ====================\n")
-        if (autoHandled.isEmpty()) sb.append("（无）\n")
-        autoHandled.forEach { sb.append("· ${it.label} → ${stateText(it.state)}\n") }
-        sb.append("==================== ② 需手工确认（按步骤点一下即可）====================\n")
-        if (needManual.isEmpty()) sb.append("（无，全部已就绪）\n")
-        needManual.forEachIndexed { i, it ->
-            sb.append("${i + 1}. ${it.label} → ${stateText(it.state)}\n")
-            sb.append("   检测方式：${it.detector}\n")
-            if (it.manualSteps.isNotEmpty()) sb.append("   步骤：${it.manualSteps}\n")
+        if (fullyClear) {
+            sb.append("\n✅ 已完成全部授权：必需项与按需项均已就绪。\n")
+            return sb.toString()
         }
-        sb.append("==================== ③ 不支持自动 / 无法检测 ====================\n")
-        if (unsupported.isEmpty()) sb.append("（无）\n")
-        unsupported.forEachIndexed { i, it ->
-            sb.append("${i + 1}. ${it.label} → ${stateText(it.state)}\n")
-            sb.append("   检测方式：${it.detector}\n")
-            if (it.manualSteps.isNotEmpty()) sb.append("   步骤：${it.manualSteps}\n")
+        // ★ 2026-11-07 只有"可自动核验"的项全部就绪时才给这句；UNKNOWN 永不算完成
+        if (detectableClear) {
+            sb.append("\n✅ 可自动检测的必需项已全部就绪（无法自动核验的项见下方）。\n")
         }
-        sb.append("\n说明：清单②③必须手工确认，App 无法替你点这些系统开关（无障碍、自启动、" +
-                "所有文件访问、悬浮窗、媒体投影均为系统级安全授权）。\n")
-        sb.append("manifest 声明但项目代码未使用、故不申请的权限：" +
-                PermissionInventory.notRequested.joinToString("、") { it.first.substringAfterLast('.') } + "\n")
+        if (pending.isNotEmpty()) {
+            sb.append("\n==================== 未完成 / 无法自动核验（${pending.size} 项）====================\n")
+            pending.forEachIndexed { i, it ->
+                sb.append("${i + 1}. ${it.label} → ${stateText(it.state)}\n")
+                if (it.manualSteps.isNotEmpty()) sb.append("   步骤：${it.manualSteps}\n")
+            }
+            if (pendingUnverifiable.isNotEmpty()) {
+                sb.append("\n其中 ${pendingUnverifiable.size} 项系统不开放读取（如 MIUI 自启动），App 无法核验。" +
+                        "请按上面步骤手动设置；点「我已按步骤设置」只会减少重复提示，" +
+                        "**不代表已授权**，也不会让本报告变成“全部完成”。\n")
+            }
+        }
+        if (optionalUnfinished.isNotEmpty()) {
+            sb.append("\n==================== 按需功能未开启（${optionalUnfinished.size} 项，不影响运行）====================\n")
+            optionalUnfinished.forEachIndexed { i, it ->
+                sb.append("${i + 1}. ${it.label} → ${stateText(it.state)}\n")
+                if (it.manualSteps.isNotEmpty()) sb.append("   步骤：${it.manualSteps}\n")
+            }
+        }
+        sb.append("\n说明：本清单只列出【未完成】项，已授予的项不显示；通知项按你的要求保持关闭，不在此提示。\n")
         return sb.toString()
     }
 }
@@ -112,49 +164,66 @@ object KeepAliveReportBuilder {
      * 在界面上列出三类清单。文案 selectable + 一键复制到剪贴板，
      * 这样 OEM 手工步骤（MIUI 自启动等无法自动的项）用户能直接粘给别人/自己照着做。
      */
-    fun show(ctx: Context, report: KeepAliveReport) {
+    /**
+     * ★★★ 2026-11-07 修正后的展示语义：
+     * - 只有【所有必需项真实 granted】才显示"授权完成：已全部授权"；
+     * - UNKNOWN（如 MIUI 自启动）永远不参与完成判定，只会显示为"无法自动核验"；
+     * - "我已按步骤设置"只写入 24h 提示冷却，**不改变完成状态**，因此不会再把报告变成"全部完成"。
+     */
+    fun show(activity: Activity, report: KeepAliveReport, onGuide: (() -> Unit)? = null) {
+        if (activity.isFinishing) return
         val text = report.toDisplayText()
-        // 非华为机型：有可直达的厂商后台管理页时，报告页也提供一键跳转（与「一键授权」同一入口）
-        val oemJumpable = !RomType.isHuawei && RomType.needsOemGuide && OemGuide.hasJumpEntry(ctx)
         try {
-            MaterialDialog.Builder(ctx)
-                .title(if (report.allClear) "授权自检：全部就绪" else "授权自检：还有 ${report.needManual.size + report.unsupported.size} 项需处理")
+            val builder = MaterialDialog.Builder(activity)
+                .title(
+                    when {
+                        report.fullyClear -> "授权完成：已全部授权"
+                        report.pending.isEmpty() -> "必需授权已完成"
+                        report.pendingNeedsAttention.isEmpty() ->
+                            "还有 ${report.pending.size} 项无法自动核验"
+                        else -> "还有 ${report.pendingNeedsAttention.size} 项需要处理"
+                    }
+                )
                 .content(text)
                 .autoDismiss(false)
                 .cancelable(true)
-                .positiveText("复制全文")
-                .onPositive { dialog, _ ->
-                    copyToClipboard(ctx, text)
-                    dialog.dismiss()
-                }
-                .neutralText(
-                    when {
-                        RomType.isHuawei -> "华为电池设置"
-                        oemJumpable -> "厂商后台设置"
-                        else -> "应用详情页"
-                    }
-                )
-                .onNeutral { dialog, _ ->
-                    when {
-                        RomType.isHuawei -> {
-                            val r = PermissionRequests.openHuaweiBatterySettings(ctx)
-                            Log.i("KeepAliveGuardian", "★ 报告页跳转华为电池设置: $r（休眠保持网络开关在该页）")
-                        }
-                        oemJumpable -> {
-                            val r = OemGuide.openAutostartPage(ctx)
-                            Log.i("KeepAliveGuardian", "★ 报告页跳转 ${RomType.describe()} 厂商后台设置: $r")
-                            if (r != OpenResult.OPENED) PermissionRequests.openAppDetails(ctx)
-                        }
-                        else -> PermissionRequests.openAppDetails(ctx)
-                    }
-                    dialog.dismiss()
-                }
                 .negativeText("关闭")
                 .onNegative { dialog, _ -> dialog.dismiss() }
-                .build()
-                .show()
+            if (report.pending.isEmpty()) {
+                builder.positiveText("好的")
+                    .onPositive { dialog, _ -> dialog.dismiss() }
+            } else {
+                if (report.pendingUnverifiable.isNotEmpty()) {
+                    builder.neutralText("我已按步骤设置（24小时不再提示）")
+                        .onNeutral { dialog, _ ->
+                            cn.ppps.forwarder.utils.SettingUtils.confirmPermKeys(
+                                report.pendingUnverifiable.map { it.key }
+                            )
+                            Log.i("KeepAliveGuardian", "★ 用户声明已按步骤设置（仅降低提示频率，不代表已授权）: "
+                                    + report.pendingUnverifiable.joinToString { it.key })
+                            dialog.dismiss()
+                            // ★ 不再重新弹同一报告（避免用户误以为"确认后就完成"）：
+                            //   状态仍是"无法自动核验"，下次一键授权会重新提示。
+                        }
+                }
+                if (report.pendingNeedsAttention.isNotEmpty()) {
+                    builder.positiveText("逐项去处理")
+                        .onPositive { dialog, _ ->
+                            dialog.dismiss()
+                            try {
+                                onGuide?.invoke()
+                            } catch (t: Throwable) {
+                                Log.w("KeepAliveGuardian", "逐项引导回调异常: ${t.message}")
+                            }
+                        }
+                } else {
+                    builder.positiveText("好的")
+                        .onPositive { dialog, _ -> dialog.dismiss() }
+                }
+            }
+            builder.build().show()
         } catch (t: Throwable) {
-            // 弹窗本身出问题时退回 toast，绝不能让自检把被控端搞崩
+            // 弹窗本身出问题时退回日志，绝不能让自检把被控端搞崩
             Log.e("KeepAliveGuardian", "展示报告失败，退回日志: ${t.message}")
             logReport(report)
         }
@@ -294,8 +363,8 @@ object KeepAliveGuardian {
             try {
                 val report = diagnoseSync(appCtx)
                 KeepAliveReportBuilder.logReport(report)
-                Log.i(TAG, "★ 服务启动自检：已授予 ${report.autoHandled.size} 项，" +
-                        "待手工 ${report.needManual.size} 项，不可自动 ${report.unsupported.size} 项（详见报告）")
+                Log.i(TAG, "★ 服务启动自检：必需项 ${report.required.size} 项，未完成 ${report.pending.size} 项" +
+                        "（其中无法检测 ${report.pendingUnverifiable.size} 项）；详见报告")
             } catch (t: Throwable) {
                 Log.w(TAG, "服务启动自检异常: ${t.message}")
             }
@@ -306,28 +375,32 @@ object KeepAliveGuardian {
      * ★ 入口二：「一键授权」收尾。检测 + 出三类清单（界面弹窗 + logcat）。
      * 用户从系统设置页返回后也可以再次调用，看到"还剩什么"。
      */
-    fun reportAndGuide(activity: Activity, alsoLog: Boolean = true) {
+    fun reportAndGuide(activity: Activity, alsoLog: Boolean = true, onGuide: (() -> Unit)? = null) {
         diagnoseAsync(activity.applicationContext, activity) { report ->
             if (alsoLog) KeepAliveReportBuilder.logReport(report)
             try {
-                if (!activity.isFinishing) KeepAliveReportBuilder.show(activity, report)
+                if (!activity.isFinishing) KeepAliveReportBuilder.show(activity, report, onGuide)
             } catch (t: Throwable) {
                 Log.w(TAG, "展示一键授权报告异常: ${t.message}")
             }
-            // 全部就绪则记入既有标记（保持与旧逻辑兼容：autoAuthorizeDone=true 后不再重复触发自检弹窗）
-            if (report.allClear) {
+            // ★ 2026-11-07 只有"可自动检测"的必需项全部就绪才停掉重复流程；
+            //   UNKNOWN（MIUI 自启动等）永远无法自动核验，不能因此让流程无限循环。
+            if (report.detectableClear) {
                 SettingUtils.autoAuthorizeDone = true
-                Log.i(TAG, "★ 一键授权：全部权限已就绪，标记 autoAuthorizeDone")
+                Log.i(TAG, "★ 一键授权：可自动检测项已全部就绪，标记 autoAuthorizeDone"
+                        + "（无法核验项 ${report.pendingUnverifiable.size} 项仍需手工确认）")
+            } else {
+                Log.i(TAG, "★ 一键授权：仍有 ${report.pending.size} 项未完成 → 不标记完成")
             }
         }
     }
 
-    /** 仅出报告不弹窗（供「授权自检报告」按钮复用，不打扰）。 */
-    fun snapshotNow(activity: Activity) {
+    /** 仅出报告（供「授权自检报告」按钮复用，不打扰）。 */
+    fun snapshotNow(activity: Activity, onGuide: (() -> Unit)? = null) {
         diagnoseAsync(activity.applicationContext, activity) { report ->
             KeepAliveReportBuilder.logReport(report)
             try {
-                if (!activity.isFinishing) KeepAliveReportBuilder.show(activity, report)
+                if (!activity.isFinishing) KeepAliveReportBuilder.show(activity, report, onGuide)
             } catch (t: Throwable) {
                 Log.w(TAG, "snapshotNow 展示异常: ${t.message}")
             }

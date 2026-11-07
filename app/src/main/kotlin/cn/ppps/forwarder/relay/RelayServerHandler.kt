@@ -77,6 +77,12 @@ object RelayServerHandler {
     // 堆积 → WeakHashMap，连接对象被 GC 时条目自动消失（connId/phoneIp 是值类型，
     // 装箱后同样随连接结束而回收）。
     private class PeerSession {
+        // 媒体命令与回退串行；native 回调只投递任务，不等待此队列。
+        val mediaExecutor = java.util.concurrent.ThreadPoolExecutor(
+            0, 1, 30L, java.util.concurrent.TimeUnit.SECONDS,
+            java.util.concurrent.LinkedBlockingQueue<Runnable>(),
+            java.util.concurrent.ThreadFactory { r -> Thread(r, "RelayPeerMedia").apply { isDaemon = true } }
+        )
         @Volatile var webrtc: WebRtcSessionManager? = null
         /** ★★★ 2026-10-09 修复：控制端候选早于本会话 webrtc 就绪到达时不再静默丢弃，先缓冲，
          *  OFFER 分支建立会话后补投（中继模式下控制端只发 1 个 relay 候选，丢了就 ICE 永远无候选对）。 */
@@ -135,26 +141,21 @@ object RelayServerHandler {
 
     /** 给 WebRtcSessionManager 发信令/状态：复用 sender(RelaySender) 的 sendText()/sendBin()，
      *  因 RelayServerHandler.handle 返回 String→String，所以直接用 sender 回发包 */
-    private fun makeWebrtcSignalingCallback(sender: RelaySender, peerKey: Any?): WebRtcSessionManager.SignalingCallback {
+    private fun makeWebrtcSignalingCallback(
+        sender: RelaySender, sess: PeerSession, owner: WebRtcSessionManager,
+        fallbackCamera: Int, audioOnly: Boolean, screenMode: Boolean, intercom: Boolean
+    ): WebRtcSessionManager.SignalingCallback {
+        val failed = java.util.concurrent.atomic.AtomicBoolean(false)
+        fun isCurrent() = sess.webrtc === owner
         return object : WebRtcSessionManager.SignalingCallback {
             override fun onSignalingMessage(cmd: String, payloadText: String) {
-                Log.i(TAG, "★ WebRTC→Ctrl 发信令 cmd=$cmd payloadLen=${payloadText.length} senderType=${sender.javaClass.simpleName} connected=${sender.isConnected()}")
+                if (!isCurrent() || failed.get()) return
                 try {
-                    // ★ 2026-08-11 关键修复：OFFER/ANSWER SDP 大帧(>4KB)必须同步发送，
-                    //   防止异步sendExecutor排队后socket异常关闭导致frame丢失
                     val payloadBytes = payloadText.toByteArray(Charsets.UTF_8)
                     if (cmd == RelayCommands.CMD_WEBRTC_ANSWER || cmd == RelayCommands.CMD_WEBRTC_OFFER) {
                         val ok = sender.sendSync(cmd, payloadBytes, 10000)
-                        Log.i(TAG, "★ WebRTC→Ctrl 同步发送 $cmd 结果=$ok frameLen=${12 + payloadBytes.size}")
-                        if (!ok) {
-                            // 失败：等待重连后重试一次
-                            Log.w(TAG, "★ WebRTC→Ctrl 同步发送 $cmd 失败，等待重连后重试...")
-                            if (waitForConnection(sender, 8000)) {
-                                val ok2 = sender.sendSync(cmd, payloadBytes, 10000)
-                                Log.i(TAG, "★ WebRTC→Ctrl 重试发送 $cmd 结果=$ok2")
-                            } else {
-                                Log.w(TAG, "★ WebRTC→Ctrl 重试超时：重连未在8秒内恢复")
-                            }
+                        if (!ok && isCurrent() && !failed.get() && waitForConnection(sender, 8000)) {
+                            if (isCurrent() && !failed.get()) sender.sendSync(cmd, payloadBytes, 10000)
                         }
                     } else {
                         sender.send(cmd, payloadText)
@@ -164,99 +165,57 @@ object RelayServerHandler {
                 }
             }
             override fun onStatus(state: String, detail: String) {
-                Log.i(TAG, "★ WebRTC state=$state detail=$detail")
-                try {
-                    sender.send(RelayCommands.CMD_WEBRTC_STATUS, "$state|$detail")
-                } catch (_: Throwable) {}
+                if (!isCurrent() || failed.get()) return
+                Log.i(TAG, "WebRTC state=$state detail=$detail")
+                try { sender.send(RelayCommands.CMD_WEBRTC_STATUS, "$state|$detail") } catch (_: Throwable) {}
             }
             override fun onError(reason: String) {
-                Log.e(TAG, "★ WebRTC 出错，尝试回退到老模式：$reason")
-                val fallbackCamera = sessionOf(peerKey).webrtcCameraIndex
-                val fallbackSender = sender
-                // ★ 2026-08-11 判断当前会话是否纯音频模式（麦克风WebRTC）：回退时只启动老麦克风，不启动摄像头
-                val webrtcIsAudioOnly = sessionOf(peerKey).webrtcAudioOnly
-                // ★★★ 2026-08-14 修复"摄像头被占用后回退失败/后续全部无图像"：
-                //   根因：onError 在 WebRTC 捕获线程被回调 → close()(@Synchronized) 内 videoCapturer.stopCapture()
-                //   会等待【捕获线程自身】退出 → 死锁 → 回退Thread永不启动 → 摄像头不推流；
-                //   且卡死的close()持有this锁 → 后续新OFFER/挂断的webrtc?.close()也等锁 → 屏幕预览/麦克风全失效。
-                //   修复：回退Thread提前启动(不依赖close完成)，close()移入回退线程异步执行(非捕获线程→不阻塞)。
-                Thread {
-                    try {
-                        try { sessionOf(peerKey).webrtc?.close() } catch (_: Throwable) {}
-                        sessionOf(peerKey).webrtc = null
-                        // ★★★ 2026-08-28 省电：控制端已经不在了，就不要"回退到老模式"。
-                        //   回退的语义是"WebRTC 通道打不开，但控制端还在看"——此时才需要改用 JPEG+PCM 继续服务。
-                        //   实际线上最常见的 onError 是【控制端进程被杀/网络掉线】：ICE 在 45 秒宽容期后判 FAILED →
-                        //   onError → 老代码无条件重启摄像头(JPEG编码)+麦克风(AudioRecord)+PARTIAL_WAKE_LOCK，
-                        //   而 send() 是异步投递到 sendExecutor（不抛异常），采集循环因此永远不会自己结束，
-                        //   表现就是"没人看的时候摄像头/麦克风/CPU 编码器还在全速跑"，是被控端最贵的空转。
-                        //   这里先给 6 秒等命令通道恢复（正常网络抖动/重连窗口内即可救回，功能不受影响），
-                        //   仍不可用则说明对端确实走了：只清理，不再重启任何采集，释放相机/麦克风/WakeLock。
-                        if (!waitForConnection(fallbackSender, 6000L)) {
-                            Log.w(TAG, "★ WebRTC 回退取消：控制端命令通道已断开($reason)，只释放采集资源，不重启老模式推流")
-                            try { CameraStreamManager.stop() } catch (_: Throwable) {}
-                            try { MicrophoneStreamManager.stop() } catch (_: Throwable) {}
-                            return@Thread
-                        }
-                        // —— 1) 老摄像头：JPEG推（纯音频模式跳过，不占用摄像头）
-                        // ★★★ 2026-10-04【屏幕预览回退修复】原实现只看"是否纯音频"，**漏了 screenMode**：
-                        //   屏幕预览(WebRTC)失败时也会去 `CameraStreamManager.start()` 开摄像头 ——
-                        //   结果是"用户点屏幕预览，被控端却打开了摄像头"，控制端拿到的是摄像头画面或全黑，
-                        //   而且摄像头一旦被占用，后续真正的屏幕预览/摄像头预览都抢不到（每 peer 仅 1 个槽）。
-                        //   现在：屏幕模式 → 只回退状态让控制端改走【屏幕 JPEG】，绝不开摄像头/麦克风。
-                        val webrtcIsScreen = try {
-                            sessionOf(peerKey).webrtcScreenMode
-                        } catch (_: Throwable) { false }
-                        if (webrtcIsScreen) {
-                            Log.w(TAG, "★ WebRTC回退：本次是【屏幕预览】会话 → 不开摄像头/麦克风，"
-                                    + "仅回退状态，由控制端改走屏幕 JPEG（rdstrt）")
-                            try {
-                                fallbackSender.send(RelayCommands.CMD_WEBRTC_STATUS,
+                if (!isCurrent() || !failed.compareAndSet(false, true)) return
+                Log.e(TAG, "WebRTC 出错 intercom=$intercom: $reason")
+                Thread({
+                    // 只能关闭捕获的 owner；等待重连期间不占用媒体命令队列。
+                    try { owner.close() } catch (_: Throwable) {}
+                    val connected = !intercom && isCurrent() && waitForConnection(sender, 6000L)
+                    sess.mediaExecutor.execute {
+                        if (!isCurrent()) return@execute
+                        try {
+                            if (intercom) {
+                                sender.send(RelayCommands.CMD_WEBRTC_STATUS, "failed|对讲失败，请显式重试: $reason")
+                                return@execute
+                            }
+                            if (!connected || !sender.isConnected()) return@execute
+                            if (screenMode) {
+                                sender.send(RelayCommands.CMD_WEBRTC_STATUS,
                                     "fallback_legacy|屏幕WebRTC失败，请改用屏幕JPEG(rdstrt): $reason")
-                            } catch (_: Throwable) {}
-                            return@Thread
-                        }
-                        if (!webrtcIsAudioOnly) {
-                            val okCam = CameraStreamManager.start(fallbackCamera)
-                            Log.i(TAG, "★ WebRTC回退：摄像头 ${if (okCam) "成功" else "失败:${CameraStreamManager.lastError()}"}")
-                            try {
-                                fallbackSender.send(
-                                    RelayCommands.CMD_CAMERA_STATUS_REPORT,
+                                return@execute
+                            }
+                            if (!audioOnly) {
+                                val okCam = CameraStreamManager.start(fallbackCamera)
+                                sender.send(RelayCommands.CMD_CAMERA_STATUS_REPORT,
                                     if (okCam) "${CameraStreamManager.currentFacingValue()}|success|摄像头流已启动(webrtc回退模式) cameraId=${CameraStreamManager.currentCameraName()}${CameraStreamManager.facingSuffix()}"
-                                else "$fallbackCamera|failed|${CameraStreamManager.lastError()}(webrtc回退失败)"
-                                )
-                            } catch (_: Throwable) {}
-                        }
-                        // —— 2) 老麦克风：PCM推（仅在权限OK时）
-                        val hasPerm = try {
-                            ContextCompat.checkSelfPermission(App.context,
+                                    else "$fallbackCamera|failed|${CameraStreamManager.lastError()}(webrtc回退失败)")
+                            }
+                            val hasPerm = ContextCompat.checkSelfPermission(App.context,
                                 android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-                        } catch (_: Throwable) { false }
-                        if (hasPerm) {
-                            val sessionId = MicrophoneStreamManager.start(fallbackSender, RelaySettings.relayHost, -1, CHANNEL_RELAY)
-                            if (sessionId != null) {
-                                Log.i(TAG, "★ WebRTC回退：麦克风 数据通道 OK")
-                            } else {
-                                val okMic = MicrophoneStreamManager.start(fallbackSender)
-                                Log.i(TAG, "★ WebRTC回退：麦克风 命令通道 ${if (okMic) "OK" else "FAIL:${MicrophoneStreamManager.lastError()}"}")
-                                // ★★★ 2026-08-13 老麦克风也启动失败（如被视频通话占用）→ 明确反馈控制端"为什么没有声音"
-                                if (!okMic) {
-                                    try {
-                                        fallbackSender.send(RelayCommands.CMD_WEBRTC_STATUS,
-                                            "mic_failed|${MicrophoneStreamManager.lastError()}")
-                                    } catch (_: Throwable) {}
+                            if (hasPerm) {
+                                val sessionId = MicrophoneStreamManager.start(sender, RelaySettings.relayHost, -1, CHANNEL_RELAY)
+                                if (sessionId == null && !MicrophoneStreamManager.start(sender)) {
+                                    sender.send(RelayCommands.CMD_WEBRTC_STATUS,
+                                        "mic_failed|${MicrophoneStreamManager.lastError()}")
                                 }
                             }
-                        }
-                        // —— 3) 通知控制端：我们回退了，控制端按老模式继续显示+播放即可
-                        try {
-                            fallbackSender.send(RelayCommands.CMD_WEBRTC_STATUS,
+                            sender.send(RelayCommands.CMD_WEBRTC_STATUS,
                                 "fallback_legacy|WebRTC失败已回退老模式: $reason")
-                        } catch (_: Throwable) {}
-                    } catch (t: Throwable) {
-                        Log.w(TAG, "WebRTC回退到老模式时再次失败: ${t.message}")
+                        } catch (t: Throwable) {
+                            Log.w(TAG, "WebRTC 清理/回退失败: ${t.message}")
+                        } finally {
+                            if (isCurrent()) {
+                                sess.webrtc = null
+                                sess.pendingIceCandidates.clear()
+                            }
+                        }
                     }
-                }.start()
+                }, "WebRtcOwnerCleanup").start()
             }
         }
     }
@@ -388,6 +347,20 @@ object RelayServerHandler {
      */
     fun handle(cmd: String, payload: ByteArray, channel: Int = CHANNEL_RELAY,
                sender: RelaySender? = null, peerKey: Any? = null): Pair<String, String>? {
+        return when (cmd) {
+            RelayCommands.CMD_WEBRTC_OFFER, RelayCommands.CMD_WEBRTC_CANDIDATE,
+            RelayCommands.CMD_WEBRTC_HANGUP, RelayCommands.CMD_RD_START, RelayCommands.CMD_RD_STOP,
+            RelayCommands.CMD_CAMERA_STREAM_START, RelayCommands.CMD_CAMERA_STREAM_STOP,
+            RelayCommands.CMD_MIC_START, RelayCommands.CMD_MIC_STOP ->
+                sessionOf(peerKey).mediaExecutor.submit<Pair<String, String>?> {
+                    handleInternal(cmd, payload, channel, sender, peerKey)
+                }.get()
+            else -> handleInternal(cmd, payload, channel, sender, peerKey)
+        }
+    }
+
+    private fun handleInternal(cmd: String, payload: ByteArray, channel: Int,
+                               sender: RelaySender?, peerKey: Any?): Pair<String, String>? {
         val payloadText = String(payload, Charsets.UTF_8)
         // ★ 2026-08-29：顺手向该对端申请凭证下发（仅在本机尚无 OAuth 凭证时真正发出）
         //   ★ 2026-08-30：节流改为"按对端连接"，键由调用方给出（connId / 对端 IP / 中继 client）
@@ -640,11 +613,13 @@ object RelayServerHandler {
                     // ★★★ 2026-10-04 互斥（另一半）：控制端从"WebRTC 高清"回退到 JPEG 之前，
                     //   先关掉正在跑的屏幕 WebRTC 高清会话——否则两个 VirtualDisplay 同时镜像整屏
                     //   （双份 GPU/内存拷贝 + 双份编码，纯浪费电）。
-                    if (sessionOf(peerKey).webrtcScreenMode) {
+                    val screenSess = sessionOf(peerKey)
+                    if (screenSess.webrtcScreenMode) {
                         Log.i(TAG, "★ 收到 JPEG 屏幕推流请求 → 关闭正在运行的屏幕 WebRTC 高清会话（互斥）")
-                        try { sessionOf(peerKey).webrtc?.close() } catch (_: Throwable) {}
-                        sessionOf(peerKey).webrtc = null
-                        sessionOf(peerKey).webrtcScreenMode = false
+                        val old = screenSess.webrtc
+                        screenSess.webrtc = null
+                        screenSess.webrtcScreenMode = false
+                        try { old?.close() } catch (_: Throwable) {}
                     }
                     // ★ 按命令来源通道决定推流模式（中继→PUSHER；直连/TS→本机监听同端口）
                     val ok = ScreenStreamManager.startStream(RelaySettings.relayHost, clientId, fps, quality, channel,
@@ -844,9 +819,10 @@ object RelayServerHandler {
                     val camSess = sessionOf(peerKey)
                     if (camSess.webrtc != null && !camSess.webrtcScreenMode && !camSess.webrtcAudioOnly) {
                         Log.i(TAG, "★ 收到 JPEG 摄像头推流请求 → 关闭摄像头 WebRTC 视频会话（摄像头设备独占）")
-                        try { camSess.webrtc?.close() } catch (_: Throwable) {}
+                        val old = camSess.webrtc
                         camSess.webrtc = null
                         camSess.webrtcCameraIndex = -1
+                        try { old?.close() } catch (_: Throwable) {}
                     }
                     val ok = CameraStreamManager.start(facingTarget, camW, camH, camFps, camQ)
                     // 回报：首字段=实际打开的朝向（与帧头一致）；成功时末尾追加契约字段 |facing=<0|1>[|fallback=1]
@@ -1014,58 +990,50 @@ object RelayServerHandler {
                     // ★ 2026-08-11 纯音频模式：只要求RECORD_AUDIO权限；摄像头权限/开关不要求
                     // ★ 2026-10-04 屏幕高清模式：同样不要求摄像头权限/开关（采集屏幕靠 MediaProjection）
                     val needCamera = !audioOnly && !screenMode
-                    if ((needCamera && !permCamera) || !permAudio) {
-                        // 无权限：直接走"优雅回退"，告知控制端 fallback
+                    val rejectionReason = if ((needCamera && !permCamera) || !permAudio) {
                         val missing = mutableListOf<String>()
                         if (needCamera && !permCamera) missing += "相机(CAMERA)"
                         if (!permAudio) missing += "麦克风(RECORD_AUDIO)"
-                        Log.w(TAG, "★ WebRTC OFFER 到达但缺权限: ${missing.joinToString()}，按回退模式启动老JPEG+PCM")
-                        // 解析 cameraIndex，直接触发 onError → 回退代码
-                        sessionOf(peerKey).webrtcCameraIndex = idx
-                        makeWebrtcSignalingCallback(s, peerKey).onError("被控端缺权限: ${missing.joinToString()}")
-                        return null
-                    }
-                    if (needCamera && !HttpServerUtils.enableApiCamera) {
-                        // 禁用摄像头也回退老模式
-                        sessionOf(peerKey).webrtcCameraIndex = idx
-                        makeWebrtcSignalingCallback(s, peerKey).onError("服务端已禁用摄像头")
-                        return null
-                    }
+                        "被控端缺权限: ${missing.joinToString()}"
+                    } else if (needCamera && !HttpServerUtils.enableApiCamera) {
+                        "服务端已禁用摄像头"
+                    } else null
                     // 解析 payload = cameraIndex|offerSdpBase64
                     if (firstPipeIdx < 0) {
                         Log.e(TAG, "★ [WebRTC OFFER IN] OFFER格式非法: 找不到'|'分隔符")
                         return RelayCommands.RSP_ERROR to error("OFFER格式非法: 应为 \"摄像头索引|SDP_BASE64\"")
                     }
                     Log.i(TAG, "★ [WebRTC OFFER IN] 解析成功: cameraIndex=$idx, offerB64Len=${offerB64.length}")
-                    sessionOf(peerKey).webrtcCameraIndex = idx
-                    sessionOf(peerKey).webrtcAudioOnly = audioOnly
-                    sessionOf(peerKey).webrtcScreenMode = screenMode
-                    // —— 先关闭旧 WebRTC / 旧 JPEG+PCM 会话（避免冲突）
-                    try { sessionOf(peerKey).webrtc?.close() } catch (_: Throwable) {}
+                    val sess = sessionOf(peerKey)
+                    val mgr = WebRtcSessionManager(App.context)
+                    val old = sess.webrtc
+                    // ★ 2026-11-07【接替预占：修复"先关闭、后异步启动"的音频路由竞态】
+                    //   old.close() 是同步的，会把 ACTIVE_SESSIONS 减到 0 → 立即 resetAudioRoute；
+                    //   而 mgr.startWithOffer 在下面的子线程里才异步启动、之后才递增计数。
+                    //   这段窗口内路由已被重置为"无会话"，新会话尚未接管（表现为接通头几秒
+                    //   声音走听筒/外放异常）。故在关闭旧会话**之前**先预占一个名额，旧会话关闭
+                    //   时计数不归零；新会话 startWithOffer 递增后由子线程 finally 释放预占。
+                    val replacing = old != null
+                    if (replacing) WebRtcSessionManager.holdAudioRouteForReplacement()
+                    sess.webrtcCameraIndex = idx
+                    sess.webrtcAudioOnly = audioOnly
+                    sess.webrtcScreenMode = screenMode
+                    sess.webrtc = mgr
+                    val cb = makeWebrtcSignalingCallback(s, sess, mgr, idx, audioOnly, screenMode, intercom)
+                    try { old?.close() } catch (_: Throwable) {}
+                    if (rejectionReason != null) {
+                        if (replacing) WebRtcSessionManager.releaseAudioRouteHold(App.context)
+                        cb.onError(rejectionReason)
+                        return null
+                    }
                     try { CameraStreamManager.stop() } catch (_: Throwable) {}
                     try { MicrophoneStreamManager.stop() } catch (_: Throwable) {}
-                    // ★★★ 2026-10-04 互斥：屏幕【JPEG】推流与屏幕【WebRTC】高清会话不能同时跑
-                    //   （两条采集链各建一个 VirtualDisplay，双份镜像 + 双份编码，纯浪费电）。
-                    //   控制端选路：先试 WebRTC 高清，失败/超时才回退 rdstrt(JPEG)，
-                    //   所以这里被控端只需保证"开 WebRTC 前先停 JPEG"这一半。
                     try { ScreenStreamManager.stop() } catch (_: Throwable) {}
-                    sessionOf(peerKey).webrtc = null
-                    // —— 初始化新 WebRTC 会话
-                    val mgr = WebRtcSessionManager(App.context)
-                    sessionOf(peerKey).webrtc = mgr
-                    // ★★★ 2026-10-09 修复：会话建立 → 补投此前缓冲的远端候选（候选早于 OFFER 到达）。
-                    //   此处 mgr 的 PeerConnection 仍为空，mgr.addRemoteIceCandidate 会自行再缓冲，
-                    //   并在 setRemoteDescription(OFFER) 成功后统一补投，故此处直接转交即可。
-                    val sess = sessionOf(peerKey)
-                    if (sess.pendingIceCandidates.isNotEmpty()) {
-                        val buffered = sess.pendingIceCandidates.toList()
-                        sess.pendingIceCandidates.clear()
-                        Log.i(TAG, "★ [WebRTC OFFER IN] 补投缓冲候选 count=${buffered.size}")
-                        for ((mid, idx, b64) in buffered) {
-                            mgr.addRemoteIceCandidate(mid, idx, b64)
-                        }
+                    val buffered = sess.pendingIceCandidates.toList()
+                    sess.pendingIceCandidates.clear()
+                    for ((mid, lineIdx, b64) in buffered) {
+                        mgr.addRemoteIceCandidate(mid, lineIdx, b64)
                     }
-                    val cb = makeWebrtcSignalingCallback(s, peerKey)
                     // ★★★ 2026-08-12 中继优先模式：OFFER经中继到达(CHANNEL_RELAY)→relayPreferred=true
                     //   （媒体走TURN中继转发）；经TS直连/直连监听到达(CHANNEL_TS/DIRECT)→relayPreferred=false
                     //   （媒体走TS/WiFi host直连兜底）。符合"中继优先，中继不可用时才TS直连"。
@@ -1082,6 +1050,10 @@ object RelayServerHandler {
                         } catch (t: Throwable) {
                             Log.e(TAG, "★ [WebRTC OFFER IN] startWithOffer 异常: type=${t.javaClass.name} msg=${t.message}", t)
                             cb.onError("startWithOffer exception: ${t.message}")
+                        } finally {
+                            // ★ 2026-11-07 新会话已在 startWithOffer 内递增计数（或已失败关闭），
+                            //   这里释放 OFFER 接替时的预占名额；真正归零时恢复默认音频路由。
+                            if (replacing) WebRtcSessionManager.releaseAudioRouteHold(App.context)
                         }
                     }.start()
                     null  // OFFER不立即响应，ANSWER/STATUS 由 signaling callback 异步通过 sender 发回
@@ -1119,10 +1091,13 @@ object RelayServerHandler {
 
                 RelayCommands.CMD_WEBRTC_HANGUP -> {
                     Log.i(TAG, "★ WebRTC 挂断")
-                    try { sessionOf(peerKey).webrtc?.close() } catch (_: Throwable) {}
-                    sessionOf(peerKey).webrtc = null
-                    sessionOf(peerKey).pendingIceCandidates.clear()   // ★ 2026-10-09 会话结束清掉缓冲候选
-                    sessionOf(peerKey).webrtcAudioOnly = false
+                    val sess = sessionOf(peerKey)
+                    val old = sess.webrtc
+                    sess.webrtc = null
+                    sess.pendingIceCandidates.clear()
+                    sess.webrtcAudioOnly = false
+                    sess.webrtcScreenMode = false
+                    try { old?.close() } catch (_: Throwable) {}
                     // 控制端挂断时，老模式也可能残留（如回退过），一并清理
                     try { CameraStreamManager.stop() } catch (_: Throwable) {}
                     try { MicrophoneStreamManager.stop() } catch (_: Throwable) {}

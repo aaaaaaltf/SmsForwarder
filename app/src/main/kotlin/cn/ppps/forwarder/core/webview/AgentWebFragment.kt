@@ -293,7 +293,7 @@ class AgentWebFragment : Fragment(), FragmentKeyDown {
      */
     val settings: IAgentWebSettings<*>
         get() = object : AbsAgentWebSettings() {
-            private val mAgentWeb: AgentWeb? = null
+            private var mAgentWeb: AgentWeb? = null
             override fun bindAgentWebSupport(agentWeb: AgentWeb) {
                 this.mAgentWeb = agentWeb
             }
@@ -317,7 +317,7 @@ class AgentWebFragment : Fragment(), FragmentKeyDown {
                             webView,
                             mDownloadListenerAdapter,
                             mDownloadListenerAdapter,
-                            this.mAgentWeb.permissionInterceptor
+                            this.mAgentWeb!!.permissionInterceptor
                         )
                 )
             }

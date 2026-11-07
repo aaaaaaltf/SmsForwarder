@@ -49,6 +49,10 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
     @Volatile
     private var firstLaunchOnboardShown = false
 
+    /** ★ 2026-11-07 "已完成全部授权"提示只弹一次（只有严格判定通过时才提示） */
+    @Volatile
+    private var allClearTipShown = false
+
     /** ★ 2026-08-28 用户是否已点击「一键授权」：只有为 true 时 onResume 才继续逐个打开系统页 */
     @Volatile
     // ★ 2026-08-29 本次一键授权是否真的发起了批量运行时权限申请（决定报告时机）
@@ -116,7 +120,7 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         // ★ 2026-08-28 「授权自检报告」：只重跑检测并展示三类清单（不弹任何授权窗，避免打扰）
         binding!!.btnPermReport.setOnClickListener {
             try {
-                activity?.let { cn.ppps.forwarder.permission.KeepAliveGuardian.snapshotNow(it) }
+                activity?.let { cn.ppps.forwarder.permission.KeepAliveGuardian.snapshotNow(it) { continueManualAuthFromReport() } }
             } catch (e: Exception) {
                 Log.e(TAG, "打开授权自检报告失败: ${e.message}")
             }
@@ -151,6 +155,16 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         binding!!.btnPermVpn.setOnClickListener {
             // 调用TailscaleManager请求VPN授权
             cn.ppps.forwarder.tailscale.TailscaleManager.requestVpnConsent(requireActivity())
+        }
+
+        // ★ 2026-11-07 自启动/后台活动（系统不开放读取，按机型跳转引导）
+        binding!!.btnPermAutostart.setOnClickListener {
+            markSystemUiHandoff()
+            // ★ 手动点击时结束本轮"自动逐项跳转"，否则 onResume 会继续跳下一个设置页，
+            //   把刚打开的自启动管理页立刻覆盖掉（真机：用户看到的是"通知设置"页）。
+            manualAuthFlowActive = false
+            autoManualPrompted.add("oem_autostart")
+            openOemAutostartSetting()
         }
 
         //中继服务器地址
@@ -361,6 +375,14 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             }
         } catch (e: Exception) {
             Log.w(TAG, "自动授权完成检测异常: ${e.message}")
+        }
+        // ★★★ 2026-11-07 用户要求：启动时不列全部授权项；诊断后只显示【未完成】项。
+        try {
+            cn.ppps.forwarder.permission.KeepAliveGuardian.diagnoseAsync(
+                requireContext(), activity
+            ) { report -> refreshPermissionCards(report) }
+        } catch (t: Throwable) {
+            Log.w(TAG, "刷新授权卡片异常: ${t.message}")
         }
         // ★ 2026-10-26 首次安装/升级后只跑一次的「权限 + 保活」总向导（自动申请 + 逐项跳转引导）
         try {
@@ -804,7 +826,7 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                     batchRuntimeIssued = false
                     handler.postDelayed({
                         try {
-                            activity?.let { cn.ppps.forwarder.permission.KeepAliveGuardian.reportAndGuide(it) }
+                            activity?.let { cn.ppps.forwarder.permission.KeepAliveGuardian.reportAndGuide(it, onGuide = { continueManualAuthFromReport() }) }
                         } catch (e: Exception) {
                             Log.e(TAG, "批量结果后生成授权报告异常: ${e.message}")
                         }
@@ -1012,17 +1034,10 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         } catch (t: Throwable) {
             ""
         }
-        val content = "接下来会按顺序自动申请以下权限（系统弹窗出现时请点「允许」）：\n" +
-                "· 短信、通话记录、电话状态/本机号码、通讯录、定位（含后台定位）\n" +
-                "· 相机、麦克风、拨打电话、通知（Android 13+）\n" +
-                "· 并逐项打开需要你点一下确认的系统页面：通知、悬浮窗、所有文件访问、安装未知应用、" +
-                "电池优化白名单、应用启动管理、无障碍、VPN、屏幕共享。\n\n" +
-                "无法自动完成的开关会给出设置路径。" +
-                if (cn.ppps.forwarder.permission.RomType.isHuawei) {
-                    "\n\n华为/荣耀需手动完成（系统未开放给第三方 App）：\n$oemSteps"
-                } else {
-                    "\n\n厂商自启动/后台限制（需手动确认）：\n$oemSteps"
-                }
+        val content = "接下来会自动申请被控端运行所需的必要权限（系统弹窗出现时请点「允许」）。\n\n" +
+                "全部流程结束后，只会显示【仍未完成】的项，并逐项给出精确设置路径；" +
+                "已完成的项不再显示。\n\n" +
+                "只有在全部必需项都真正就绪后，才会提示“已完成全部授权”。"
         try {
             com.xuexiang.xui.widget.dialog.materialdialog.MaterialDialog.Builder(ctx)
                 .title("首次启动：权限与保活设置")
@@ -1132,6 +1147,15 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
      * 2. 手动授权：自动打开需用户确认的设置页（所有文件访问、悬浮窗、无障碍、电池优化）
      */
     private fun oneClickAuthorize() {
+        // ★★★ 2026-11-07 每次一键授权都重新开始：
+        //   · 清空"24h 内不再提示"的软确认（人工确认不能跨流程累积成"已授权"）；
+        //   · 重置 OEM 引导标记，保证"发现自启动未授权 → 按机型导航"每次都生效。
+        try { SettingUtils.clearPermConfirmedKeys() } catch (ignored: Throwable) {}
+        try { SettingUtils.oemAutostartGuided = false } catch (ignored: Throwable) {}
+        // ★ 电池白名单引导标记同样是"曾经提示过"而非"已授权"，一键授权时一并重置
+        try { SettingUtils.batteryAuthGuided = false } catch (ignored: Throwable) {}
+        autoManualPrompted.clear()
+        batchReportShown = false
         XToastUtils.toast("开始一键授权，请按提示操作...")
         manualAuthFlowActive = true
         manualAuthFlowStartTime = System.currentTimeMillis()
@@ -1247,7 +1271,7 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                                 batchReportShown = true
                                 batchRuntimeIssued = false
                                 try {
-                                    activity?.let { cn.ppps.forwarder.permission.KeepAliveGuardian.reportAndGuide(it) }
+                                    activity?.let { cn.ppps.forwarder.permission.KeepAliveGuardian.reportAndGuide(it, onGuide = { continueManualAuthFromReport() }) }
                                 } catch (e: Exception) {
                                     Log.e(TAG, "兜底生成授权报告异常: ${e.message}")
                                 }
@@ -1255,7 +1279,7 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                         }, 25000)
                     } else {
                         batchReportShown = true
-                        activity?.let { cn.ppps.forwarder.permission.KeepAliveGuardian.reportAndGuide(it) }
+                        activity?.let { cn.ppps.forwarder.permission.KeepAliveGuardian.reportAndGuide(it, onGuide = { continueManualAuthFromReport() }) }
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "生成授权报告异常: ${e.message}")
@@ -1274,6 +1298,101 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
     //   启动路径现在只调用 cn.ppps.forwarder.permission.KeepAliveGuardian.onStartup()；
     //   完整授权链路保留在 oneClickAuthorize()（用户主动触发）+ autoContinueManualAuth()（返回后继续）里，
     //   两侧的"检测口径"都收敛到 PermissionProbe / PermissionRequests，避免两处判定不一致。
+
+    /**
+     * ★★★ 2026-11-07 用户要求：启动时不显示授权项；自动授权完成后**只显示未完成项**。
+     *   - 已授予 / 用户已确认的卡片一律 GONE（已完成的不显示）；
+     *   - 未完成的卡片显示，并把状态文本换成真实结论 + 简短步骤（长步骤见授权报告）；
+     *   - 只有【必需项】真正全部就绪时才提示"已完成全部授权"（严格判定，每进程一次）。
+     */
+    private fun refreshPermissionCards(report: cn.ppps.forwarder.permission.KeepAliveReport) {
+        val b = binding ?: return
+        val unfinished = report.unfinishedAll.associateBy { it.key }
+
+        fun apply(card: android.view.View?, status: android.widget.TextView?, vararg keys: String): Boolean {
+            val hit = keys.firstNotNullOfOrNull { unfinished[it] }
+            if (hit == null) {
+                card?.visibility = android.view.View.GONE
+                return false
+            }
+            card?.visibility = android.view.View.VISIBLE
+            val step = hit.manualSteps.replace("\n", " ").trim()
+            status?.text = buildString {
+                append("✗ 未完成")
+                if (hit.state == cn.ppps.forwarder.permission.GrantState.UNKNOWN) {
+                    append("（系统不开放读取，需人工确认）")
+                }
+                if (step.isNotEmpty()) {
+                    append("：").append(if (step.length > 140) step.take(140) + "…" else step)
+                }
+            }
+            return true
+        }
+
+        apply(b.cardPermTouch, b.tvTouchStatus, "accessibility")
+        apply(b.cardPermMic, b.tvPermMicStatus, "android.permission.RECORD_AUDIO")
+        apply(
+            b.cardPermStorage, b.tvPermStorageStatus,
+            "all_files_access",
+            "android.permission.READ_EXTERNAL_STORAGE",
+            "android.permission.WRITE_EXTERNAL_STORAGE"
+        )
+        apply(
+            b.cardPermNotification, b.tvPermNotificationStatus,
+            "notification", "android.permission.POST_NOTIFICATIONS"
+        )
+        apply(b.cardPermOverlay, b.tvPermOverlayStatus, "overlay")
+        apply(b.cardPermBattery, b.tvPermBatteryStatus, "battery_whitelist")
+        apply(b.cardPermScreen, b.tvPermScreenStatus, "media_projection")
+        apply(b.cardPermVpn, b.tvPermVpnStatus, "vpn_consent")
+        // ★ 2026-11-07 自启动/后台活动（MIUI/EMUI 等无读取 API）——未完成时显示并按机型跳转
+        apply(
+            b.cardPermAutostart, b.tvPermAutostartStatus,
+            "oem_autostart", "huawei_sleep_network", "recents_lock"
+        )
+
+        // ★★★ 2026-11-07 用户要求：功能开关行也只在"对应授权未完成"时显示，
+        //   授权完成后全部隐藏（已完成的项不显示；未完成的才显示并引导）。
+        apply(b.rowApiSms, null, "android.permission.READ_SMS")
+        apply(b.rowApiCall, null,
+            "android.permission.READ_PHONE_STATE", "android.permission.READ_CALL_LOG")
+        apply(b.rowApiContacts, null, "android.permission.READ_CONTACTS")
+        apply(b.rowApiAddContacts, null, "android.permission.WRITE_CONTACTS")
+        apply(b.rowApiLocation, null,
+            "android.permission.ACCESS_FINE_LOCATION",
+            "android.permission.ACCESS_BACKGROUND_LOCATION",
+            "system_location_switch")
+        apply(b.rowApiBattery, null)   // 无授权依赖 → 视为已完成，不显示
+        apply(b.rowApiScreen, null, "media_projection")
+        apply(b.rowApiCamera, null, "android.permission.CAMERA")
+
+        if (report.fullyClear && !allClearTipShown) {
+            allClearTipShown = true
+            XToastUtils.toast("✅ 已完成全部授权（所有项均已就绪）")
+        } else if (report.detectableClear && !allClearTipShown) {
+            // ★ 2026-11-07 只有可自动检测项就绪；UNKNOWN 项永不算完成，也不再谎报"全部完成"
+            allClearTipShown = true
+            if (report.pendingUnverifiable.isNotEmpty()) {
+                XToastUtils.toast("可检测项已就绪；${report.pendingUnverifiable.size} 项无法自动核验（自启动/后台活动请按卡片提示开启）")
+            } else {
+                XToastUtils.toast("✅ 必需授权已完成（按需功能未开启）")
+            }
+        }
+        Log.i(TAG, "★ 授权卡片刷新：必需 ${report.required.size} 项，未完成 ${report.pending.size} 项，" +
+                "界面显示 ${unfinished.size} 张未完成卡片")
+    }
+
+    /** ★ 2026-11-07 报告页「逐项去处理」：重置本轮跳转记录，按未完成项顺序继续引导。 */
+    private fun continueManualAuthFromReport() {
+        try {
+            autoManualPrompted.clear()
+            lastAutoManualJumpTime = 0L
+            markSystemUiHandoff()
+            autoContinueManualAuth()
+        } catch (t: Throwable) {
+            Log.w(TAG, "逐项引导异常: ${t.message}")
+        }
+    }
 
     /**
      * ★ 一键授权流程中逐个弹出"需手动授权"的特殊权限界面（每次只弹一个）：
@@ -1386,17 +1505,18 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             //    MIUI/EMUI/ColorOS/OriginOS）：仅电池优化白名单不够，国产 ROM 的后台管控会直接杀进程，
             //    中继服务/屏幕预览授权随进程死亡失效，必须用户手动允许 自启动/关联启动/后台活动。
             //    触发条件：保活未真正生效，或系统根本不开放自启动状态读取（MIUI）；只引导一次。
+            // ★★★ 2026-11-07 修复"发现未授权却不再导航"：不再用持久化的 oemAutostartGuided 永久阻断，
+            //   只在【本次授权流程】内用 autoManualPrompted 防止同一个页面反复自动弹；
+            //   用户下次点「一键授权」会重新清空并再次引导。
             if (cn.ppps.forwarder.permission.RomType.needsOemGuide &&
                 (!isBatteryOptimizationAuthorized(ctx) ||
                         cn.ppps.forwarder.permission.OemGuide.probeAutostartState(ctx) !=
-                        cn.ppps.forwarder.permission.GrantState.GRANTED) &&
-                !SettingUtils.oemAutostartGuided
+                        cn.ppps.forwarder.permission.GrantState.GRANTED)
             ) {
                 if (autoManualPrompted.add("oem_autostart")) {
                     lastAutoManualJumpTime = now
-                    SettingUtils.oemAutostartGuided = true
                     if (isHuaweiDevice()) SettingUtils.huaweiKeepaliveGuided = true
-                    Log.i(TAG, "★ 一键授权继续：跳转 ${cn.ppps.forwarder.permission.RomType.describe()} 自启动/后台管理页（只引导一次）")
+                    Log.i(TAG, "★ 一键授权继续：跳转 ${cn.ppps.forwarder.permission.RomType.describe()} 自启动/后台管理页（本次流程一次）")
                     openOemAutostartSetting()
                     return
                 }
@@ -1427,9 +1547,10 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             cn.ppps.forwarder.permission.OpenResult.OPENED ->
                 XToastUtils.toast("请在打开的页面里允许 SmsForwarder 自启动 / 后台活动（${cn.ppps.forwarder.permission.RomType.describe()}）")
             else -> {
-                Log.w(TAG, "未找到 ${cn.ppps.forwarder.permission.RomType.describe()} 自启动管理入口，退回应用详情页并展示手工步骤")
-                cn.ppps.forwarder.permission.PermissionRequests.openAppDetails(ctx)
-                XToastUtils.error("该 ROM 无直达入口，请照步骤手工设置：$steps")
+                // openAutostartPage 已兜底打开本应用详情页；这里只负责把精确步骤说清楚，
+                // 不再重复打开页面（避免"一闪而过的详情页"）。
+                Log.w(TAG, "未直达 ${cn.ppps.forwarder.permission.RomType.describe()} 自启动页，已退回应用详情页并展示手工步骤")
+                XToastUtils.error("未能直达自启动页，已打开应用详情页；请照步骤设置：$steps")
             }
         }
     }
@@ -1441,13 +1562,18 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
 
     /** ★ 检查所有关键权限是否已全部授权（★ 2026-08-28 口径统一到 PermissionProbe/KeepAliveReport，
      *  不再在本类里维护第二份权限清单。优先复用 3 秒内的最近一次报告，避免重复 binder 轮询）。*/
+    /**
+     * ★★★ 2026-11-07 自动授权流程能否结束：只看【可自动检测】的必需项。
+     *   UNKNOWN（MIUI 自启动等无读取 API）永远无法自动核验，不能因为它让流程无限跳设置页；
+     *   它们由授权页卡片 + 报告逐项引导用户手工完成（且绝不据此宣称"全部授权完成"）。
+     */
     private fun isAllPermissionsAuthorized(): Boolean {
         return try {
             val fresh = cn.ppps.forwarder.permission.KeepAliveGuardian.lastReport()
             if (fresh != null && System.currentTimeMillis() - fresh.generatedAt < 3000) {
-                fresh.allClear
+                fresh.detectableClear
             } else {
-                cn.ppps.forwarder.permission.KeepAliveGuardian.diagnoseSync(requireContext()).allClear
+                cn.ppps.forwarder.permission.KeepAliveGuardian.diagnoseSync(requireContext()).detectableClear
             }
         } catch (e: Exception) {
             Log.w(TAG, "isAllPermissionsAuthorized 异常: ${e.message}")
@@ -1539,11 +1665,10 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         // 5. OEM 自启动 / 后台活动引导（★ 2026-08-28 由"仅华为"泛化到 MIUI/EMUI/ColorOS/OriginOS）
         if (cn.ppps.forwarder.permission.RomType.needsOemGuide &&
             cn.ppps.forwarder.permission.OemGuide.probeAutostartState(ctx) !=
-            cn.ppps.forwarder.permission.GrantState.GRANTED &&
-            !SettingUtils.oemAutostartGuided
+            cn.ppps.forwarder.permission.GrantState.GRANTED
         ) {
+            // ★ 2026-11-07 同上：不再因"曾经引导过"永久跳过；每次一键授权都重新引导。
             pendingItems.add("${cn.ppps.forwarder.permission.RomType.describe()} 自启动/后台活动")
-            SettingUtils.oemAutostartGuided = true
             if (isHuaweiDevice()) SettingUtils.huaweiKeepaliveGuided = true
             openOemAutostartSetting()
             return
@@ -1559,11 +1684,13 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         }
         if (report == null) {
             XToastUtils.error("权限检查异常，请重试")
+        } else if (report.fullyClear) {
+            XToastUtils.toast("✅ 已完成全部授权")
         } else if (report.allClear) {
-            XToastUtils.toast("所有权限已授权！")
+            XToastUtils.toast("✅ 必需授权已完成（按需功能未开启）")
         } else {
-            val names = report.needManual.joinToString("、") { it.label.substringBefore('（') }
-            XToastUtils.toast("仍需手工确认: $names（详情见刚弹出的三类清单，可复制步骤）")
+            val names = report.pending.joinToString("、") { it.label.substringBefore('（') }
+            XToastUtils.toast("仍需处理 ${report.pending.size} 项: $names（详情见授权报告）")
         }
         if (pendingItems.isNotEmpty()) {
             Log.i(TAG, "★ 本轮逐一打开过的系统页: $pendingItems")

@@ -44,6 +44,9 @@ const val SP_OEM_AUTOSTART_GUIDED = "sp_oem_autostart_guided"
 // ★★★ 2026-10-26 首次安装启动的"权限 + 保活"总向导是否已展示过（新装/升级后只跑一次，
 //   之后不再自动打扰；用户可随时点界面上的「一键授权」重跑）
 const val SP_KEEPALIVE_ONBOARD_DONE = "sp_keepalive_onboard_done"
+// ★ 2026-11-07 用户手工确认"系统不开放读取"的授权项（自启动/休眠网络等）。
+//   只有用户点过"我已完成无法检测项"才写入 —— 用于让"全部完成"有真实依据，绝不自动判定为完成。
+const val SP_PERM_CONFIRMED_KEYS = "sp_perm_confirmed_keys"
 
 //数据库
 const val DATABASE_NAME = "sms_forwarder.db"

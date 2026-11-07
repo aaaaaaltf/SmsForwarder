@@ -358,12 +358,14 @@ object ScreenStreamManager {
                         if (!DirectAuth.verifyMediaLine(RelayCommands.RELAY_VIDEO_PORT, authLine ?: "")) {
                             Log.w(TAG, "屏幕媒体鉴权失败，拒绝连接: ${accepted.inetAddress.hostAddress}")
                             accepted.close()
+                            running = false   // ★ 2026-11-07：鉴权失败显式复位，线程 finally 仍会兜底
                             return
                         }
                         accepted.soTimeout = 0
                     } catch (e: Exception) {
                         Log.w(TAG, "屏幕媒体鉴权异常，拒绝连接: ${e.message}")
                         try { accepted.close() } catch (_: Exception) {}
+                        running = false   // ★ 2026-11-07：鉴权异常显式复位
                         return
                     }
                     socket = accepted
