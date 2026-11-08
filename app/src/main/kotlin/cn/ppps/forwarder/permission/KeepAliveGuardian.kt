@@ -42,15 +42,16 @@ data class KeepAliveReport(
          *   无障碍没开，报告标题仍是"全部就绪"。
          *
          * 以下为【按需/明确不要求】的项，不参与"全部完成"判定：
-         * - notification：用户明确要求自动授权时关闭被控端通知（不影响前台服务运行）
          * - media_projection / install_unknown_apps：屏幕预览、自升级为按需功能
          * - write_settings：依赖库带入，项目代码未使用
          * - vpn_consent：被控端走 tsnet 用户态通道，无需系统 VPN
          * - recents_lock：多任务上锁为可选项
          * - system_location_switch：仅远程定位功能需要
+         *
+         * ★★★ 2026-11-08 用户要求：通知属于**必需项**（要求关闭），已从 OPTIONAL_KEYS 移除；
+         *   通知仍开启时授权页显示该项并导航到系统通知页，关闭后才算完成。
          */
         private val OPTIONAL_KEYS = setOf(
-            "notification",
             "media_projection",
             "install_unknown_apps",
             "write_settings",
@@ -84,9 +85,9 @@ data class KeepAliveReport(
     val pendingUnverifiable: List<PermStatus>
         get() = pending.filter { it.state == GrantState.UNKNOWN }
 
-    /** 所有未完成项（含按需功能），用于授权页卡片显示。通知项按用户要求不提示。 */
+    /** 所有未完成项（含按需功能），用于授权页卡片显示。★ 2026-11-08 通知也显示（要求关闭）。 */
     val unfinishedAll: List<PermStatus>
-        get() = items.filter { !it.granted && it.key != "notification" }
+        get() = items.filter { !it.granted }
 
     /** 未开启的按需功能（屏幕预览/安装未知应用/定位总开关等），不影响被控端核心运行。 */
     val optionalUnfinished: List<PermStatus>
@@ -145,7 +146,7 @@ data class KeepAliveReport(
                 if (it.manualSteps.isNotEmpty()) sb.append("   步骤：${it.manualSteps}\n")
             }
         }
-        sb.append("\n说明：本清单只列出【未完成】项，已授予的项不显示；通知项按你的要求保持关闭，不在此提示。\n")
+        sb.append("\n说明：本清单只列出【未完成】项，已授予的项不显示；通知要求保持关闭，已关闭则不显示，无法检测时列出供人工确认。\n")
         return sb.toString()
     }
 }

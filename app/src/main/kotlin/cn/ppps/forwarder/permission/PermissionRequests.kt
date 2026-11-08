@@ -220,6 +220,18 @@ object OemGuide {
      *   `startActivity` 尝试（显式组件，失败只捕获异常）；③ 全部失败才退回应用详情页。
      */
     fun openAutostartPage(ctx: Context): OpenResult {
+        // ★★★ 2026-11-08 华为/荣耀（EMUI / HarmonyOS）：启动管理页受系统级权限保护
+        //   （requires com.huawei.permission.external_app_settings.USE_COMPONENT，第三方 startActivity
+        //   实测抛 SecurityException，StartupNormalAppListActivity / StartupAppControlActivity
+        //   均无法打开，ProtectActivity 在 HarmonyOS 上已不存在）。
+        //   这里直接打开【应用信息页】（内含「耗电管理 → 允许后台活动」入口），保证点击必有响应，
+        //   不再连续尝试 3 个受限组件、也不再把用户丢回原页面。
+        val mfr = (android.os.Build.MANUFACTURER ?: "").lowercase()
+        if (mfr.contains("huawei") || mfr.contains("honor")) {
+            Log.w(TAG, "华为/荣耀：启动管理页需系统权限，改为打开应用信息页（耗电管理入口）")
+            PermissionRequests.openAppDetails(ctx)
+            return OpenResult.OPENED
+        }
         val all = candidates().map { ComponentName(it.first, it.second) }
         val resolved = resolveComponent(ctx)
         val order = if (resolved != null) listOf(resolved) + all.filter { it != resolved } else all

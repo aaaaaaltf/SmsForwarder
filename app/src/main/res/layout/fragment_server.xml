@@ -16,14 +16,18 @@
             android:layout_margin="5dp"
             android:orientation="vertical">
 
+            <!--★ 2026-11-08 用户要求：授权页只保留「自检报告 / 未自动授权项 / 检查更新」，
+                 中继服务器配置与应用功能开关等一律隐藏-->
             <LinearLayout
+                android:id="@+id/block_relay_title"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginStart="5dp"
                 android:layout_marginTop="5dp"
                 android:layout_marginEnd="5dp"
                 android:gravity="center_vertical"
-                android:orientation="horizontal">
+                android:orientation="horizontal"
+                android:visibility="gone">
 
                 <TextView
                     android:layout_width="wrap_content"
@@ -189,7 +193,8 @@
                 android:layout_marginBottom="5dp"
                 android:padding="8dp"
                 android:text="一键授权所有权限"
-                android:textSize="@dimen/text_size_medium" />
+                android:textSize="@dimen/text_size_medium"
+                android:visibility="gone" />
 
             <!--★ 2026-08-28 权限与保活自检：只重跑检测并列出「已自动处理/需手工确认/不支持自动」三类清单，不弹授权窗-->
             <com.xuexiang.xui.widget.button.ButtonView
@@ -205,6 +210,7 @@
                 android:textSize="@dimen/text_size_medium" />
 
             <LinearLayout
+                android:id="@+id/block_feature_title"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginStart="5dp"
@@ -212,7 +218,8 @@
                 android:layout_marginEnd="5dp"
                 android:layout_marginBottom="5dp"
                 android:gravity="center_vertical"
-                android:orientation="horizontal">
+                android:orientation="horizontal"
+                android:visibility="gone">
 
                 <TextView
                     android:layout_width="wrap_content"

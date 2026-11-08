@@ -177,7 +177,10 @@ object PermissionInventory {
      * - RECORD_AUDIO       : relay/MicrophoneStreamManager 麦克风推流（WebRTC 免提）
      * - CALL_PHONE         : 远程主动拨号
      * - READ/WRITE_EXTERNAL_STORAGE : 仅 API<33（一键换新机备份文件读写）
-     * - POST_NOTIFICATIONS : 仅 API>=33（前台服务通知，被控端保活必需）
+     *
+     * ★ 2026-11-08 用户要求：被控端通知必须【关闭】。POST_NOTIFICATIONS 运行时权限
+     *   与"关闭通知"的目标冲突，已从运行时清单移除 —— 通知状态统一由 key="notification"
+     *   的特别项（反向判定：已关闭=已完成）管理，不再单独申请/提示开启通知。
      */
     val runtimeEntries: List<RuntimeEntry> by lazy {
         val list = mutableListOf(
@@ -197,8 +200,6 @@ object PermissionInventory {
         if (Build.VERSION.SDK_INT < 33) {
             list.add(RuntimeEntry("android.permission.READ_EXTERNAL_STORAGE", "存储（读）", "备份/文件读写"))
             list.add(RuntimeEntry("android.permission.WRITE_EXTERNAL_STORAGE", "存储（写）", "备份/文件读写"))
-        } else {
-            list.add(RuntimeEntry("android.permission.POST_NOTIFICATIONS", "通知", "前台服务保活通知（Android 13+）"))
         }
         list
     }
@@ -324,27 +325,37 @@ object PermissionProbe {
         }
     }
 
-    /** 通知是否可发（Android 13+ 受 POST_NOTIFICATIONS 约束，前台服务通知是被控端保活关键）。 */
-    fun areNotificationsEnabled(ctx: Context): Boolean = try {
+    /**
+     * 通知开关状态：true=允许通知，false=已关闭，**null=读取异常（无法检测）**。
+     * ★ 2026-11-08 用户要求：通知是要求【关闭】的 —— 能检测到已关闭就不显示该项；
+     *   不能检测时必须显示该项（所以这里不能把异常吞成 false，否则会被误判成"已关闭"而隐藏）。
+     */
+    fun areNotificationsEnabledOrNull(ctx: Context): Boolean? = try {
         NotificationManagerCompat.from(ctx).areNotificationsEnabled()
     } catch (t: Throwable) {
-        Log.w(TAG, "areNotificationsEnabled 异常: ${t.message}")
-        false
+        Log.w(TAG, "areNotificationsEnabled 异常（按无法检测处理）: ${t.message}")
+        null
     }
 
+    /** 兼容旧调用：只有明确读到"已开启"才返回 true；读不到按 false（调用方需自行区分时用 [areNotificationsEnabledOrNull]）。 */
+    fun areNotificationsEnabled(ctx: Context): Boolean = areNotificationsEnabledOrNull(ctx) == true
+
     /**
-     * 无障碍服务（远程触摸 TouchControlService）是否真正启用：
+     * 无障碍服务（远程触摸 TouchControlService）状态：true=已启用，false=确认未启用，**null=无法检测**。
      * ① Settings.Secure.enabled_accessibility_services 含本组件（系统持久化事实，进程未起也能判）；
      * ② AccessibilityManager 已启用服务列表（运行时事实）；
      * ③ 本进程已有服务实例（最强证据）。
-     * 只看 ③ 会在"服务已启用但进程刚重启、尚未回调 onServiceConnected"时误判未授权。
+     * ★ 2026-11-08 用户要求：无法识别时也必须把无障碍加入自动检测授权（显示并人工确认），
+     *   所以两路系统读取都抛异常且无服务实例时返回 null（UNKNOWN），不能吞成 false。
      */
-    fun isAccessibilityEnabled(ctx: Context): Boolean {
+    fun isAccessibilityEnabledOrNull(ctx: Context): Boolean? {
         val want = ComponentName(ctx, TouchControlService::class.java).flattenToString()
+        var readable = false
         try {
             val enabled = Settings.Secure.getString(
                 ctx.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
             )
+            readable = true
             if (!enabled.isNullOrEmpty() && enabled.split(':').any { it.equals(want, true) }) return true
         } catch (t: Throwable) {
             Log.w(TAG, "读 enabled_accessibility_services 异常: ${t.message}")
@@ -353,14 +364,20 @@ object PermissionProbe {
             val ams = ctx.getSystemService(Context.ACCESSIBILITY_SERVICE) as AccessibilityManager
             val infos: List<AccessibilityServiceInfo> =
                 ams.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
+            readable = true
             if (infos.any { it.resolveInfo?.serviceInfo?.let { si -> si.packageName == ctx.packageName && ctx.packageName + "/" + si.name == want } == true }) {
                 return true
             }
         } catch (t: Throwable) {
             Log.w(TAG, "读 AccessibilityManager 已启用服务异常: ${t.message}")
         }
-        return TouchControlService.instance != null
+        if (TouchControlService.instance != null) return true
+        // 有一路系统读取成功且都不含本组件 → 可确认未启用；两路都读不到 → 无法检测
+        return if (readable) false else null
     }
+
+    /** 兼容旧调用：只有明确读到"已启用"才返回 true（无法检测按未启用处理）。 */
+    fun isAccessibilityEnabled(ctx: Context): Boolean = isAccessibilityEnabledOrNull(ctx) == true
 
     /**
      * 无障碍服务是否在 manifest 里声明过（决定"未启用"是"从没开过"还是"被清掉"）。
@@ -588,27 +605,32 @@ object PermissionProbe {
             )
         )
         run {
-            val notifyOn = areNotificationsEnabled(ctx)
-            val notifyState = if (notifyOn) {
-                GrantState.GRANTED
-            } else if (Build.VERSION.SDK_INT >= 33 && activity != null &&
-                isRuntimePermanentlyDenied(activity, "android.permission.POST_NOTIFICATIONS")
-            ) {
-                GrantState.DENIED_PERMANENTLY
-            } else {
-                GrantState.DENIED
+            // ★★★ 2026-11-08 用户明确要求：被控端通知应当**关闭**（避免常驻通知）。
+            //   判定反转：能检测到通知已关闭 = GRANTED（授权页不显示）；
+            //   通知仍开启 = DENIED（显示并导航去关闭）；
+            //   系统 API 读取异常（无法检测）= UNKNOWN（也必须显示该项，由用户人工确认）。
+            val enabled = areNotificationsEnabledOrNull(ctx)
+            val notifyState = when (enabled) {
+                false -> GrantState.GRANTED
+                true -> GrantState.DENIED
+                null -> GrantState.UNKNOWN
             }
+            val needClose = notifyState != GrantState.GRANTED
             out.add(
                 PermStatus(
                     key = "notification",
-                    label = "通知（前台服务保活通知）",
+                    label = if (notifyState == GrantState.UNKNOWN)
+                        "通知（要求关闭）【无法检测，需人工确认已关闭】"
+                    else "通知（要求关闭，避免常驻通知）",
                     kind = PermissionKind.SPECIAL,
                     state = notifyState,
-                    autoFixable = notifyState != GrantState.DENIED_PERMANENTLY,
-                    manualSteps = if (!notifyOn)
-                        "系统设置 → 通知管理 → 找到 SmsForwarder → 打开「允许通知」（前台服务通知被关闭时，被控端极易被系统回收）"
+                    autoFixable = true,
+                    manualSteps = if (needClose)
+                        (if (notifyState == GrantState.UNKNOWN)
+                            "系统未开放通知状态读取，请人工确认已关闭："
+                         else "") + "系统设置 → 应用 → SmsForwarder → 通知 → 关闭「允许通知」（前台服务不受影响）"
                     else "",
-                    detector = "NotificationManagerCompat.areNotificationsEnabled" + if (Build.VERSION.SDK_INT >= 33) " + POST_NOTIFICATIONS" else "",
+                    detector = "NotificationManagerCompat.areNotificationsEnabled（反向判定：关闭=已完成；读取异常=无法检测）",
                 )
             )
         }
@@ -624,32 +646,49 @@ object PermissionProbe {
             )
         )
         run {
-            val accEnabled = isAccessibilityEnabled(ctx)
+            // ★ 2026-11-08 用户要求：无障碍能否识别？三路系统信号可判 true/false；
+            //   两路系统读取都异常且无服务实例时返回 null → UNKNOWN，必须显示该项并人工确认，
+            //   不允许把"无法检测"当成"已完成"。
+            val acc = isAccessibilityEnabledOrNull(ctx)
+            val accEnabled = acc == true
             // ★★ 2026-08-29 遗留项落实：MIUI 上 `am force-stop` / 一键清理会清空
             // Settings.Secure.enabled_accessibility_services（实测复现 2 次，App 无法自愈），
             // 旧清单只会笼统说"未授予"，看不出是"从没开过"还是"被系统偷偷清掉"。
             // 这里把"曾经启用过"持久化，下次声明了却未启用 → 显式提示"曾被系统清除，需重新勾选"。
             // 不做自动回写 Settings.Secure：那需要 WRITE_SECURE_SETTINGS，普通应用无权也不该绕过。
             if (accEnabled) markAccessibilityEverEnabled(ctx)
-            val cleared = !accEnabled && isAccessibilityDeclared(ctx) && hasAccessibilityEverEnabled(ctx)
+            val cleared = acc == false && isAccessibilityDeclared(ctx) && hasAccessibilityEverEnabled(ctx)
+            val undetectable = acc == null
             out.add(
                 PermStatus(
                     key = "accessibility",
-                    label = if (cleared) "无障碍服务（远程触摸/远程桌面点击）【曾被系统清除】"
-                            else "无障碍服务（远程触摸/远程桌面点击）",
+                    label = when {
+                        undetectable -> "无障碍服务（远程触摸/远程桌面点击）【无法自动检测，需人工确认】"
+                        cleared -> "无障碍服务（远程触摸/远程桌面点击）【曾被系统清除】"
+                        else -> "无障碍服务（远程触摸/远程桌面点击）"
+                    },
                     kind = PermissionKind.SPECIAL,
-                    state = if (accEnabled) GrantState.GRANTED else GrantState.DENIED,
+                    state = when (acc) {
+                        true -> GrantState.GRANTED
+                        false -> GrantState.DENIED
+                        null -> GrantState.UNKNOWN
+                    },
                     autoFixable = false,
                     manualSteps = when {
                         accEnabled -> ""
+                        undetectable -> "系统未开放无障碍状态读取，请人工确认以下开关已开启：" + accessibilityManualSteps()
                         cleared -> "⚠ 该服务此前开启过，现已被系统清除（MIUI 强制停止/一键清理会清空无障碍" +
                                 "开关，App 无权自行恢复），必须重新手工勾选一次：\\n" + accessibilityManualSteps()
                         else -> accessibilityManualSteps()
                     },
-                    detector = if (cleared)
-                        "本组件在 manifest 声明为无障碍服务，但 Settings.Secure.enabled_accessibility_services" +
-                                " 已不含它，且本 App 曾检测到它启用过 → 判定为被系统清除"
-                    else "Settings.Secure.enabled_accessibility_services + AccessibilityManager 已启用服务列表 + 服务实例",
+                    detector = when {
+                        undetectable -> "Settings.Secure.enabled_accessibility_services 与 AccessibilityManager 均读取失败，" +
+                                "且本进程无服务实例 → 无法检测（按必须人工确认处理）"
+                        cleared ->
+                            "本组件在 manifest 声明为无障碍服务，但 Settings.Secure.enabled_accessibility_services" +
+                                    " 已不含它，且本 App 曾检测到它启用过 → 判定为被系统清除"
+                        else -> "Settings.Secure.enabled_accessibility_services + AccessibilityManager 已启用服务列表 + 服务实例"
+                    },
                 )
             )
         }

