@@ -109,6 +109,13 @@ object RelayCommands {
 
     /** PC协议版本查询（控制端用于确认被控端在线，兼容PC被控端协议） */
     const val CMD_GET_VERSION = "ver000000000"
+
+    // ==================== 手机操作记录（2026-11-08 恢复并扩展：亮屏/熄屏 + APP 前后台时段） ====================
+    /** 控制端 -> 手机被控端：拉取本机操作记录（负载 limit|keyword|days，keyword/days 可空） */
+    const val CMD_PHONE_ACTIVITY = "phact0000000"
+
+    /** 手机被控端 -> 控制端：操作记录响应（JSON：{meta:{...}, records:[...]}，按时间升序） */
+    const val RSP_PHONE_ACTIVITY = "phact1000000"
     /** 版本信息响应（负载: 版本|设备名|用户|isAdmin|isService，ASCII内容GBK/UTF-8解码一致） */
     const val CMD_VERSION_INFO = "ver100000000"
 

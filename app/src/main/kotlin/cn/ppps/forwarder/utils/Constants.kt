@@ -262,6 +262,12 @@ const val SP_RELAY_CONTROLLER_PORT = "relay_controller_port"
 /** ★ Tailscale直连模式开关（true=被控端监听56786接受控制端直连，false=传统中继模式） */
 const val SP_RELAY_DIRECT_MODE = "relay_direct_mode"
 const val SP_RELAY_ENABLE_SERVER_AUTORUN = "relay_enable_server_autorun"
+/** ★ 2026-11-08【服务自恢复】用户是否在界面里主动"停止服务"：仅此情况才禁止进程启动时自动拉起 */
+const val SP_RELAY_USER_STOPPED_SERVER = "relay_user_stopped_server"
+/** ★ 2026-11-08【权威状态持久化】最近一次收到的中继开关值（服务器 relayst / 同机广播） */
+const val SP_RELAY_LAST_AUTHORITY_ON = "relay_last_authority_on"
+/** ★ 2026-11-08【权威状态持久化】是否曾经收到过权威开关状态（false=从未收到，仍按"默认中继开"） */
+const val SP_RELAY_LAST_AUTHORITY_KNOWN = "relay_last_authority_known"
 
 
 //自动任务

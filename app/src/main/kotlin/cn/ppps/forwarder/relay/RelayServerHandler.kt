@@ -569,6 +569,14 @@ object RelayServerHandler {
                     }
                 }
 
+                // ==================== 手机操作记录（2026-11-08 恢复并扩展） ====================
+                // 控制端拉取本机操作记录：亮屏/熄屏 + APP 前后台时段（系统 UsageStats）。
+                RelayCommands.CMD_PHONE_ACTIVITY -> {
+                    val (data, err) = handlePhoneActivity(payloadText)
+                    if (data == null) return RelayCommands.RSP_PHONE_ACTIVITY to error(err ?: "查询失败")
+                    RelayCommands.RSP_PHONE_ACTIVITY to success(data)
+                }
+
                 RelayCommands.CMD_CLONE_PULL -> {
                     if (!HttpServerUtils.enableApiClone) return RelayCommands.RSP_CLONE to error("服务端已禁用该功能")
                     val cloneInfo = parseData(payloadText, CloneInfo::class.java)
@@ -1240,6 +1248,167 @@ object RelayServerHandler {
             AppUtils.getAppVersionCode(),
             AppUtils.getAppVersionName(),
         )
+    }
+
+    // ==================== 手机操作记录（2026-11-08 恢复并扩展） ====================
+
+    /** 一段操作时段：kind=app/screen；start=0 表示查询窗口开始前已在前台（打开时间不可考）。 */
+    private data class UsageSeg(val kind: String, val pkg: String, val start: Long, var end: Long, var ongoing: Boolean)
+
+    /**
+     * 拉取本机操作记录（系统 UsageStats 事件配对成时段）。
+     *
+     * 负载：`limit|keyword|days|since`（keyword/days 可空；days 默认 7 天，limit 默认 5000；
+     * since 为毫秒时间戳，>0 表示**增量**：只回传段尾在该时刻之后的记录，控制端已缓存的不再下载）。
+     * 返回 Pair(data, err)：data 非空由调用方包 success()；为空时 err 为明确原因
+     * （控制端直接展示原因，不干等——失败必回执带原因）。
+     *
+     * ★ 用 queryEvents 而非 queryUsageStats：后者只有聚合值，拿不到起止时间。
+     * ★ 亮屏行：开始=亮屏(SCREEN_INTERACTIVE)，结束=熄屏(SCREEN_NON_INTERACTIVE)；
+     *   APP行：开始=打开(ACTIVITY_RESUMED)，结束=退回后台(ACTIVITY_PAUSED)。
+     *   同包 2 秒内的 暂停→恢复 视为应用内部页面切换，合并为一段（不剁碎时长）。
+     *   熄屏时仍未退后台的 APP 一并收尾（熄屏后不可能还在前台）。
+     */
+    private fun handlePhoneActivity(payloadText: String): Pair<Any?, String?> {
+        val ctx = App.context ?: return null to "无法获取应用上下文"
+        val parts = payloadText.split("|")
+        val limit = (parts.getOrNull(0)?.trim()?.toIntOrNull() ?: 5000).coerceIn(1, 20000)
+        val keyword = (parts.getOrNull(1)?.trim() ?: "").lowercase()
+        val days = (parts.getOrNull(2)?.trim()?.toIntOrNull() ?: 7).coerceIn(1, 30)
+        // ★ 2026-11-08 增量：since>0 时只回传此后的段（控制端本地已缓存更早的记录）
+        val since = (parts.getOrNull(3)?.trim()?.toLongOrNull() ?: 0L).coerceAtLeast(0L)
+
+        if (!cn.ppps.forwarder.permission.PermissionProbe.isUsageAccessGranted(ctx)) {
+            return null to "未开启「使用情况访问权限」：请在被控端手机 设置 → 应用 → 特殊应用权限 → 使用情况访问权限 中允许 SmsForwarder（被控端启动时也会自动导航到该页引导）"
+        }
+        val usm = ctx.getSystemService(Context.USAGE_STATS_SERVICE) as? android.app.usage.UsageStatsManager
+            ?: return null to "本机不支持 UsageStatsManager"
+        val end = System.currentTimeMillis()
+        val begin = end - days.toLong() * 24L * 3600L * 1000L
+
+        val events = usm.queryEvents(begin, end)
+        val ev = android.app.usage.UsageEvents.Event()
+        val openApp = HashMap<String, Long>()
+        var screenStart = 0L
+        val segs = ArrayList<UsageSeg>()
+        while (events.hasNextEvent()) {
+            events.getNextEvent(ev)
+            val t = ev.timeStamp
+            when (ev.eventType) {
+                android.app.usage.UsageEvents.Event.ACTIVITY_RESUMED -> {
+                    val pkg = ev.packageName ?: continue
+                    // 同包内部页面切换不覆盖最早的打开时间
+                    if (!openApp.containsKey(pkg)) openApp[pkg] = t
+                }
+                android.app.usage.UsageEvents.Event.ACTIVITY_PAUSED -> {
+                    val pkg = ev.packageName ?: continue
+                    val st = openApp.remove(pkg)
+                    if (st != null && t > st) segs.add(UsageSeg("app", pkg, st, t, false))
+                    else if (st == null) segs.add(UsageSeg("app", pkg, 0L, t, false))
+                }
+                android.app.usage.UsageEvents.Event.SCREEN_INTERACTIVE -> screenStart = t
+                android.app.usage.UsageEvents.Event.SCREEN_NON_INTERACTIVE -> {
+                    for ((pkg, st) in openApp) segs.add(UsageSeg("app", pkg, st, t, false))
+                    openApp.clear()
+                    if (screenStart > 0 && t > screenStart) segs.add(UsageSeg("screen", "", screenStart, t, false))
+                    else if (screenStart == 0L) segs.add(UsageSeg("screen", "", 0L, t, false))
+                    screenStart = 0L
+                }
+            }
+        }
+        // 查询结束仍在前台/仍亮屏 → 进行中（持续时间累计到当前）
+        for ((pkg, st) in openApp) segs.add(UsageSeg("app", pkg, st, end, true))
+        if (screenStart > 0) segs.add(UsageSeg("screen", "", screenStart, end, true))
+
+        // 按时间顺序（升序）；打开时间不可考的段按结束时间排位
+        segs.sortBy { if (it.start > 0) it.start else it.end }
+        // 合并同包短间隔（≤2s）的相邻段：应用内部 Activity 切换产生的 暂停→恢复 碎片
+        val merged = ArrayList<UsageSeg>()
+        for (s in segs) {
+            val last = merged.lastOrNull()
+            if (last != null && s.kind == "app" && last.kind == "app" && last.pkg == s.pkg
+                && !last.ongoing && s.start > 0 && s.start - last.end in 0..2000L) {
+                last.end = s.end
+                last.ongoing = s.ongoing
+            } else {
+                merged.add(s)
+            }
+        }
+
+        // ★ 2026-11-08 增量过滤：分段在完整窗口内生成（保证与全量查询的分段结果一致），
+        //   这里只回传"段尾 >= since"的段；进行中的段始终回传（控制端要用最新时长覆盖旧记录）。
+        //   打开时间不可考（start=0）的段以结束时刻判断。
+        val filtered = if (since > 0L) merged.filter { it.ongoing || it.end >= since } else merged
+
+        val pm = ctx.packageManager
+        // ★ 2026-11-08 用户要求：桌面（Launcher）的前后台切换没有实际意义，直接过滤。
+        //   用 CATEGORY_HOME 解析所有桌面 App（华为/小米/原生包名各不相同，不能写死）。
+        val launcherPkgs = HashSet<String>()
+        try {
+            val home = android.content.Intent(android.content.Intent.ACTION_MAIN)
+                .addCategory(android.content.Intent.CATEGORY_HOME)
+            val ris = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                pm.queryIntentActivities(home, PackageManager.ResolveInfoFlags.of(PackageManager.MATCH_ALL.toLong()))
+            } else {
+                @Suppress("DEPRECATION") pm.queryIntentActivities(home, PackageManager.MATCH_ALL)
+            }
+            for (ri in ris) ri.activityInfo?.packageName?.let { launcherPkgs.add(it) }
+        } catch (t: Throwable) {
+            Log.w(TAG, "读取桌面包名失败（本次不过滤桌面）: ${t.message}")
+        }
+        val labelCache = HashMap<String, String>()
+        val fmt = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+        val allRecords = ArrayList<HashMap<String, String>>()
+        for (s in filtered) {
+            // ★ 2026-11-08 用户要求：操作记录不显示亮屏/锁屏（screen 段）；
+            //   但 screen 事件仍参与上面"熄屏收尾 APP 段"的计算，只影响输出。
+            if (s.kind == "screen") continue
+            if (s.kind == "app" && launcherPkgs.contains(s.pkg)) continue
+            var label = ""
+            if (s.kind == "app") {
+                label = labelCache.getOrPut(s.pkg) {
+                    try {
+                        val ai = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            pm.getApplicationInfo(s.pkg, PackageManager.ApplicationInfoFlags.of(0))
+                        } else {
+                            @Suppress("DEPRECATION") pm.getApplicationInfo(s.pkg, 0)
+                        }
+                        pm.getApplicationLabel(ai).toString()
+                    } catch (_: Exception) {
+                        s.pkg  // 已卸载/不可见：保留包名，不猜
+                    }
+                }
+                if (keyword.isNotEmpty() && !(label + s.pkg).lowercase().contains(keyword)) continue
+            }
+            val durSec = if (s.start > 0) ((s.end - s.start) / 1000L).toInt() else -1
+            val row = HashMap<String, String>()
+            row["kind"] = if (s.kind == "screen") "亮屏" else "应用使用"
+            row["app"] = label
+            row["start"] = if (s.start > 0) fmt.format(java.util.Date(s.start)) else "—"
+            row["end"] = if (s.ongoing) "进行中" else fmt.format(java.util.Date(s.end))
+            row["duration"] = if (durSec >= 0)
+                String.format(Locale.US, "%02d:%02d:%02d", durSec / 3600, (durSec % 3600) / 60, durSec % 60)
+                else ""
+            // ★ 2026-11-08 增量合并用：控制端按 pkg/start_ms 去重、用 end_ms 判新旧
+            row["pkg"] = if (s.kind == "app") s.pkg else ""
+            row["start_ms"] = if (s.start > 0) s.start.toString() else "0"
+            row["end_ms"] = (if (s.ongoing) end else s.end).toString()
+            allRecords.add(row)
+        }
+        // ★ 2026-11-08 用户要求「最新的记录必须保留」：超过 limit 时截断**最早**的部分
+        //   （原实现边遍历边 break，升序下丢掉的是最近记录）。
+        val records = if (allRecords.size > limit)
+            ArrayList(allRecords.subList(allRecords.size - limit, allRecords.size)) else allRecords
+        val meta = HashMap<String, Any>()
+        meta["rows"] = records.size
+        meta["os"] = "Android " + Build.VERSION.RELEASE
+        meta["range"] = "%s ~ %s".format(fmt.format(java.util.Date(begin)), fmt.format(java.util.Date(end)))
+        meta["note"] = "数据来源：系统使用记录（最近 $days 天）；已过滤桌面与亮屏/锁屏记录"
+        // ★ 2026-11-08 控制端缓存用：generated_at 作为"进行中"记录的累计终点与 covered_until
+        meta["generated_at"] = end.toString()
+        meta["since"] = since.toString()
+        Log.i(TAG, "★ 手机操作记录查询: 最近 $days 天，since=$since → ${records.size} 条")
+        return mapOf("meta" to meta, "records" to records) to null
     }
 
     private fun handleBattery(): BatteryInfo {

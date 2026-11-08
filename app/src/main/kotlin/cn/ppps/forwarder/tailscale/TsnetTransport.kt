@@ -326,6 +326,28 @@ object TsnetTransport {
         flushPendingExposes()
     }
 
+    /**
+     * ★★★ 2026-11-08【服务停止 → 拆除入站代理】
+     *   服务销毁时本地 56786 已关闭，但 tsnet 侧仍把尾网 :56786 转发到 127.0.0.1:56786，
+     *   控制端收到的是 RST / "connection was refused"（真机实测：服务停后仍能看到
+     *   CreateEndpoint error）。这里只摘除命令端口代理，节点本身保留（媒体端口/其他功能不受影响）。
+     */
+    fun stopInbound(reason: String) {
+        val p = inboundPort
+        synchronized(this) {
+            if (inboundStarted && p > 0) {
+                try {
+                    node?.stopListenProxy(p.toLong())
+                    Log.i(TAG, "★ 入站代理已拆除：尾网 :$p（$reason）")
+                } catch (t: Throwable) {
+                    Log.w(TAG, "拆除入站代理失败: ${t.message}")
+                }
+            }
+            inboundStarted = false
+            inboundPort = 0
+        }
+    }
+
     /** 停机（服务销毁/调试用）：关闭节点、代理与状态 */
     fun stop() {
         try {

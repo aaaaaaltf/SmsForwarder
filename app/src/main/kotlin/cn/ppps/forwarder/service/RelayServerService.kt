@@ -405,6 +405,10 @@ class RelayServerService : Service() {
                     cn.ppps.forwarder.tailscale.TailscaleManager.serverRelayStateFreshUntil =
                         System.currentTimeMillis() + 180_000L
                     cn.ppps.forwarder.tailscale.TailscaleManager.serverRelayStateValue = on
+                    // ★★★ 2026-11-08【权威状态持久化】服务器 relayst 是唯一总闸，立即落盘：
+                    //   进程重启/覆盖安装后在重新注册并收到 relayst 之前，按上次开关值恢复直连任务，
+                    //   不再回落到"默认中继开"而把 56786 监听停掉。
+                    RelaySettings.rememberAuthorityRelayState(on, "服务器relayst")
                     cn.ppps.forwarder.tailscale.TailscaleManager.setRelayConnected(this, on)
                     // ★★★ 2026-10-04【模式互斥】总闸变化 → 立即启停直连任务
                     //   （on：停 56786 监听 + 56789 扫描；off：启用直连兜底）
@@ -493,7 +497,19 @@ class RelayServerService : Service() {
             val listenerHolder = arrayOfNulls<RelayServerListener>(1)
             val l = RelayServerListener(
                 port = RelaySettings.relayServerPort,
-                onConnected = { Log.i(TAG, "直连监听端口 ${RelaySettings.relayServerPort} 已就绪") },
+                onConnected = {
+                    Log.i(TAG, "直连监听端口 ${RelaySettings.relayServerPort} 已就绪")
+                    // ★★★ 2026-11-08【入站代理时序修复】真机实证：覆盖安装/重启后 tsnet 入站代理
+                    //   可能先于本地 56786 listener 建立，控制端 SYN 被转发到尚未监听的端口 →
+                    //   CreateEndpoint error: connection was refused（红米首次启动即此现象）。
+                    //   listener 就绪后再确保一次代理（startInboundIfNeeded 内部幂等，已建立则早退），
+                    //   消除"先暴露、后被拒"的窗口。
+                    if (cn.ppps.forwarder.tailscale.TailscaleManager.USE_TSNET) {
+                        cn.ppps.forwarder.tailscale.TsnetTransport.startInboundWhenReady(
+                            RelaySettings.relayServerPort
+                        )
+                    }
+                },
                 onDisconnected = { },
                 onCommand = onDirectCommand,
                 // ★★★ 2026-08-30 打通下发路径的关键一环：新控制端一连进来就主动朝它要一次
@@ -724,15 +740,15 @@ class RelayServerService : Service() {
      * 也只等待重试，**不得**启用任何直连任务。
      * 取值优先级：① 服务器总闸（唯一权威，粘性值，不因 180s 窗口过期而翻转）
      *            ② 同机控制端广播的权威值
-     *            ③ 从未收到任何权威状态（全新安装/服务端未推送）→ 用"中继通道是否连着"兜底
+     *            ③ 从未收到任何权威状态（全新安装/服务端未推送）→ 视为中继开，**不按可达性兜底**
      */
     private fun isRelayModeOn(): Boolean = try {
-        // ★★★ 2026-10-06【整改：真源收敛到 TailscaleManager.isRelaySwitchOn()，删除可达性兜底】
-        //   原实现第 ③ 分支 `tm.isRelayConnected() || client?.isConnected() == true` 是
-        //   **可达性兜底**：没有任何权威状态时按"中继通道通不通"判模式 ⇒ 中继瞬断即被当成
-        //   直连模式 ⇒ 启用直连任务（正是用户实测"中继模式下仍看到直连任务"的成因之一）。
-        //   ⇒ 现在唯一判据是**开关**（未知 ⇒ 视为中继开，不启任何直连任务），
-        //     与控制端侧 isDeviceRoutedViaRelay 的口径完全一致（同一真源、零回退）。
+        // ★★★ 2026-11-08【铁律：中继/直连严格分离，严禁"直连不通就用中继兜底"】
+        //   模式唯一由用户在控制端手机上的「中继开关」决定，被控端必须同步该开关状态。
+        //   ① 收到服务器总闸或同机控制端广播的权威值 → 严格按开关；
+        //   ② 未收到权威值 → 视为中继开（不启任何直连任务），绝不按可达性猜测方向；
+        //   ③ 任何异常同样视为中继开。
+        //   ⚠ 禁止再用 client.isConnected()/isRelayConnected() 参与模式判定。
         cn.ppps.forwarder.tailscale.TailscaleManager.isRelaySwitchOn()
     } catch (e: Throwable) {
         // ★ 异常时同样**不得**用可达性猜方向 ⇒ 视为中继开（不启直连任务）
@@ -985,6 +1001,11 @@ class RelayServerService : Service() {
         client?.stop()
         client = null
         listener?.stop()
+        // ★★★ 2026-11-08【入站代理随服务拆除】本地 56786 关闭后，tsnet 尾网代理若仍指向
+        //   127.0.0.1:56786，控制端会在 TS 层收到 RST/refused。这里同步摘除命令端口代理。
+        if (cn.ppps.forwarder.tailscale.TailscaleManager.USE_TSNET) {
+            cn.ppps.forwarder.tailscale.TsnetTransport.stopInbound("RelayServerService.onDestroy")
+        }
         // ★ 2026-09-04：CameraStreamManager 是进程级单例，服务销毁后它仍会留着这些通道
         //   （且通道闭包捕获了本服务实例）→ 只 add 不 remove 会让 senders 随重启单调增长。
         //   中继 client 由下面的 setClient(null) 负责摘除，这里补齐另外两类。

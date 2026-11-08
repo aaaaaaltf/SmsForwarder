@@ -1026,7 +1026,10 @@ object TailscaleManager {
     fun isRelaySwitchOn(): Boolean = when {
         serverRelayStateFreshUntil != 0L -> serverRelayStateValue
         externalRelayStateUntil != 0L -> externalRelayStateOn
-        else -> true
+        // ★★★ 2026-11-08【权威状态持久化】内存权威尚未到达（进程刚重启/覆盖安装后）→
+        //   沿用最后一次落盘的用户开关值；只有"从未收到过权威状态"（全新安装）才默认中继开。
+        //   注意：该值只来自 relayst/同机广播，不由可达性写入，仍严格遵守铁律。
+        else -> cn.ppps.forwarder.utils.RelaySettings.lastKnownAuthorityRelayState() ?: true
     }
 
     /**

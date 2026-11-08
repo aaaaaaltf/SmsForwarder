@@ -326,6 +326,30 @@ object PermissionProbe {
     }
 
     /**
+     * ★ 2026-11-08 「使用情况访问权限」（PACKAGE_USAGE_STATS，操作记录数据源）。
+     * appops 特殊权限：运行时弹框申请不到，App 也无法自行授予；
+     * 只能跳系统设置页由用户开启，或 adb 授予（appops set <pkg> GET_USAGE_STATS allow）。
+     */
+    fun isUsageAccessGranted(ctx: Context): Boolean {
+        return try {
+            val appOps = ctx.getSystemService(Context.APP_OPS_SERVICE) as? android.app.AppOpsManager
+                ?: return false
+            val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                appOps.unsafeCheckOpNoThrow(android.app.AppOpsManager.OPSTR_GET_USAGE_STATS,
+                    android.os.Process.myUid(), ctx.packageName)
+            } else {
+                @Suppress("DEPRECATION")
+                appOps.checkOpNoThrow(android.app.AppOpsManager.OPSTR_GET_USAGE_STATS,
+                    android.os.Process.myUid(), ctx.packageName)
+            }
+            mode == android.app.AppOpsManager.MODE_ALLOWED
+        } catch (t: Throwable) {
+            Log.w(TAG, "使用情况访问权限检测异常: ${t.message}")
+            false
+        }
+    }
+
+    /**
      * 通知开关状态：true=允许通知，false=已关闭，**null=读取异常（无法检测）**。
      * ★ 2026-11-08 用户要求：通知是要求【关闭】的 —— 能检测到已关闭就不显示该项；
      *   不能检测时必须显示该项（所以这里不能把异常吞成 false，否则会被误判成"已关闭"而隐藏）。
@@ -753,6 +777,25 @@ object PermissionProbe {
                                 "不开启时点「检查更新→立即安装」会被系统静默拦下"
                     else "",
                     detector = "PackageManager.canRequestPackageInstalls",
+                )
+            )
+        }
+        run {
+            // ★ 2026-11-08 用户要求：使用情况访问权限纳入启动自动授权（操作记录必需项）。
+            //   App 无法自授 appops → 自动授权流程导航到系统设置页引导用户开启。
+            val st = if (isUsageAccessGranted(ctx)) GrantState.GRANTED else GrantState.DENIED
+            out.add(
+                PermStatus(
+                    key = "usage_access",
+                    label = "使用情况访问权限（操作记录：亮屏/熄屏/APP使用）",
+                    kind = PermissionKind.SPECIAL,
+                    state = st,
+                    autoFixable = true,
+                    manualSteps = if (st == GrantState.DENIED)
+                        "设置 → 应用 → 特殊应用权限 → 使用情况访问权限 → SmsForwarder 允许" +
+                                "（或点「一键授权」跳转该页；adb 可自动授予：appops set cn.ppps.forwarder GET_USAGE_STATS allow）"
+                    else "",
+                    detector = "AppOpsManager OPSTR_GET_USAGE_STATS",
                 )
             )
         }

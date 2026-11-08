@@ -162,6 +162,8 @@ class App : Application(), Configuration.Provider by Core {
                         //   闸门 externalRelayStateOn 仍为 true（更早的中继态）→ setRelayConnected(false)
                         //   被闸门拦下、不建 VPN，只能等服务器 relayst=off + 看门狗退避（最坏约 60s）才起来。
                         cn.ppps.forwarder.tailscale.TailscaleManager.externalRelayStateOn = on
+                        // ★★★ 2026-11-08【权威状态持久化】同机广播同样是用户开关的权威值，落盘供进程重启后沿用
+                        cn.ppps.forwarder.utils.RelaySettings.rememberAuthorityRelayState(on, "同机控制端广播")
                         // ★ 权威状态变化 → 复位看门狗退避，使建立失败后也能在 10s 内快速重试
                         cn.ppps.forwarder.tailscale.TailscaleManager.resetVpnWatchdogBackoff()
                         cn.ppps.forwarder.tailscale.TailscaleManager.setRelayConnected(
@@ -182,8 +184,17 @@ class App : Application(), Configuration.Provider by Core {
             }
             Log.i(TAG, "★ 已注册中继状态联动接收器（中继开→关VPN / 中继关→开VPN，被动响应）")
 
-            //启动被控端中继服务（开机自启）
-            if (RelaySettings.enableServerAutorun) {
+            // ★★★ 2026-11-08【服务自恢复：修复覆盖安装后直连永久不可用】
+            //   真机实证：双机 relay_enable_server_autorun=false，且 Manifest 没有 MY_PACKAGE_REPLACED；
+            //   今日 11 轮覆盖安装每次都杀进程，服务死后无人拉起（dumpsys 无 RelayServerService），
+            //   于是 :56786 无监听 → 控制端直连全部 RST。模式互斥逻辑根本没机会执行。
+            //   RelayServerService 是中继命令通道（relayst 开关状态同步）与直连监听的唯一载体，
+            //   因此进程启动即拉起；仅当用户在图里主动点过「停止服务」才不自动拉起。
+            //   「开机自启」开关语义保留：它只决定手机重启后是否由 BootCompletedReceiver 拉起进程。
+            if (RelaySettings.userStoppedServer) {
+                Log.i(TAG, "★ 用户曾主动停止被控端服务 → 本次进程启动不自动拉起（可在界面点「运行」恢复）")
+            } else {
+                Log.i(TAG, "★ 进程启动 → 自动拉起被控端服务（修复覆盖安装后服务不运行）")
                 RelayServerService.start(this)
             }
 
