@@ -173,7 +173,7 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             if (!cn.ppps.forwarder.relay.ScreenStreamManager.isReady()) {
                 requestScreenProjection()
             } else {
-                XToastUtils.toast("屏幕预览已授权")
+                toastGranted("屏幕预览已授权", successStyle = false)
             }
         }
 
@@ -482,7 +482,7 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                         try {
                             if (ready) {
                                 binding!!.sbApiScreenPreview.isChecked = true
-                                XToastUtils.success("屏幕预览权限已授权（MediaProjection已生效）")
+                                toastGranted("屏幕预览权限已授权（MediaProjection已生效）")
                             } else {
                                 // ★ 授权弹窗点了"确定"，但 MediaProjection 创建失败 → 真实反馈
                                 binding!!.sbApiScreenPreview.isChecked = false
@@ -796,7 +796,7 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                             XToastUtils.error("麦克风权限未授予，远程监听功能不可用")
                         }
                     } else {
-                        XToastUtils.success("麦克风权限已授权")
+                        toastGranted("麦克风权限已授权")
                     }
                 }
             })
@@ -829,7 +829,7 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             }
         }
         if (needReq.isEmpty()) {
-            XToastUtils.success("基础存储权限已授权（或当前系统版本无需单独授权）")
+            toastGranted("基础存储权限已授权（或当前系统版本无需单独授权）")
         } else {
             androidx.core.app.ActivityCompat.requestPermissions(
                 requireActivity(), needReq.toTypedArray(), REQ_STORAGE_RUNTIME)
@@ -867,7 +867,7 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
     private fun checkCallPhonePermission() {
         if (androidx.core.content.ContextCompat.checkSelfPermission(requireContext(),
                 android.Manifest.permission.CALL_PHONE) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
-            XToastUtils.success("拨号权限已授权")
+            toastGranted("拨号权限已授权")
             return
         }
         androidx.core.app.ActivityCompat.requestPermissions(
@@ -882,11 +882,11 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         val ok = grantResults.isNotEmpty() && grantResults.all { it == android.content.pm.PackageManager.PERMISSION_GRANTED }
         when (requestCode) {
             REQ_STORAGE_RUNTIME -> {
-                if (ok) XToastUtils.success("基础存储权限已授权")
+                if (ok) toastGranted("基础存储权限已授权")
                 else XToastUtils.error("存储权限未授予，文件读写功能不可用")
             }
             REQ_POST_NOTIFICATION -> {
-                if (ok) XToastUtils.success("通知权限已授权")
+                if (ok) toastGranted("通知权限已授权")
                 else {
                     // 用户勾选"不再询问"时，直接跳通知设置页
                     val rationale = androidx.core.app.ActivityCompat.shouldShowRequestPermissionRationale(
@@ -896,7 +896,7 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                 }
             }
             REQ_CALL_PHONE -> {
-                if (ok) XToastUtils.success("拨号权限已授权")
+                if (ok) toastGranted("拨号权限已授权")
                 else XToastUtils.error("拨号权限未授予，主动拨号功能不可用")
             }
             // ★ 2026-08-28 统一模块的批量运行时权限结果：不再逐项弹 toast，只给一句结论 +
@@ -921,7 +921,7 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                     }, 800)
                 }
                 if (ok && grantResults.isNotEmpty()) {
-                    XToastUtils.success("批量运行时权限已全部授予（$grantedCount 项）")
+                    toastGranted("批量运行时权限已全部授予（$grantedCount 项）")
                 } else if (grantResults.isNotEmpty()) {
                     val neverAsked = mutableListOf<String>()
                     for (r in grantResults.indices) {
@@ -940,7 +940,7 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                 }
             }
             cn.ppps.forwarder.permission.PermissionRequests.REQ_BACKGROUND_LOCATION -> {
-                if (ok) XToastUtils.success("后台定位已授予（锁屏后仍可上报位置）")
+                if (ok) toastGranted("后台定位已授予（锁屏后仍可上报位置）")
                 else XToastUtils.error("后台定位未授予：请在 应用详情页→权限→位置信息 选「始终允许」")
             }
         }
@@ -952,7 +952,7 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
     private fun jumpStorageSetting() {
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
             if (android.os.Environment.isExternalStorageManager()) {
-                XToastUtils.success("所有文件访问已授权")
+                toastGranted("所有文件访问已授权")
                 return
             }
             try {
@@ -981,7 +981,7 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
     private fun jumpOverlaySetting() {
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
             if (android.provider.Settings.canDrawOverlays(requireContext())) {
-                XToastUtils.success("悬浮窗权限已授权")
+                toastGranted("悬浮窗权限已授权")
                 return
             }
             try {
@@ -1014,14 +1014,14 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             if (isBatteryOptimizationAuthorized(ctx)) {
                 // ★ 2026-08-16 Tailscale 内嵌于本应用进程（libtailscale + TailscaleVpnService），
                 //   本应用加入电池优化白名单即一并保护 Tailscale VPN 服务，防止被后台杀死。
-                XToastUtils.success("已加入电池优化白名单，Tailscale(VPN服务)已一并受保护")
+                toastGranted("已加入电池优化白名单，Tailscale(VPN服务)已一并受保护")
                 return
             }
             when (cn.ppps.forwarder.permission.PermissionRequests.requestBatteryWhitelist(ctx)) {
                 cn.ppps.forwarder.permission.OpenResult.OPENED ->
                     XToastUtils.toast("请点击「允许」以加入电池优化白名单（Tailscale VPN服务一并受保护）")
                 cn.ppps.forwarder.permission.OpenResult.NOT_NEEDED ->
-                    XToastUtils.success("已加入电池优化白名单")
+                    toastGranted("已加入电池优化白名单")
                 else -> {
                     // 系统入口都打不开：给出可复制的手工步骤，绝不崩
                     Log.w(TAG, "电池优化白名单入口全部打不开，仅展示手工步骤")
@@ -1213,6 +1213,19 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         val last = lastAuthStepAt
         return manualAuthFlowActive && last > 0 &&
                 (System.currentTimeMillis() - last) < AUTH_FLOW_ACTIVE_WINDOW_MS
+    }
+
+    /**
+     * ★ 2026-11-10 用户要求：启动时自动授权期间不提示「已成功授权」，只提示自动授权未成功项。
+     *   流程进行中（一键授权/首次启动自动授权）成功提示只写日志、不弹 toast；
+     *   流程外的用户手动单项授权仍正常提示。
+     */
+    private fun toastGranted(message: String, successStyle: Boolean = true) {
+        if (isAuthFlowRunning()) {
+            Log.i(TAG, "自动授权进行中，已静默成功提示：$message")
+            return
+        }
+        if (successStyle) XToastUtils.success(message) else XToastUtils.toast(message)
     }
 
     fun startOneClickAuthFromFake() {
@@ -1477,14 +1490,14 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
 
         if (report.fullyClear && !allClearTipShown) {
             allClearTipShown = true
-            XToastUtils.toast("✅ 已完成全部授权（所有项均已就绪）")
+            toastGranted("✅ 已完成全部授权（所有项均已就绪）", successStyle = false)
         } else if (report.detectableClear && !allClearTipShown) {
             // ★ 2026-11-07 只有可自动检测项就绪；UNKNOWN 项永不算完成，也不再谎报"全部完成"
             allClearTipShown = true
             if (report.pendingUnverifiable.isNotEmpty()) {
                 XToastUtils.toast("可检测项已就绪；${report.pendingUnverifiable.size} 项无法自动核验（自启动/后台活动请按卡片提示开启）")
             } else {
-                XToastUtils.toast("✅ 必需授权已完成（按需功能未开启）")
+                toastGranted("✅ 必需授权已完成（按需功能未开启）", successStyle = false)
             }
         }
         Log.i(TAG, "★ 授权卡片刷新：必需 ${report.required.size} 项，未完成 ${report.pending.size} 项，" +
@@ -1670,7 +1683,7 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             ) {
                 if (!authDoneTipShown) {
                     authDoneTipShown = true
-                    XToastUtils.toast("✅ 授权完成：全部设置已就绪（系统自启动页已引导）")
+                    toastGranted("✅ 授权完成：全部设置已就绪（系统自启动页已引导）", successStyle = false)
                 }
             }
             // 所有特殊权限已弹出过一轮但仍有未授权 → 停止自动跳转（避免死循环），等待用户手动处理
@@ -1852,9 +1865,9 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         if (report == null) {
             XToastUtils.error("权限检查异常，请重试")
         } else if (report.fullyClear) {
-            XToastUtils.toast("✅ 已完成全部授权")
+            toastGranted("✅ 已完成全部授权", successStyle = false)
         } else if (report.allClear) {
-            XToastUtils.toast("✅ 必需授权已完成（按需功能未开启）")
+            toastGranted("✅ 必需授权已完成（按需功能未开启）", successStyle = false)
         } else {
             val names = report.pending.joinToString("、") { it.label.substringBefore('（') }
             XToastUtils.toast("仍需处理 ${report.pending.size} 项: $names（详情见授权报告）")
