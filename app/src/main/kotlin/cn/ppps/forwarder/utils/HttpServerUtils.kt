@@ -39,7 +39,9 @@ class HttpServerUtils private constructor() {
         var enableApiBatteryQuery: Boolean by SharedPreference(SP_ENABLE_API_BATTERY_QUERY, true)
 
         //是否启用远程找手机
-        var enableApiLocation: Boolean by SharedPreference(SP_ENABLE_API_LOCATION, false)
+        // ★ 2026-11-10 用户要求：短信查询与远程定位默认开启（原定位默认 false，
+        //   会导致系统权限已授予时仍被“服务端禁用”拦截，形成权限误报）。
+        var enableApiLocation: Boolean by SharedPreference(SP_ENABLE_API_LOCATION, true)
 
         //是否启用远程摄像头（被控端摄像头推流到控制端）
         var enableApiCamera: Boolean by SharedPreference(SP_ENABLE_API_CAMERA, true)

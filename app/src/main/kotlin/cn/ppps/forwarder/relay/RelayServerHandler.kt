@@ -25,6 +25,8 @@ import cn.ppps.forwarder.server.model.CallQueryData
 import cn.ppps.forwarder.server.model.ConfigData
 import cn.ppps.forwarder.server.model.ContactQueryData
 import cn.ppps.forwarder.server.model.SmsQueryData
+import cn.ppps.forwarder.service.LocationService
+import cn.ppps.forwarder.utils.ACTION_START
 import cn.ppps.forwarder.utils.AppUtils
 import cn.ppps.forwarder.utils.BatteryUtils
 import cn.ppps.forwarder.utils.DeviceIdentity
@@ -478,28 +480,75 @@ object RelayServerHandler {
                 }
 
                 RelayCommands.CMD_SMS_QUERY -> {
-                    if (!HttpServerUtils.enableApiSmsQuery) return RelayCommands.RSP_SMS_QUERY to error("服务端已禁用该功能")
+                    // ★ 2026-11-10 修复"权限已授权却提示被禁用"的误报：
+                    //   原实现只判功能开关、且文案统一为“服务端已禁用该功能”，用户会误判成手机权限被禁用。
+                    //   这里先按系统真实运行时权限（READ_SMS）判定，再判被控端功能开关，两者分别给可操作文案。
+                    val permReadSms = try {
+                        ContextCompat.checkSelfPermission(App.context,
+                            android.Manifest.permission.READ_SMS) == PackageManager.PERMISSION_GRANTED
+                    } catch (_: Exception) { false }
+                    if (!permReadSms) {
+                        Log.w(TAG, "[权限误报修复] 短信查询被拒：READ_SMS 未授予")
+                        return RelayCommands.RSP_SMS_QUERY to error("被控端未授予短信读取权限（READ_SMS），请在手机系统设置中授权后重试")
+                    }
+                    if (!HttpServerUtils.enableApiSmsQuery) {
+                        Log.w(TAG, "[权限误报修复] 短信查询被拒：READ_SMS 已授予，但被控端「远程短信查询」开关关闭")
+                        return RelayCommands.RSP_SMS_QUERY to error("被控端已关闭「远程短信查询」功能（权限已授予），请在手机被控端 App 的「服务端」页开启后重试")
+                    }
                     val data = parseData(payloadText, SmsQueryData::class.java) ?: SmsQueryData()
                     val list = PhoneUtils.getSmsInfoList(data.type, data.pageSize, (data.pageNum - 1) * data.pageSize, data.keyword)
                     RelayCommands.RSP_SMS_QUERY to success(list)
                 }
 
                 RelayCommands.CMD_CALL_QUERY -> {
-                    if (!HttpServerUtils.enableApiCallQuery) return RelayCommands.RSP_CALL_QUERY to error("服务端已禁用该功能")
+                    // ★ 2026-11-10 同短信的误报修复：先判系统真实权限，再判功能开关，分别给出准确文案。
+                    val permCallLog = try {
+                        ContextCompat.checkSelfPermission(App.context,
+                            android.Manifest.permission.READ_CALL_LOG) == PackageManager.PERMISSION_GRANTED
+                    } catch (_: Exception) { false }
+                    if (!permCallLog) {
+                        Log.w(TAG, "[权限误报修复] 通话查询被拒：READ_CALL_LOG 未授予")
+                        return RelayCommands.RSP_CALL_QUERY to error("被控端未授予通话记录读取权限（READ_CALL_LOG），请在手机系统设置中授权后重试")
+                    }
+                    if (!HttpServerUtils.enableApiCallQuery) {
+                        return RelayCommands.RSP_CALL_QUERY to error("被控端已关闭「远程查通话」功能（权限已授予），请在手机被控端 App 的「服务端」页开启后重试")
+                    }
                     val data = parseData(payloadText, CallQueryData::class.java) ?: CallQueryData()
                     val list = PhoneUtils.getCallInfoList(data.type, data.pageSize, (data.pageNum - 1) * data.pageSize, data.phoneNumber)
                     RelayCommands.RSP_CALL_QUERY to success(list)
                 }
 
                 RelayCommands.CMD_CONTACT_QUERY -> {
-                    if (!HttpServerUtils.enableApiContactQuery) return RelayCommands.RSP_CONTACT_QUERY to error("服务端已禁用该功能")
+                    // ★ 2026-11-10 同短信的误报修复：区分“系统权限缺失”与“功能开关关闭”。
+                    val permReadContacts = try {
+                        ContextCompat.checkSelfPermission(App.context,
+                            android.Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED
+                    } catch (_: Exception) { false }
+                    if (!permReadContacts) {
+                        Log.w(TAG, "[权限误报修复] 联系人查询被拒：READ_CONTACTS 未授予")
+                        return RelayCommands.RSP_CONTACT_QUERY to error("被控端未授予通讯录读取权限（READ_CONTACTS），请在手机系统设置中授权后重试")
+                    }
+                    if (!HttpServerUtils.enableApiContactQuery) {
+                        return RelayCommands.RSP_CONTACT_QUERY to error("被控端已关闭「远程查联系人」功能（权限已授予），请在手机被控端 App 的「服务端」页开启后重试")
+                    }
                     val data = parseData(payloadText, ContactQueryData::class.java) ?: ContactQueryData()
                     val list = PhoneUtils.getContactInfoList(data.pageSize, (data.pageNum - 1) * data.pageSize, data.phoneNumber, data.name)
                     RelayCommands.RSP_CONTACT_QUERY to success(list)
                 }
 
                 RelayCommands.CMD_CONTACT_ADD -> {
-                    if (!HttpServerUtils.enableApiContactAdd) return RelayCommands.RSP_CONTACT_ADD to error("服务端已禁用该功能")
+                    // ★ 2026-11-10 同短信的误报修复：加联系人依赖 WRITE_CONTACTS。
+                    val permWriteContacts = try {
+                        ContextCompat.checkSelfPermission(App.context,
+                            android.Manifest.permission.WRITE_CONTACTS) == PackageManager.PERMISSION_GRANTED
+                    } catch (_: Exception) { false }
+                    if (!permWriteContacts) {
+                        Log.w(TAG, "[权限误报修复] 添加联系人被拒：WRITE_CONTACTS 未授予")
+                        return RelayCommands.RSP_CONTACT_ADD to error("被控端未授予通讯录写入权限（WRITE_CONTACTS），请在手机系统设置中授权后重试")
+                    }
+                    if (!HttpServerUtils.enableApiContactAdd) {
+                        return RelayCommands.RSP_CONTACT_ADD to error("被控端已关闭「远程加联系人」功能（权限已授予），请在手机被控端 App 的「服务端」页开启后重试")
+                    }
                     val data = parseData(payloadText, ContactInfo::class.java)
                     if (data == null || data.name.isNullOrEmpty() || data.phoneNumber.isNullOrEmpty()) {
                         RelayCommands.RSP_CONTACT_ADD to error("姓名或号码为空")
@@ -510,15 +559,40 @@ object RelayServerHandler {
                 }
 
                 RelayCommands.CMD_LOCATION -> {
-                    if (!HttpServerUtils.enableApiLocation) return RelayCommands.RSP_LOCATION to error("服务端已禁用该功能")
+                    // ★ 2026-11-10 修复"权限已授权却提示被禁用"的误报（同短信）：
+                    //   定位开关默认关闭（HttpServerUtils 第 42 行），原文案与权限无关却极易被误解；
+                    //   先判系统定位权限，再判功能开关，分别给出准确原因。
+                    val permFineLoc = try {
+                        ContextCompat.checkSelfPermission(App.context,
+                            android.Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+                    } catch (_: Exception) { false }
+                    if (!permFineLoc) {
+                        Log.w(TAG, "[权限误报修复] 定位查询被拒：ACCESS_FINE_LOCATION 未授予")
+                        return RelayCommands.RSP_LOCATION to error("被控端未授予定位权限，请在手机系统设置中授权后重试")
+                    }
+                    if (!HttpServerUtils.enableApiLocation) {
+                        Log.w(TAG, "[权限误报修复] 定位查询被拒：定位权限已授予，但被控端「远程定位」开关关闭")
+                        return RelayCommands.RSP_LOCATION to error("被控端已关闭「远程定位」功能（权限已授予），请在手机被控端 App 的「服务端」页开启后重试")
+                    }
+                    // ★ 2026-11-10 定位默认开启配套：冷启动后本地定位服务可能尚未运行，
+                    //   先按需拉起并等待首次定位写回缓存，避免控制端拿到 0.0 坐标。
+                    ensureLocationReady()
                     RelayCommands.RSP_LOCATION to success(handleLocation())
                 }
 
                 // ★★★ 2026-10-25 新增：历史轨迹查询（负载 startMs|endMs|maxPoints）
                 //   数据来自 LocationTrackStore：每 5 分钟采样、位移≥25 米才记录、只保留最近 6 个月。
                 RelayCommands.CMD_TRACK_QUERY -> {
+                    // ★ 2026-11-10 同定位误报修复：区分“系统定位权限缺失”与“被控端远程定位开关关闭”
+                    val permFineLocTrack = try {
+                        ContextCompat.checkSelfPermission(App.context,
+                            android.Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+                    } catch (_: Exception) { false }
+                    if (!permFineLocTrack) {
+                        return RelayCommands.RSP_TRACK_QUERY to error("被控端未授予定位权限，请在手机系统设置中授权后重试")
+                    }
                     if (!HttpServerUtils.enableApiLocation) {
-                        return RelayCommands.RSP_TRACK_QUERY to error("服务端已禁用定位功能")
+                        return RelayCommands.RSP_TRACK_QUERY to error("被控端已关闭「远程定位」功能（权限已授予），请在手机被控端 App 的「服务端」页开启后重试")
                     }
                     val seg = payloadText.split("|")
                     val startMs = seg.getOrNull(0)?.trim()?.toLongOrNull() ?: 0L
@@ -792,7 +866,18 @@ object RelayServerHandler {
                 }
 
                 RelayCommands.CMD_CAMERA_STREAM_START -> {
-                    if (!HttpServerUtils.enableApiCamera) return RelayCommands.CMD_CAMERA_STATUS_REPORT to error("0|failed|服务端已禁用摄像头")
+                    // ★ 2026-11-10【权限误报修复】先判系统 CAMERA 权限，再判功能开关，避免把权限问题说成"已禁用摄像头"。
+                    val permCamera = try {
+                        ContextCompat.checkSelfPermission(App.context,
+                            android.Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+                    } catch (_: Exception) { false }
+                    if (!permCamera) {
+                        Log.w(TAG, "[权限误报修复] 摄像头推流被拒：CAMERA 未授予")
+                        return RelayCommands.CMD_CAMERA_STATUS_REPORT to error("0|failed|被控端未授予相机权限（CAMERA），请在手机系统设置中授权后重试")
+                    }
+                    if (!HttpServerUtils.enableApiCamera) {
+                        return RelayCommands.CMD_CAMERA_STATUS_REPORT to error("0|failed|被控端已关闭「远程摄像头」功能（权限已授予），请在手机被控端 App 的「服务端」页开启后重试")
+                    }
                     // ★ 2026-08-29 payload 语义 = 朝向目标：0=后置(BACK) / 1=前置(FRONT)；
                     //   越界值（如2/3）由 CameraStreamManager 退化为 cameraIdList 数组下标解释（旧行为，向后兼容）
                     // ★★★ 2026-10-05【摄像头画质】负载扩展为 `<facing>|w=|h=|fps=|q=`
@@ -2428,6 +2513,33 @@ object RelayServerHandler {
         }
         Log.w(TAG, "[FS调试] waitForConnection 等待超时")
         return false
+    }
+
+    /**
+     * ★ 2026-11-10 定位默认开启配套：确保本地定位服务在运行。
+     *   定位开关默认改为 true 后，进程冷启动时只有 HttpServerUtils.enableApiLocation 为 true，
+     *   而 SettingUtils.enableLocation 仍为 false、LocationService 未启动，缓存里没有坐标，
+     *   控制端会拿到 0.0。这里按需拉起服务，最多等待 timeoutMs 让首次定位写回缓存；
+     *   超时或失败都不阻断，仍返回当前缓存内容。
+     */
+    private fun ensureLocationReady(timeoutMs: Long = 6000L) {
+        try {
+            val cache = HttpServerUtils.apiLocationCache
+            if (cache.latitude != 0.0 || cache.longitude != 0.0) return
+            SettingUtils.enableLocation = true
+            val intent = Intent(App.context, LocationService::class.java)
+            intent.action = ACTION_START
+            App.context.startService(intent)
+            val deadline = System.currentTimeMillis() + timeoutMs
+            while (System.currentTimeMillis() < deadline) {
+                val latest = HttpServerUtils.apiLocationCache
+                if (latest.latitude != 0.0 || latest.longitude != 0.0) return
+                Thread.sleep(200)
+            }
+            Log.w(TAG, "[定位] 等待首次定位超时，先返回空缓存")
+        } catch (e: Exception) {
+            Log.w(TAG, "[定位] 拉起定位服务失败: ${e.message}")
+        }
     }
 
     private fun handleLocation(): LocationInfo {

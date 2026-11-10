@@ -1,10 +1,13 @@
 package cn.ppps.forwarder
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Application
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.location.Geocoder
+import androidx.core.content.ContextCompat
 import androidx.multidex.MultiDex
 import androidx.work.Configuration
 import cn.ppps.forwarder.core.Core
@@ -12,6 +15,7 @@ import cn.ppps.forwarder.entity.SimInfo
 import cn.ppps.forwarder.service.LocationService
 import cn.ppps.forwarder.service.RelayServerService
 import cn.ppps.forwarder.utils.ACTION_START
+import cn.ppps.forwarder.utils.HttpServerUtils
 import cn.ppps.forwarder.utils.Log
 import cn.ppps.forwarder.utils.RelaySettings
 import cn.ppps.forwarder.utils.SettingUtils
@@ -66,6 +70,63 @@ class App : Application(), Configuration.Provider by Core {
         MultiDex.install(this)
     }
 
+    /**
+     * ★ 2026-11-10【权限误报修复】一次性纠正历史误关的远程查询开关。
+     * 背景：旧版 checkReadSmsPermission / checkLocationPermission 在系统权限弹窗被拒时，
+     * 会把 enable_api_sms_query / enable_api_location 落盘为 false；用户事后在系统设置里补授权后，
+     * 控制端仍永久提示"被控端已关闭该功能"，形成"权限已授权却提示禁用"的误报。
+     * 这里仅在开关为 false 且权限确实已授予时恢复为 true，并只执行一次（标记落盘），
+     * 不影响用户之后主动关闭开关。
+     */
+    private fun migrateRemoteQuerySwitchesIfNeeded() {
+        try {
+            val sp = createDeviceProtectedStorageContext()
+                .getSharedPreferences("permission_misreport_fix", Context.MODE_PRIVATE)
+            fun granted(permission: String): Boolean =
+                try {
+                    ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
+                } catch (_: Exception) {
+                    false
+                }
+
+            if (!sp.getBoolean("v1_done", false)) {
+                if (granted(Manifest.permission.READ_SMS) && !HttpServerUtils.enableApiSmsQuery) {
+                    HttpServerUtils.enableApiSmsQuery = true
+                    Log.i(TAG, "[权限误报修复] READ_SMS 已授予，恢复「远程短信查询」开关为开启")
+                }
+                if (granted(Manifest.permission.ACCESS_FINE_LOCATION) && !HttpServerUtils.enableApiLocation) {
+                    HttpServerUtils.enableApiLocation = true
+                    Log.i(TAG, "[权限误报修复] 定位权限已授予，恢复「远程定位」开关为开启")
+                }
+                sp.edit().putBoolean("v1_done", true).apply()
+            }
+
+            // ★ 2026-11-10 扩展：通话/联系人/相机 同样存在“弹窗被拒即永久落盘 false”的历史误关，
+            //   权限已授予而开关仍为 false 时一次性恢复。用 v2 标记，保证已跑过 v1 的老设备也会执行。
+            if (!sp.getBoolean("v2_done", false)) {
+                if (granted(Manifest.permission.READ_CALL_LOG) && !HttpServerUtils.enableApiCallQuery) {
+                    HttpServerUtils.enableApiCallQuery = true
+                    Log.i(TAG, "[权限误报修复] READ_CALL_LOG 已授予，恢复「远程查通话」开关为开启")
+                }
+                if (granted(Manifest.permission.READ_CONTACTS) && !HttpServerUtils.enableApiContactQuery) {
+                    HttpServerUtils.enableApiContactQuery = true
+                    Log.i(TAG, "[权限误报修复] READ_CONTACTS 已授予，恢复「远程查联系人」开关为开启")
+                }
+                if (granted(Manifest.permission.WRITE_CONTACTS) && !HttpServerUtils.enableApiContactAdd) {
+                    HttpServerUtils.enableApiContactAdd = true
+                    Log.i(TAG, "[权限误报修复] WRITE_CONTACTS 已授予，恢复「远程加联系人」开关为开启")
+                }
+                if (granted(Manifest.permission.CAMERA) && !HttpServerUtils.enableApiCamera) {
+                    HttpServerUtils.enableApiCamera = true
+                    Log.i(TAG, "[权限误报修复] CAMERA 已授予，恢复「远程摄像头」开关为开启")
+                }
+                sp.edit().putBoolean("v2_done", true).apply()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "[权限误报修复] 开关迁移失败: ${e.message}")
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
 
@@ -93,6 +154,8 @@ class App : Application(), Configuration.Provider by Core {
         try {
             context = applicationContext
             initLibs()
+            // ★ 2026-11-10【权限误报修复】纠正旧版因权限弹窗被拒而误关的短信/定位开关
+            migrateRemoteQuerySwitchesIfNeeded()
 
             // ★ 2026-08-16 Tailscale 集成：启动 VPN 后端 + authkey 无 UI 登录
             cn.ppps.forwarder.tailscale.TailscaleManager.ensureStarted(this)

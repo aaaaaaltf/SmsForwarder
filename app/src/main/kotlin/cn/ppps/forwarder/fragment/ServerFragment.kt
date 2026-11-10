@@ -263,13 +263,15 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         binding!!.sbApiQueryContacts.isChecked = HttpServerUtils.enableApiContactQuery
         binding!!.sbApiQueryContacts.setOnCheckedChangeListener { _: CompoundButton?, isChecked: Boolean ->
             HttpServerUtils.enableApiContactQuery = isChecked
-            if (isChecked) checkContactsPermission()
+            // ★ 2026-11-10：查联系人只申请 READ_CONTACTS，不因「写」被拒连带影响查询功能
+            if (isChecked) checkContactsPermission(forAdd = false)
         }
 
         binding!!.sbApiAddContacts.isChecked = HttpServerUtils.enableApiContactAdd
         binding!!.sbApiAddContacts.setOnCheckedChangeListener { _: CompoundButton?, isChecked: Boolean ->
             HttpServerUtils.enableApiContactAdd = isChecked
-            if (isChecked) checkContactsPermission()
+            // ★ 2026-11-10：加联系人才申请 READ + WRITE_CONTACTS
+            if (isChecked) checkContactsPermission(forAdd = true)
         }
 
         binding!!.sbApiLocation.isChecked = HttpServerUtils.enableApiLocation
@@ -661,10 +663,13 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                         if (doNotAskAgain) {
                             XToastUtils.error(R.string.toast_denied_never)
                             XXPermissions.startPermissionActivity(requireContext(), deniedList)
+                        } else {
+                            XToastUtils.error(R.string.toast_denied)
                         }
-                        XToastUtils.error(R.string.toast_denied)
-                        HttpServerUtils.enableApiSmsQuery = false
-                        binding!!.sbApiQuerySms.isChecked = false
+                        // ★ 2026-11-10【权限误报修复】权限请求被拒时不再自动关闭功能开关。
+                        //   原实现会把 enable_api_sms_query 落盘为 false，用户事后在系统设置里
+                        //   补授权后，控制端仍永久提示“已关闭「远程短信查询」功能”，形成误报。
+                        //   开关只由用户手动控制；权限是否可用在收到查询命令时实时判定。
                     }
                 }
             })
@@ -684,37 +689,47 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                         if (doNotAskAgain) {
                             XToastUtils.error(R.string.toast_denied_never)
                             XXPermissions.startPermissionActivity(requireContext(), deniedList)
+                        } else {
+                            XToastUtils.error(R.string.toast_denied)
                         }
-                        XToastUtils.error(R.string.toast_denied)
-                        HttpServerUtils.enableApiCallQuery = false
-                        binding!!.sbApiQueryCall.isChecked = false
+                        // ★ 2026-11-10【权限误报修复】权限请求被拒时不再自动关闭「远程查通话」开关。
+                        //   原实现会把 enable_api_call_query 落盘为 false，用户事后在系统设置里补授权后，
+                        //   控制端仍永久提示“服务端已禁用该功能”，形成“权限已授权却提示禁用”的误报。
+                        //   开关只由用户手动控制；权限是否可用在收到查询命令时实时判定。
                     }
                 }
             })
     }
 
     //联系人权限
-    private fun checkContactsPermission() {
-        XXPermissions.with(this)
+    // ★ 2026-11-10【权限误报修复】查询与添加分开授权：
+    //   查询只需 READ_CONTACTS，添加才需要 READ + WRITE_CONTACTS。
+    //   旧实现两个开关共用一个函数（同时申请读+写），用户只拒绝「写」时，
+    //   连「远程查联系人」开关也会被永久关闭，形成“权限已授权却提示禁用”的误报。
+    private fun checkContactsPermission(forAdd: Boolean = true) {
+        val builder = XXPermissions.with(this)
             .permission(PermissionLists.getReadContactsPermission())
-            .permission(PermissionLists.getWriteContactsPermission())
-            .request(object : OnPermissionCallback {
-                override fun onResult(grantedList: MutableList<IPermission>, deniedList: MutableList<IPermission>) {
-                    val allGranted = deniedList.isEmpty()
-                    if (!allGranted) {
-                        val doNotAskAgain = XXPermissions.isDoNotAskAgainPermissions(requireActivity(), deniedList)
-                        if (doNotAskAgain) {
-                            XToastUtils.error(R.string.toast_denied_never)
-                            XXPermissions.startPermissionActivity(requireContext(), deniedList)
-                        }
+        if (forAdd) {
+            builder.permission(PermissionLists.getWriteContactsPermission())
+        }
+        builder.request(object : OnPermissionCallback {
+            override fun onResult(grantedList: MutableList<IPermission>, deniedList: MutableList<IPermission>) {
+                val allGranted = deniedList.isEmpty()
+                if (!allGranted) {
+                    val doNotAskAgain = XXPermissions.isDoNotAskAgainPermissions(requireActivity(), deniedList)
+                    if (doNotAskAgain) {
+                        XToastUtils.error(R.string.toast_denied_never)
+                        XXPermissions.startPermissionActivity(requireContext(), deniedList)
+                    } else {
                         XToastUtils.error(R.string.toast_denied)
-                        HttpServerUtils.enableApiContactQuery = false
-                        HttpServerUtils.enableApiContactAdd = false
-                        binding!!.sbApiQueryContacts.isChecked = false
-                        binding!!.sbApiAddContacts.isChecked = false
                     }
+                    // ★ 2026-11-10【权限误报修复】不再自动关闭「远程查联系人 / 远程加联系人」开关。
+                    //   原实现会把 enable_api_contact_query / enable_api_contact_add 落盘为 false，
+                    //   用户事后补授权后控制端仍永久提示“服务端已禁用该功能”。
+                    //   开关只由用户手动控制；权限是否可用在收到命令时实时判定。
                 }
-            })
+            }
+        })
     }
 
     //定位权限
@@ -732,10 +747,11 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                         if (doNotAskAgain) {
                             XToastUtils.error(R.string.toast_denied_never)
                             XXPermissions.startPermissionActivity(requireContext(), deniedList)
+                        } else {
+                            XToastUtils.error(R.string.toast_denied)
                         }
-                        XToastUtils.error(R.string.toast_denied)
-                        HttpServerUtils.enableApiLocation = false
-                        binding!!.sbApiLocation.isChecked = false
+                        // ★ 2026-11-10【权限误报修复】同短信：权限请求失败不再自动关闭「远程定位」开关，
+                        //   避免用户补授权后仍被“已关闭该功能”拦截（定位默认开启已被误关过一次）。
                     }
                 }
             })
@@ -753,10 +769,12 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                         if (doNotAskAgain) {
                             XToastUtils.error(R.string.toast_denied_never)
                             XXPermissions.startPermissionActivity(requireContext(), deniedList)
+                        } else {
+                            XToastUtils.error(R.string.toast_denied)
                         }
-                        XToastUtils.error(R.string.toast_denied)
-                        HttpServerUtils.enableApiCamera = false
-                        binding!!.sbApiCamera.isChecked = false
+                        // ★ 2026-11-10【权限误报修复】权限请求被拒时不再自动关闭「远程摄像头」开关。
+                        //   原实现会把 enable_api_camera 落盘为 false，用户事后补授权后仍提示“已禁用摄像头”。
+                        //   开关只由用户手动控制；权限是否可用在收到推流命令时实时判定。
                     }
                 }
             })
@@ -774,8 +792,9 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                         if (doNotAskAgain) {
                             XToastUtils.error(R.string.toast_denied_never)
                             XXPermissions.startPermissionActivity(requireContext(), deniedList)
+                        } else {
+                            XToastUtils.error("麦克风权限未授予，远程监听功能不可用")
                         }
-                        XToastUtils.error("麦克风权限未授予，远程监听功能不可用")
                     } else {
                         XToastUtils.success("麦克风权限已授权")
                     }
@@ -823,6 +842,18 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         //   不再只做 POST_NOTIFICATIONS 运行时申请 —— 真机上"运行时权限已授予但通知总开关被关"
         //   时旧逻辑只弹 toast「已授权」，用户看不到任何设置页。
         val ctx = requireContext()
+        // ★ 2026-11-10 用户要求：通知是"要求关闭"的项。
+        //   点击授权按钮或自动授权过程中，只有**检测到通知开关仍处于开启状态**时才弹出系统通知设置页；
+        //   已确认关闭（或无法检测）时不再弹窗，避免无意义地打断用户。
+        val notifyEnabled = cn.ppps.forwarder.permission.PermissionProbe.areNotificationsEnabledOrNull(ctx)
+        if (notifyEnabled != true) {
+            XToastUtils.toast(
+                if (notifyEnabled == false) "通知已关闭，无需再打开设置页"
+                else "无法检测通知状态，请手动确认通知已关闭"
+            )
+            Log.i(TAG, "通知检查：状态=${notifyEnabled?.toString() ?: "无法检测"}，不弹出通知设置页")
+            return
+        }
         markSystemUiHandoff()
         when (cn.ppps.forwarder.permission.PermissionRequests.openNotificationSettings(ctx)) {
             cn.ppps.forwarder.permission.OpenResult.OPENED ->
@@ -1277,15 +1308,13 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
 
             // ★ 新增：通知权限（Android 13+ 前台服务/被控端状态显示都需要）
             // ★★★ 2026-11-08 用户要求：启动自动授权时，通知**已关闭就不要再导航**通知设置页
-            //   （本项目的就是关闭通知）；只有通知仍开启（或无法检测）时才跳系统通知页引导关闭。
+            //   （本项目的就是关闭通知）。
+            // ★ 2026-11-10 统一收敛：是否弹窗由 checkNotificationPermission 内部判定 ——
+            //   只有检测到通知仍开启才弹，避免两处判据不一致。
             handler.postDelayed({
-                try {
-                    if (cn.ppps.forwarder.permission.PermissionProbe.areNotificationsEnabledOrNull(requireContext()) != false) {
-                        checkNotificationPermission()
-                    } else {
-                        Log.i(TAG, "★ 一键授权：通知已关闭，跳过通知设置页导航")
-                    }
-                } catch (e: Exception) { Log.e(TAG, "通知权限请求异常: ${e.message}") }
+                try { checkNotificationPermission() } catch (e: Exception) {
+                    Log.e(TAG, "通知权限请求异常: ${e.message}")
+                }
             }, 3500)
 
             // ★ 新增：CALL_PHONE 权限（直接拨号远程发起呼叫场景）
@@ -1605,7 +1634,9 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             //   未完成项（自启动），再引导关闭通知；避免红米上一点就跳"通知设置"让人觉得跳错页。
             //   Android 不允许 App 自己关通知开关，只能跳到系统通知设置让用户点一次；
             //   关闭后前台服务照常运行（渠道已降为 IMPORTANCE_MIN，即使开着也无声音/无状态栏图标）。
-            if (cn.ppps.forwarder.permission.PermissionProbe.areNotificationsEnabledOrNull(ctx) != false) {
+            // ★ 2026-11-10 用户要求：只有**检测到通知仍开启**时才导航到系统通知设置页；
+            //   已确认关闭或无法检测时都不再弹窗（避免无意义打断）。
+            if (cn.ppps.forwarder.permission.PermissionProbe.areNotificationsEnabledOrNull(ctx) == true) {
                 if (autoManualPrompted.add("notification_off")) {
                     lastAutoManualJumpTime = now
                     Log.i(TAG, "★ 自动授权继续：引导关闭本应用通知（通知未关闭前不会提示授权完成）")
@@ -1765,8 +1796,10 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             Log.w(TAG, "「安装未知应用」设置页打不开($r)，继续下一项")
         }
 
-        // 2.8 通知（★ 2026-11-08 用户要求关闭；无法检测时也显示并导航，关闭后前台服务照常运行）
-        if (cn.ppps.forwarder.permission.PermissionProbe.areNotificationsEnabledOrNull(ctx) != false) {
+        // 2.8 通知（★ 2026-11-08 用户要求关闭）
+        // ★ 2026-11-10 用户要求：只有**检测到通知仍开启**时才弹系统通知设置页；
+        //   已关闭或无法检测时不再跳转。
+        if (cn.ppps.forwarder.permission.PermissionProbe.areNotificationsEnabledOrNull(ctx) == true) {
             pendingItems.add("通知")
             val r = cn.ppps.forwarder.permission.PermissionRequests.openNotificationSettings(ctx)
             if (r == cn.ppps.forwarder.permission.OpenResult.OPENED) {
