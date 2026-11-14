@@ -135,8 +135,20 @@ class ScreenWebRtcCapturer(private val appContext: Context,
         //   于是设置里调到"省流"对手机被控端的高清通路**毫无影响**。
         //   现在取 min(请求尺寸, 人为上限, 1f)：两者都只缩不放 ⇒ 给小值永远安全，
         //   小手机屏幕（本身小于上限）也不会被放大导致模糊。
-        val scale = minOf(width.toFloat() / dw, height.toFloat() / dh,
-                          maxW.toFloat() / dw, maxH.toFloat() / dh, 1f)
+        // ★★★ 2026-11-14【真机】竖屏相册/微信"一片灰白模糊块"的根因：
+        //   档位 1280×720 说的是「长边 1280 / 短边 720」，旧实现却把 720 直接当成**高度**上限。
+        //   红米 1080×2400 竖屏 ⇒ scale=720/2400=0.30 ⇒ 354×720（25 万像素），
+        //   控制端再放大到全屏，文字与缩略图被插值成灰白色块（本机清晰、远端全糊）。
+        //   修法：请求框与人为上限都按「长边/短边」解释，与屏幕方向无关；仍只缩不放。
+        //   横屏 2400×1080 的计算结果与原实现逐值相同（1280×576），不改动既有行为。
+        val reqLong = maxOf(width, height).toFloat()
+        val reqShort = minOf(width, height).toFloat()
+        val capLong = maxOf(maxW, maxH).toFloat()
+        val capShort = minOf(maxW, maxH).toFloat()
+        val screenLong = maxOf(dw, dh).toFloat()
+        val screenShort = minOf(dw, dh).toFloat()
+        val scale = minOf(reqLong / screenLong, reqShort / screenShort,
+                          capLong / screenLong, capShort / screenShort, 1f)
         // ★ 注意：本方法的参数 width/height 与类的字段同名，赋值/读取字段必须写 this. 前缀
         //   （首版漏写 → Kotlin 报 "Val cannot be reassigned"，因为它赋值到的是参数 val）。
         this.width = evenDown((dw * scale).toInt().coerceAtLeast(320))
@@ -145,6 +157,9 @@ class ScreenWebRtcCapturer(private val appContext: Context,
                 + "（人为上限 ${maxW}x${maxH}，请求尺寸 ${width}x${height}）")
         frameIntervalNs = (1_000_000_000L / framerate.coerceIn(1, 60))
         lastPushedNs = 0L
+        // ★ 2026-11-14 换流即清共用检测器的历史签名/时间基准，避免 JPEG 路留下的
+        //   lastSentAt 污染本路 2 秒保活节拍（静止时长期只剩首帧）。
+        FrameChangeDetector.screen.reset()
         rgbaRow = ByteArray(this.width * 4)
         yRow = ByteArray(this.width)
         uRow = ByteArray(this.width / 2)
@@ -264,13 +279,18 @@ class ScreenWebRtcCapturer(private val appContext: Context,
             val nowNs = System.nanoTime()
             if (nowNs - lastPushedNs < frameIntervalNs) return
             lastPushedNs = nowNs
+            // ★★★ 2026-11-14 共用 FrameChangeDetector.screen 的两路时间基准必须一致：
+            //   JPEG 路 shouldSendBytes() 默认用 SystemClock.elapsedRealtime()，旧代码这里传
+            //   nanoTime/1e6（另一套单调时钟，不含 deep sleep），共享 lastSentAt ⇒ 2 秒保活帧
+            //   被算成"刚发过"而永久跳过，静止画面长期只剩那一帧（真机 0 kbps/灰白模糊）。
+            val nowMs = android.os.SystemClock.elapsedRealtime()
             // ★★★ 2026-10-07【屏幕 WebRTC 的"静止不传数据"= 静止时降帧率】
             //   策略与 PC 侧 screen_webrtc.py **完全一致**，判据也用**同一份** FrameChangeDetector：
             //     画面未变 ⇒ 丢帧，直到 ~1fps 的保活节拍才发一帧；有变化 ⇒ 立刻恢复满帧率。
             //   ★ 位置在 RGBA→I420 转换**之前**：静止时连最贵的整屏转换都省掉（省 CPU 又省带宽）。
             //   ★ 为什么不整个不发：控制端有"8 秒零帧 → 回退"和 15 秒停滞检测；1fps 保活让它们
             //     都看到链路活着，用户看到的是"画面停住"而不是"断流"。
-            if (!FrameChangeDetector.screen.shouldSendRgba(image, nowNs / 1_000_000L)) {
+            if (!FrameChangeDetector.screen.shouldSendRgba(image, nowMs)) {
                 try {
                     image.close()
                 } catch (_: Throwable) {

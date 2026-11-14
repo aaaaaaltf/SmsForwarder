@@ -51,6 +51,13 @@ class RelayServerService : Service() {
     private val TAG = "RelayServerService"
     private var client: RelayServerClient? = null
 
+    // ★★★ 2026-11-14【切回中继强制重建】真机：直连→中继后只停直连任务、沿用旧 client，
+    //   服务器没有收到新的 regsms 注册帧 ⇒ 控制端只能靠"共享中继回放"看到旧条目，时有时无。
+    private var relayClientFactory: (() -> RelayServerClient)? = null
+    private var lastModeRelayOn: Boolean? = null
+    private var relayDownSince: Long = 0L
+    private var lastRelayRebuildAt: Long = 0L
+
     /** ★ 2026-10-26【网络恢复 → 立即重连中继】默认网络变化回调（见 registerNetRecoveryCallback） */
     private var netCallback: android.net.ConnectivityManager.NetworkCallback? = null
     private var listener: RelayServerListener? = null
@@ -85,6 +92,12 @@ class RelayServerService : Service() {
 
         /** ★ 省电：灭屏且无控制端连接时的状态上报间隔 */
         private const val STATE_REPORT_IDLE_MS = 30000L
+
+        /** ★★★ 2026-11-14 中继会话连续离线多久才强制重拨重注册（状态节拍 5s，故 10s = 两轮） */
+        private const val RELAY_DOWN_REBUILD_MS = 10_000L
+
+        /** ★ 两次强制重建的最小间隔，避免状态节拍/网络回调叠加造成"连上就被自己打断" */
+        private const val RELAY_REBUILD_MIN_INTERVAL_MS = 20_000L
 
         /**
          * ★★★ 2026-10-25【立即唤醒直连扫描】当前运行中的服务实例。
@@ -470,7 +483,9 @@ class RelayServerService : Service() {
 
         // ★ 中继云优先（2026-08-05）：被控端始终主动连接中继（更稳定，控制端优先显示云服务），
         //   中继不可达时由直连监听(56786) + TS直连扫描器(56789)兜底
-        val c = RelayServerClient(
+        // ★★★ 2026-11-14【切回中继强制重建】新建 client 收成可复用工厂：
+        //   relayst=on 时要关旧 socket → 重拨 → 重新发 regsms 注册帧，不能沿用旧连接。
+        fun createRelayClientLocal(): RelayServerClient = RelayServerClient(
             host = RelaySettings.relayHost,
             port = RelaySettings.relayServerPort,
             onConnected = onConnected,
@@ -480,6 +495,8 @@ class RelayServerService : Service() {
             //   只影响"连不上时的重试频率"，已建立连接的收发、命令响应、文件传输通路完全不变。
             isBusy = { isBusyNow() },
         )
+        relayClientFactory = ::createRelayClientLocal
+        val c = createRelayClientLocal()
         c.start()
         client = c
         // 摄像头推流复用中继连接发送视频帧（直连预览时被控端视频仍经中继56788推流）
@@ -809,6 +826,66 @@ class RelayServerService : Service() {
         }
     }
 
+    /** ★★★ 2026-11-14【切回中继强制重建】关旧 socket → 重拨 → 重新发 regsms 注册帧。
+     *  直连模式下被控端仍保留到中继的 client 连接（唯一用途是接收 relayst 总闸）；
+     *  切回中继时若只停直连任务、沿用这条连接，服务器就不会重新登记它，控制端只能
+     *  靠"共享中继回放"看到旧条目 ⇒ 真机表现为列表时有时无、点进去连不上。 */
+    private fun forceRebuildRelay(reason: String) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            lifecycleHandler.post { forceRebuildRelay(reason) }
+            return
+        }
+        if (liveInstance !== this || !isRunning) return
+        val factory = relayClientFactory ?: return
+        val now = System.currentTimeMillis()
+        if (now - lastRelayRebuildAt < RELAY_REBUILD_MIN_INTERVAL_MS) {
+            Log.i(TAG, "★ 重建中继会话($reason) 跳过：距上次重建不足 20s")
+            return
+        }
+        lastRelayRebuildAt = now
+        relayDownSince = 0L
+        Log.i(TAG, "★ 重建中继会话（$reason）：关闭旧连接并重新注册")
+        try {
+            client?.stop()
+        } catch (t: Throwable) {
+            Log.w(TAG, "关闭旧中继连接异常(忽略): ${t.message}")
+        }
+        client = null
+        try {
+            val c = factory()
+            c.start()
+            client = c
+            cn.ppps.forwarder.relay.CameraStreamManager.setClient(c)
+        } catch (e: Exception) {
+            Log.w(TAG, "★ 重建中继会话失败: ${e.message}")
+        }
+    }
+
+    /** ★★★ 2026-11-14【会话看门狗】中继模式下每轮状态节拍检查会话是否真的在线。
+     *  ★ relayDownSince 只在这里按"在线"清零，绝不在 applyModeExclusivity 里无条件清零 ——
+     *    状态节拍 5s 一轮，每轮清零就永远凑不满 10s（2026-11-04 4.236 踩过的坑）。 */
+    private fun watchdogRelaySession() {
+        if (!isRelayModeOn()) {
+            relayDownSince = 0L
+            return
+        }
+        val c = client
+        if (c != null && c.isConnected()) {
+            relayDownSince = 0L
+            return
+        }
+        val now = System.currentTimeMillis()
+        if (relayDownSince == 0L) {
+            relayDownSince = now
+            Log.i(TAG, "★ 中继看门狗：会话不在线，开始计时")
+            return
+        }
+        if (now - relayDownSince >= RELAY_DOWN_REBUILD_MS) {
+            Log.i(TAG, "★ 中继看门狗：会话已离线 ${now - relayDownSince}ms，触发重建")
+            forceRebuildRelay("看门狗:会话不在线")
+        }
+    }
+
     private fun applyModeExclusivity(reason: String) {
         // 与 onDestroy 串行，入口检查和资源启停之间不能穿插销毁。
         if (Looper.myLooper() != Looper.getMainLooper()) {
@@ -817,6 +894,10 @@ class RelayServerService : Service() {
         }
         if (liveInstance !== this || !isRunning) return
         val relayOn = isRelayModeOn()
+        // ★ 2026-11-14：只在"真正切回中继"的跃迁（false→true）强制重建；
+        //   状态节拍每 5s 调一次本方法，relayOn 恒 true 时不得重复重建。
+        val prevRelayOn = lastModeRelayOn
+        lastModeRelayOn = relayOn
         if (relayOn) {
             listener?.let {
                 Log.i(TAG, "★ 模式互斥($reason)：中继模式 → 停止直连监听(56786)")
@@ -859,6 +940,10 @@ class RelayServerService : Service() {
             // ★ 2026-10-25：切直连后立刻唤醒扫描（不等下一轮 15~60 秒，也不受 60s 冷却限制）
             kickDirectScan("mode-switch:$reason")
         }
+        // ★★★ 2026-11-14 relayst=on（直连→中继）到达时立刻重拨重注册，不等看门狗。
+        if (relayOn && prevRelayOn == false) {
+            forceRebuildRelay("切回中继($reason)")
+        }
     }
 
     /** 启动设备状态周期上报定时器：忙时每5秒，待机时每30秒发送 devstate0000（名称|锁屏|屏幕|电量|充电） */
@@ -885,6 +970,8 @@ class RelayServerService : Service() {
                         // ★★★ 2026-10-04【模式互斥·兜底裁决】每轮状态上报都重新对齐一次（幂等、零额外开销），
                         //   覆盖"同机控制端广播 RELAY_STATE_CHANGED"等不经本服务回调的状态来源。
                         applyModeExclusivity("状态节拍")
+                        // ★ 2026-11-14 会话看门狗：中继开关=开但会话半死时，连续离线 10s 才重拨重注册
+                        watchdogRelaySession()
                         // ★ 2026-11-05【被控端去 VPN】用户态节点自愈（幂等）：
                         //   没有 VPN 看门狗后，节点首次未起来或中途掉线必须有人重试。
                         // ★ 2026-11-07：并行改动误删后恢复（否则 tsnet 掉线不会重建，56786 入站永久失效）。
@@ -992,6 +1079,9 @@ class RelayServerService : Service() {
         isRunning = false
         lifecycleHandler.removeCallbacksAndMessages(null)
         startDirectTasks = null
+        relayClientFactory = null
+        lastModeRelayOn = null
+        relayDownSince = 0L
         isConnected = false
         isControllerOnline = false
         // ★ 2026-08-25 停止VPN掉线恢复看门狗（服务停止后不再自动拉起VPN）

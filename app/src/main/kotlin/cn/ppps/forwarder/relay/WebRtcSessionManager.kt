@@ -1086,10 +1086,14 @@ class WebRtcSessionManager(
                                         //     下限 800k = 改造前的硬顶值（保证不因新公式反而变差）：
                                         //     640×480@10 → 0.3M ⇒ 取 800k（与改造前逐字一致）；
                                         //     1280×720@12 → 1.1M；1920×1080@12 → 2.5M。
-                                        //   ★ 屏幕通路**保持 800k 不变**：屏幕文本对码率远比摄像头敏感，
-                                        //     线上 27fps 已验证良好，不在本次改动范围内（最小爆炸半径）。
-                                        val bitCapBps = if (screenMode) 800_000
-                                        else maxOf(800_000, minOf(6_000_000, effCapW * effCapH * effCapFps / 10))
+                                        // ★★★ 2026-11-14【真机】竖屏采集尺寸修好后，800k 硬顶会把
+                                        //   576×1280 重新压回马赛克（L404-407 早已记过这个亏）。
+                                        //   屏幕路也随档位联动，但受中继媒体面吞吐约束夹在 [800k, 1.6M]：
+                                        //     saver 640×360@10 ⇒ 800k（与改造前逐字一致）；
+                                        //     hd 1280×720@20   ⇒ 1.6M；静止时仍近乎 0 输出。
+                                        val capTopBps = if (screenMode) 1_600_000 else 6_000_000
+                                        val bitCapBps = maxOf(800_000,
+                                                minOf(capTopBps, effCapW * effCapH * effCapFps / 10))
                                         for (enc in encs) {
                                             try { enc.scaleResolutionDownBy = 1.0 } catch (_: Throwable) {}
                                             enc.minBitrateBps = 100_000
