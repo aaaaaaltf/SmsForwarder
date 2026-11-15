@@ -56,6 +56,10 @@ class TailscaleDirectClient(
         return s.isConnected && !s.isClosed && !s.isInputShutdown && !s.isOutputShutdown
     }
 
+    /** ★ P7：连接线程是否在运行（含拨号/退避重试中）。isConnected 只反映 socket 已建立，
+     *  握手窗口内为 false；调用方据此避免把"正在连接"的客户端 stop 掉重建。 */
+    fun isRunning(): Boolean = running
+
     fun start() {
         if (running) return
         running = true

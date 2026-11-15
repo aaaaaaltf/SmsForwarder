@@ -37,7 +37,18 @@ class MainActivity : BaseActivity<ActivityMainBinding?>() {
         //     ① 口令不再删除；② 重建（savedInstanceState != null）一律视为已解锁，绝不重定向。
         val firstCreate = savedInstanceState == null
         val fromFake = isFromFake(intent)
-        allowRealUi = fromFake || !firstCreate
+        // ★★★ 2026-11-15【与 SplashActivity 同一修复】首次向导未完成时放行真实界面，
+        //   否则即便启动页放行，这里也会因 allowRealUi=false 立刻 redirectToFakeIfRunning()
+        //   把用户又踢回伪装页，ServerFragment.onResume 里的向导同样看不到。
+        val onboardPending = try {
+            !cn.ppps.forwarder.utils.SettingUtils.keepAliveOnboardDone
+        } catch (t: Throwable) {
+            false
+        }
+        allowRealUi = fromFake || !firstCreate || onboardPending
+        if (onboardPending && !fromFake) {
+            android.util.Log.i(TAG, "★ 首次授权向导未完成：主界面放行真实 UI")
+        }
         // ★ 2026-11-04：授权中跳系统设置页常被 MIUI 回收重建，停留态要跨重建保留，
         //   否则新实例 onStop 会立刻把界面 finish（=授权完成后自动退到后台）。
         authStayForeground = sAuthStayForeground

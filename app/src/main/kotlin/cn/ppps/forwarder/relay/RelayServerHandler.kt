@@ -807,7 +807,9 @@ object RelayServerHandler {
                     //   一直卡在"正在请求被控端屏幕…"（真机 2026-10-04 18:52 华为→红米 实测）。
                     //   ⇒ 统一走 selfDeviceName()，与 devstate / 列表显示完全同源。
                     val deviceName = selfDeviceName()
-                    // 负载格式与PC被控端一致: 版本|设备名|用户|isAdmin|isService（纯ASCII，编码安全）
+                    // 负载格式与PC被控端一致: 版本|设备名|用户|isAdmin|isService
+                    // ★ 设备名可含中文，本端按 UTF-8 发送；控制端须用 UTF-8 优先解码（decodeSmart），
+                    //   老控制端按 GBK 解码会出乱码（"绾㈢背K40"），不是"纯ASCII编码安全"。
                     // ★★★ 2026-10-04 尾部追加协商字段（老控制端按下标取前 5 段，多出来的字段被忽略）：
                     //   proto=本端协议版本；caps=屏幕能力位（控制端据此决定"屏幕用 WebRTC 高清还是 JPEG"）。
                     RelayCommands.CMD_VERSION_INFO to

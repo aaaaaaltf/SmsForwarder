@@ -661,9 +661,11 @@ class RelayServerService : Service() {
             return
         }
         // ★ 多控制端：每台控制端独立连接（与PC被控端_zt_direct_clients一致），已连接的直接复用
+        // ★ P7：握手/退避重试中的客户端也要复用——原实现只看 isConnected()，扫描器在拨号窗口内
+        //   再次触发会把正在连接的客户端 stop 掉重建，首条入向连接被自己的 stop() 杀死。
         val existing = tsDirectClients[phoneIp]
-        if (existing != null && existing.isConnected()) {
-            Log.i(TAG, "★ 已有到 $phoneIp 的TS直连，复用")
+        if (existing != null && (existing.isConnected() || existing.isRunning())) {
+            Log.i(TAG, "★ 已有到 $phoneIp 的TS直连（连接中或已连接），复用")
             return
         }
         existing?.let {

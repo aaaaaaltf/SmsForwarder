@@ -64,11 +64,25 @@ class SplashActivity : BaseSplashActivity(), CancelAdapt {
         } catch (t: Throwable) {
             false
         }
-        if (serviceRunning && !fromFake) {
+        // ★★★ 2026-11-15【启动授权修复·首次向导被伪装页挡掉】真机冷启动实测：
+        //   App.onCreate 无条件拉起服务，47.233 服务自检已完成、47.274 就判定"服务运行中"
+        //   ⇒ 直接进 FakeSettingsActivity，ServerFragment 从未加载 ⇒
+        //   maybeStartFirstLaunchOnboarding() 永不执行，新装用户看不到任何授权引导，
+        //   只能靠连点"关于手机"10 次（有权限/无权限两次冷启动均复现）。
+        //   首次向导未完成时必须先进真实界面，让用户看到"一键授权"。
+        val onboardPending = try {
+            !cn.ppps.forwarder.utils.SettingUtils.keepAliveOnboardDone
+        } catch (t: Throwable) {
+            false
+        }
+        if (serviceRunning && !fromFake && !onboardPending) {
             android.util.Log.i(TAG, "★ 服务运行中：启动页直接进伪装设置页")
             ActivityUtils.startActivity(FakeSettingsActivity::class.java)
             finish()
             return
+        }
+        if (onboardPending && !fromFake) {
+            android.util.Log.i(TAG, "★ 首次授权向导未完成：优先进入真实界面")
         }
         ActivityUtils.startActivity(MainActivity::class.java)
         finish()

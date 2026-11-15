@@ -473,6 +473,36 @@ object PermissionRequests {
         }
     }
 
+    /** ★★★ 2026-11-15【后台定位永远授不上】Fragment 通道重载。
+     *
+     *  真机实测（撤权后一键授权）：批量列表 11 项不含 background location；
+     *  批量发出后调用 Activity 版 requestBackgroundLocation，但此时前台定位尚未授予
+     *  ⇒ 首行直接 return，整份日志里没有任何后台定位申请记录（静默失败）。
+     *  即使已授予，Activity 通道的 requestCode 也不属于任何 Fragment，
+     *  Fragment.onRequestPermissionsResult 里的 REQ_BACKGROUND_LOCATION 分支永远收不到。
+     *  因此必须在 REQ_BATCH_RUNTIME 结果回调里用本重载（Fragment 通道）单独发起。
+     */
+    fun requestBackgroundLocation(fragment: androidx.fragment.app.Fragment): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return false
+        val ctx = try {
+            fragment.requireContext()
+        } catch (t: Throwable) {
+            return false
+        }
+        if (PermissionProbe.checkRuntime(ctx, PermissionInventory.BACKGROUND_LOCATION) == GrantState.GRANTED) return false
+        if (PermissionProbe.checkRuntime(ctx, "android.permission.ACCESS_FINE_LOCATION") != GrantState.GRANTED) return false
+        return try {
+            fragment.requestPermissions(
+                arrayOf(PermissionInventory.BACKGROUND_LOCATION), REQ_BACKGROUND_LOCATION
+            )
+            Log.i(TAG, "★ 批量结果后单独申请后台定位（Fragment 通道）")
+            true
+        } catch (t: Throwable) {
+            Log.w(TAG, "申请后台定位异常: ${t.message}")
+            false
+        }
+    }
+
     /** 悬浮窗授权页（ACTION_MANAGE_OVERLAY_PERMISSION + package: data）。 */
     fun openOverlaySettings(ctx: Context): OpenResult {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return OpenResult.NOT_NEEDED
