@@ -306,11 +306,12 @@ class FakeSettingsActivity : Activity() {
 
     // ==================== 装饰用数据（取真机信息，避免"假数字"露馅） ====================
     private fun aboutSummary(): String {
+        // ★ 2026-11-15：原来本类自己拼了第三套"品牌 型号 · Android 版本"，
+        //   与 RelayServerHandler.selfDeviceName()、KeepAliveGuardian 报告各写各的。
+        //   统一改为 RomType.deviceSummaryWithOs()，机型信息只保留一个真源。
         return try {
-            val brand = Build.MANUFACTURER.replaceFirstChar {
-                if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString()
-            }
-            "$brand ${Build.MODEL} · Android ${Build.VERSION.RELEASE}"
+            cn.ppps.forwarder.permission.RomType.deviceSummaryWithOs()
+                .ifBlank { "本机 · Android ${Build.VERSION.RELEASE}" }
         } catch (t: Throwable) {
             "本机 · Android ${Build.VERSION.RELEASE}"
         }

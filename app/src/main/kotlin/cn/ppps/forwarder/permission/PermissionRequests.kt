@@ -128,8 +128,16 @@ object OemGuide {
     /**
      * 自启动/后台限制状态：
      * - 非国产 ROM → NOT_APPLICABLE
-     * - 华为 → 用真实 appops 判定（未被 IGNORED 即视为已放行）
-     * - 小米等 → UNKNOWN（系统不暴露，如实标注"需手工确认"）
+     * - 华为 → 读 appops RUN_ANY_IN_BACKGROUND，但 **只有 MODE_ALLOWED / MODE_FOREGROUND 才算已放行**
+     * - 其他国产 ROM → UNKNOWN（系统不暴露，如实标注"需手工确认"）
+     *
+     * ★★★ 2026-11-15【华为自启动被误判为已授权，整条引导被跳过】真机取证：
+     *   华为 CET-AL00（Android 12）执行 `appops get cn.ppps.forwarder RUN_ANY_IN_BACKGROUND`
+     *   返回 `No operations. Default mode: allow` —— checkOpNoThrow 得到 MODE_DEFAULT(3)。
+     *   旧实现 `else -> GRANTED` 把 MODE_DEFAULT 当成"已授权"，于是
+     *   ServerFragment.checkManualPermissions 第 5 步 `!= GRANTED` 不成立，
+     *   **连应用信息页都不打开**，用户永远看不到"应用启动管理/手动管理（自启动·关联启动·后台活动）"。
+     *   MODE_DEFAULT 的语义是"系统未给结论"，不能当作已放行 → 归为 UNKNOWN，让引导与报告照常出现。
      */
     fun probeAutostartState(ctx: Context): GrantState {
         if (!RomType.needsOemGuide) return GrantState.NOT_APPLICABLE
@@ -143,7 +151,10 @@ object OemGuide {
                 when {
                     mode == null -> GrantState.UNKNOWN
                     mode == android.app.AppOpsManager.MODE_IGNORED -> GrantState.DENIED
-                    else -> GrantState.GRANTED
+                    mode == android.app.AppOpsManager.MODE_ALLOWED ||
+                            mode == android.app.AppOpsManager.MODE_FOREGROUND -> GrantState.GRANTED
+                    // MODE_DEFAULT 等"系统没给结论"的情况一律 UNKNOWN，绝不冒充已授权
+                    else -> GrantState.UNKNOWN
                 }
             } catch (t: Throwable) {
                 Log.w(TAG, "EMUI 后台活动 appops 读取失败: ${t.message}")
@@ -153,7 +164,8 @@ object OemGuide {
         return GrantState.UNKNOWN
     }
 
-    fun manualSteps(): String = when {
+    fun manualSteps(): String {
+        val body = when {
         RomType.isXiaomi ->
             "MIUI 自启动（无读取 API，必须手工确认一次）：\n" +
                     "① 安全中心 → 授权管理 → 自启动管理 → 允许「SmsForwarder」自启动；\n" +
@@ -161,12 +173,14 @@ object OemGuide {
                     "③ 最近任务里给 SmsForwarder 下拉加锁（防止一键清理杀掉）；\n" +
                     "④ 如仍被杀：设置 → 电池与性能 → 关闭「智能省电」对该应用的作用"
         RomType.isHuawei ->
-            "EMUI 保活四步（缺一不可）：\n" +
-                    "① 设置 → 应用和服务 → 应用启动管理 → SmsForwarder → 关闭「自动管理」，" +
-                    "并勾选 自启动 / 关联启动 / 后台活动；\n" +
-                    "② 设置 → 电池 → 电池优化 → SmsForwarder → 选择「不允许优化」；\n" +
-                    "③ 设置 → 电池 → 更多电池设置 → 打开「休眠时始终保持网络连接」；\n" +
-                    "④ 打开多任务（最近任务）界面 → 下拉 SmsForwarder 卡片（或点卡片右上角锁图标）上锁，防一键清理杀进程"
+            "EMUI / HarmonyOS 保活四步（缺一不可）：\n" +
+                    "① 应用启动管理：设置 → 应用和服务 → 应用启动管理 → 找到「SmsForwarder」→ 关闭「自动管理」，" +
+                    "在弹窗「手动管理」里把 自启动 / 关联启动 / 后台活动 三项全部打开 → 点「确定」；\n" +
+                    "   · EMUI 9/10 在「手机管家 → 应用启动管理」；\n" +
+                    "   · HarmonyOS 2/3 在「设置 → 应用 → 应用启动管理」，找不到时在设置里搜索「应用启动管理」；\n" +
+                    "② 电池优化：设置 → 电池 → 电池优化 → 右上角切换「所有应用」→ SmsForwarder → 选「不允许优化」；\n" +
+                    "③ 休眠保持网络：设置 → 电池 → 更多电池设置 → 打开「休眠时始终保持网络连接」；\n" +
+                    "④ 多任务锁定：打开最近任务 → 下拉 SmsForwarder 卡片（或点右上角锁图标）上锁，防一键清理杀掉"
         RomType.isOppo ->
             "ColorOS / realme UI / OxygenOS 保活三步：\n" +
                     "① 手机管家 → 权限隐私 → 自启动管理 → 允许「SmsForwarder」；\n" +
@@ -208,7 +222,12 @@ object OemGuide {
                     "① Phone Master（手机管家）→ 权限管理 → 自启动 → 允许「SmsForwarder」；\n" +
                     "② 设置 → 电池 → 后台耗电管理 / 省电模式 → SmsForwarder → 无限制；\n" +
                     "③ 最近任务 → 锁定 SmsForwarder"
-        else -> "当前 ROM 无厂商自启动入口，仅需保证电池优化白名单即可"
+            else -> "当前 ROM 无厂商自启动入口，仅需保证电池优化白名单即可"
+        }
+        // ★ 2026-11-15：被控端可能装在任何机型上，步骤开头点名本机型号，
+        //   避免用户照着别的机型的菜单路径去找（EMUI/ColorOS/OriginOS 菜单差异很大）。
+        val dev = RomType.deviceModel()
+        return if (dev.isEmpty()) body else "当前机型：$dev\n$body"
     }
 
     /**
@@ -228,7 +247,24 @@ object OemGuide {
         //   不再连续尝试 3 个受限组件、也不再把用户丢回原页面。
         val mfr = (android.os.Build.MANUFACTURER ?: "").lowercase()
         if (mfr.contains("huawei") || mfr.contains("honor")) {
-            Log.w(TAG, "华为/荣耀：启动管理页需系统权限，改为打开应用信息页（耗电管理入口）")
+            // ★ 2026-11-15 真机实测（CET-AL00 / Android 12）：StartupNormalAppListActivity 与
+            //   StartupAppControlActivity 都要求 com.huawei.permission.external_app_settings.USE_COMPONENT，
+            //   第三方 App（甚至 adb shell）直接 am start 就抛 SecurityException。
+            //   但老版本 EMUI（9/10）该页仍可直达，所以先尝试一次，失败再退回应用信息页；
+            //   无论哪种情况都不能假装"已打开启动管理页"（调用方会据此给出手工路径）。
+            val hw = ComponentName(
+                "com.huawei.systemmanager",
+                "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity"
+            )
+            try {
+                val i = Intent().setComponent(hw)
+                i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                ctx.startActivity(i)
+                Log.i(TAG, "华为/荣耀：已直达启动管理页（老版本 EMUI）")
+                return OpenResult.OPENED
+            } catch (t: Throwable) {
+                Log.w(TAG, "华为/荣耀：启动管理页被系统权限拒绝(${t.message})，改为打开应用信息页")
+            }
             PermissionRequests.openAppDetails(ctx)
             return OpenResult.OPENED
         }

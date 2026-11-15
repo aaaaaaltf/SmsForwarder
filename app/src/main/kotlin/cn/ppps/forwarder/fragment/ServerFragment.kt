@@ -1768,9 +1768,14 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             cn.ppps.forwarder.permission.OpenResult.OPENED -> {
                 val mfr = (android.os.Build.MANUFACTURER ?: "").lowercase()
                 if (mfr.contains("huawei") || mfr.contains("honor")) {
-                    // ★ 2026-11-08 华为/荣耀无法直达受系统权限保护的"应用启动管理"页，
-                    //   已改为打开应用信息页，这里给出该页内的精确路径。
-                    XToastUtils.toast("已打开应用信息页：请点「耗电管理」→ 允许后台活动 / 应用启动管理")
+                    // ★ 2026-11-15 真机取证（CET-AL00 / Android 12）：应用信息页里并没有
+                    //   "应用启动管理"入口，旧文案「请点耗电管理 → 应用启动管理」会让人找不到。
+                    //   现在点名本机型号 + 给出系统设置里的真实路径。
+                    XToastUtils.toast(
+                        "已打开「${cn.ppps.forwarder.permission.RomType.deviceModel()}」应用信息页；" +
+                                "请到 设置 → 应用和服务 → 应用启动管理 → SmsForwarder → 关闭「自动管理」，" +
+                                "把 自启动 / 关联启动 / 后台活动 三项都打开"
+                    )
                 } else {
                     XToastUtils.toast("请在打开的页面里允许 SmsForwarder 自启动 / 后台活动（${cn.ppps.forwarder.permission.RomType.describe()}）")
                 }
@@ -1904,7 +1909,10 @@ class ServerFragment : BaseFragment<FragmentServerBinding?>(), View.OnClickListe
             cn.ppps.forwarder.permission.GrantState.GRANTED
         ) {
             // ★ 2026-11-07 同上：不再因"曾经引导过"永久跳过；每次一键授权都重新引导。
-            pendingItems.add("${cn.ppps.forwarder.permission.RomType.describe()} 自启动/后台活动")
+            pendingItems.add(
+                "${cn.ppps.forwarder.permission.RomType.describe()}" +
+                        "${cn.ppps.forwarder.permission.RomType.deviceSuffix()} 自启动/后台活动"
+            )
             if (isHuaweiDevice()) SettingUtils.huaweiKeepaliveGuided = true
             openOemAutostartSetting()
             return

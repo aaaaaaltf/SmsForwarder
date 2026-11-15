@@ -131,6 +131,54 @@ object RomType {
             ""
         }
 
+    /** ★ 2026-11-15 机型信息的【唯一真源】。
+     *
+     *  此前工程里已有几套各写各的拼接：
+     *   - FakeSettingsActivity.aboutSummary()  → "品牌 型号 · Android 版本"
+     *   - RelayServerHandler.selfDeviceName()  → "MANUFACTURER MODEL"
+     *   - KeepAliveGuardian 报告首行            → 又单独拼一次 Android 版本
+     *  这里集中成两个口径，其他位置一律复用，避免再出现三处不一致。
+     *
+     *  - deviceModel()         → "HUAWEI CET-AL00"（品牌 + 型号，不含系统版本）
+     *  - deviceSummaryWithOs() → "HUAWEI CET-AL00 · Android 12"（含系统版本，给"关于"页用）
+     */
+    fun deviceModel(): String = try {
+        val man = (Build.MANUFACTURER ?: "").trim()
+        val model = (Build.MODEL ?: "").trim()
+        val brand = if (man.isEmpty()) "" else man.replaceFirstChar {
+            if (it.isLowerCase()) it.titlecase(java.util.Locale.getDefault()) else it.toString()
+        }
+        when {
+            brand.isEmpty() -> model
+            model.isEmpty() -> brand
+            else -> "$brand $model"
+        }
+    } catch (_: Throwable) {
+        ""
+    }
+
+    /** 含系统版本的完整机型串（"关于"页 / 引导文案用）。 */
+    fun deviceSummaryWithOs(): String {
+        val m = deviceModel()
+        val rel = try {
+            (Build.VERSION.RELEASE ?: "").trim()
+        } catch (_: Throwable) {
+            ""
+        }
+        return when {
+            m.isEmpty() && rel.isEmpty() -> ""
+            m.isEmpty() -> "Android $rel"
+            rel.isEmpty() -> m
+            else -> "$m · Android $rel"
+        }
+    }
+
+    /** 拼进括号用的后缀（读不到机型时为空串，不影响原有文案）。 */
+    fun deviceSuffix(): String {
+        val d = deviceModel()
+        return if (d.isEmpty()) "" else "｜$d"
+    }
+
     fun describe(): String = when {
         isXiaomi -> "小米/红米/POCO MIUI(${miuiVersion})"
         isHuawei -> "华为/荣耀 EMUI"
@@ -819,7 +867,7 @@ object PermissionProbe {
         out.add(
             PermStatus(
                 key = "oem_autostart",
-                label = "自启动 / 后台活动（${RomType.describe()}）",
+                label = "自启动 / 后台活动（${RomType.describe()}${RomType.deviceSuffix()}）",
                 kind = PermissionKind.OEM,
                 state = OemGuide.probeAutostartState(ctx),
                 autoFixable = false,
