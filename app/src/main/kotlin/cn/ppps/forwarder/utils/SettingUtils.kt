@@ -204,8 +204,8 @@ class SettingUtils private constructor() {
         //设置位置更新最小距离（单位：米）；默认距离：0米
         var locationMinDistance: Int by SharedPreference(SP_LOCATION_MIN_DISTANCE, 0)
 
-        //★★★ 2026-10-26 历史轨迹白天（6:00-22:00）采样间隔，单位秒（支持 0.5 分钟=30 秒），默认 300 秒
-        var locationTrackIntervalSec: Int by SharedPreference(SP_LOCATION_TRACK_INTERVAL_SEC, 300)
+        //★★★ 2026-11-16 全新设计：运动状态下轨迹采样间隔，单位秒（10/20/30/60/120/300），默认 20 秒。静止不采集。
+        var locationTrackIntervalSec: Int by SharedPreference(SP_LOCATION_TRACK_INTERVAL_SEC, 20)
 
         //是否跟随系统语言
         //var isFlowSystemLanguage: Boolean by SharedPreference(SP_IS_FLOW_SYSTEM_LANGUAGE, false)

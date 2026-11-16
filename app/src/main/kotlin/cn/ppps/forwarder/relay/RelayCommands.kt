@@ -170,17 +170,17 @@ object RelayCommands {
     /** 查询定位 */
     const val CMD_LOCATION = "sflocqry0000"
 
-    /** ★ 2026-10-25 新增：历史轨迹查询（控制端→被控端）
+    /** 历史轨迹查询（控制端→被控端）
      *  负载: `startMs|endMs|maxPoints`（ASCII 数字，可只传前两段）
-     *  响应: [RSP_TRACK_QUERY]，data = {"points":[{"t":毫秒,"lng":..,"lat":..}...],"total":N}
-     *  数据来源：LocationTrackStore（每 5 分钟采样、位移去重、只保留最近 6 个月）。 */
+     *  响应: [RSP_TRACK_QUERY]，data = {"points":[{"t":毫秒,"lng":..,"lat":..}...],"total":N,"intervalSec":N,"moving":bool}
+     *  数据来源：LocationTrackStore（运动/静止状态机：静止不采集、运动按档位采样、只保留最近 6 个月）。 */
     const val CMD_TRACK_QUERY = "sftrkqry0000"
 
     /** 历史轨迹查询响应 */
     const val RSP_TRACK_QUERY = "sftrkdata000"
 
-    /** ★ 2026-10-26 新增：设置历史轨迹采集间隔（白天 6:00-22:00）
-     *  负载: 秒数 30/60/120/180/240/300/600/900/1200/1800（即 0.5~30 分钟）
+    /** 设置运动状态下的轨迹采集间隔
+     *  负载: 秒数 10/20/30/60/120/300（默认 20）；静止状态始终不采集
      *  响应: [RSP_TRACK_CONFIG]，data = {"intervalSec":N} */
     const val CMD_TRACK_CONFIG = "sftrkcfg0000"
 

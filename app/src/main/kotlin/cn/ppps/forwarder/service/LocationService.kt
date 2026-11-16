@@ -128,9 +128,9 @@ class LocationService : Service() {
                         }
                         HttpServerUtils.apiLocationCache = locationInfoNew
 
-                        // ★★★ 2026-10-25 新增：位置轨迹记录（每 5 分钟采样、位移 ≥25 米才落盘，
-                        //   只保留最近 6 个月）。写文件在定位回调线程做，但内部有 5 分钟节流，
-                        //   实际落盘频率极低，不会造成回调线程卡顿。
+                        // ★★★ 2026-11-16 全新设计：运动/静止状态机。静止时 MotionDetector 判定为
+                        //   静止，LocationTrackStore 直接不采集；运动时按所选档位（10~300 秒）采样，
+                        //   位移 ≥25 米才落盘，只保留最近 6 个月。
                         try {
                             cn.ppps.forwarder.relay.LocationTrackStore.onLocation(
                                 this@LocationService, location.longitude, location.latitude)
@@ -151,6 +151,8 @@ class LocationService : Service() {
 
                 restartLocation()
                 isRunning = true
+                // ★ 2026-11-16 运动/静止状态机：启动加速度计运动检测，静止时停止采集轨迹
+                cn.ppps.forwarder.relay.MotionDetector.start(this@LocationService)
             } else if (!SettingUtils.enableLocation && App.LocationClient.isStarted()) {
                 Log.d(TAG, "stopLocation")
                 App.LocationClient.stopLocation()
@@ -166,6 +168,9 @@ class LocationService : Service() {
     private fun stopService() {
         //清空缓存
         HttpServerUtils.apiLocationCache = LocationInfo()
+
+        // ★ 停止运动检测
+        cn.ppps.forwarder.relay.MotionDetector.stop()
 
         isRunning = try {
             //如果已经开始定位，则先停止定位

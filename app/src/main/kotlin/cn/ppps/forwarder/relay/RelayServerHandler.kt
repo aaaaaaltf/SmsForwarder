@@ -580,8 +580,8 @@ object RelayServerHandler {
                     RelayCommands.RSP_LOCATION to success(handleLocation())
                 }
 
-                // ★★★ 2026-10-25 新增：历史轨迹查询（负载 startMs|endMs|maxPoints）
-                //   数据来自 LocationTrackStore：每 5 分钟采样、位移≥25 米才记录、只保留最近 6 个月。
+                // ★★★ 历史轨迹查询（负载 startMs|endMs|maxPoints）
+                //   数据来自 LocationTrackStore：运动时按所选档位采样、静止不采集、只保留最近 6 个月。
                 RelayCommands.CMD_TRACK_QUERY -> {
                     // ★ 2026-11-10 同定位误报修复：区分“系统定位权限缺失”与“被控端远程定位开关关闭”
                     val permFineLocTrack = try {
@@ -614,19 +614,18 @@ object RelayServerHandler {
                         "total" to points.size,
                         "points" to points,
                         "intervalSec" to intervalSec,
-                        // 兼容旧控制端：整分钟档位同时返回 intervalMin（0.5 分钟时为 0，旧端会忽略）
-                        "intervalMin" to (intervalSec / 60),
+                        "moving" to MotionDetector.isMoving(),
                     ))
                 }
 
-                // ★★★ 2026-10-26 新增：设置轨迹采集间隔（负载: 秒数，限 0.5/1/2/3/4/5/10/15/20/30 分钟）
-                //   只调整白天 06:00-22:00 的采样间隔；夜间 22:00-06:00 固定 30 分钟。
+                // ★★★ 2026-11-16 全新设计：设置运动状态下的轨迹采集间隔
+                //   负载: 秒数，限 10/20/30/60/120/300。静止状态始终不采集。
                 RelayCommands.CMD_TRACK_CONFIG -> {
                     val seconds = payloadText.trim().toIntOrNull()
                     if (seconds == null || seconds !in LocationTrackStore.TRACK_INTERVAL_SECONDS) {
-                        RelayCommands.RSP_TRACK_CONFIG to error("采集间隔需为 0.5/1/2/3/4/5/10/15/20/30 分钟")
+                        RelayCommands.RSP_TRACK_CONFIG to error("采集间隔需为 10/20/30/60/120/300 秒")
                     } else {
-                        // ★ 2026-10-26 需求：必须确认已写入配置文件后才回复成功（commit 同步落盘 + 回读校验）
+                        // 必须确认已写入配置文件后才回复成功（commit 同步落盘 + 回读校验）
                         val committed = SharedPreference.preference.edit()
                             .putInt(SP_LOCATION_TRACK_INTERVAL_SEC, seconds)
                             .commit()
@@ -636,8 +635,7 @@ object RelayServerHandler {
                             Log.w(TAG, "★ 轨迹采集间隔保存失败: committed=$committed persisted=$persisted")
                             RelayCommands.RSP_TRACK_CONFIG to error("采集间隔保存失败，请重试")
                         } else {
-                            val label = if (seconds < 60) "${seconds / 60.0} 分钟" else "${seconds / 60} 分钟"
-                            Log.i(TAG, "★ 轨迹采集间隔已保存到配置文件: 白天每 $label（夜间固定 30 分钟）")
+                            Log.i(TAG, "★ 轨迹采集间隔已保存: 运动时每 $seconds 秒（静止不采集）")
                             RelayCommands.RSP_TRACK_CONFIG to success(mapOf("intervalSec" to seconds))
                         }
                     }
