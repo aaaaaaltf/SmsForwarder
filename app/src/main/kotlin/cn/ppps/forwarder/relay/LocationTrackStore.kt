@@ -14,9 +14,11 @@ import java.util.concurrent.locks.ReentrantLock
  * 位置轨迹存储（★ 2026-11-16 全新设计：运动/静止状态机）
  *
  * 采集规则：
- * - 静止状态：完全不采集（不写盘），由 [MotionDetector] 依据加速度计判定。
+ * - 静止状态：完全不采集（不写盘），由 [MotionDetector] 依据加速度计 / trigger sensor 判定。
  * - 运动状态：按控制端下发的间隔采样（10/20/30/60/120/300 秒，默认 20 秒）。
  * - 位移判重：上一条位置位移小于 [MIN_MOVE_METERS] 时不记录，避免 GPS 抖动产生垃圾点。
+ * - 精度过滤：hAcc > MAX_HACC_METERS 的粗定位点不记录（2026-11-17）。
+ * - 决策日志：每次回调的触发/拒绝原因写入 TrackDebugLog 专用文件，便于连续多日取证。
  *
  * 其它约束（保持不变）：
  * - 文件位于 App 私有目录 files/location_track.jsonl，每行一条 JSON，追加写。
@@ -44,6 +46,9 @@ object LocationTrackStore {
     /** 判重阈值（米）：小于该位移视为"位置未变化"，不记录 */
     private const val MIN_MOVE_METERS = 25.0
 
+    /** 精度阈值（米）：hAcc 大于该值的粗定位点直接拒绝（2026-11-17） */
+    const val MAX_HACC_METERS = 500.0f
+
     /** 轨迹数据最长保留 6 个月（180 天） */
     private const val MAX_AGE_MS = 180L * 24 * 60 * 60 * 1000L
 
@@ -64,35 +69,85 @@ object LocationTrackStore {
 
     /**
      * 定位回调入口：由 LocationService 每次定位成功时调用。
-     * - 静止：直接返回，不采集。
-     * - 运动：距上次采样 >= 所选间隔 且 位移 >= 25 米 才落盘。
+     * 所有拒绝原因写入 TrackDebugLog，便于连续几天核对是否真的由运动触发。
      */
-    fun onLocation(ctx: Context, lng: Double, lat: Double) {
-        if (lng.isNaN() || lat.isNaN()) return
-        if (lng == 0.0 || lat == 0.0) return
-        if (!MotionDetector.isMoving()) return
+    fun onLocation(ctx: Context, lng: Double, lat: Double, hAcc: Float, provider: String?) {
+        val nowIn = System.currentTimeMillis()
+        val motionAge = if (MotionDetector.lastMotionAtMs() <= 0L) -1L
+                        else nowIn - MotionDetector.lastMotionAtMs()
+        fun reject(reason: String, dist: Double = -1.0, intervalMs: Long = -1L, extra: String = "") {
+            TrackDebugLog.event(
+                "TRACK_REJECT",
+                "reason" to reason,
+                "lng" to String.format("%.7f", lng),
+                "lat" to String.format("%.7f", lat),
+                "hAcc" to hAcc,
+                "provider" to provider,
+                "moving" to MotionDetector.isMoving(),
+                "motionSensor" to MotionDetector.isSensorAvailable(),
+                "motionAgeMs" to motionAge,
+                "distM" to dist,
+                "intervalMs" to intervalMs,
+                "extra" to extra
+            )
+        }
+        if (lng.isNaN() || lat.isNaN()) {
+            reject("INVALID_COORD")
+            return
+        }
+        if (lng == 0.0 || lat == 0.0) {
+            reject("ZERO_COORD")
+            return
+        }
+        if (hAcc.isNaN() || hAcc > MAX_HACC_METERS) {
+            reject("HACC_TOO_LARGE", extra = "limit=" + MAX_HACC_METERS)
+            return
+        }
+        if (!MotionDetector.isMoving()) {
+            reject("NOT_MOVING")
+            return
+        }
         try {
             lock.lock()
-            if (!ensureLoaded(ctx)) return
+            if (!ensureLoaded(ctx)) {
+                reject("LOAD_FAILED")
+                return
+            }
             val now = System.currentTimeMillis()
             val intervalMs = normalizeIntervalSec(SettingUtils.locationTrackIntervalSec) * 1000L
+            val dist = if (!lastLng.isNaN() && !lastLat.isNaN())
+                distanceMeters(lastLat, lastLng, lat, lng) else -1.0
             // 采样节流：未到下一次采样点直接返回（不改 lastSampleAt，保持周期稳定）
-            if (lastSampleAt != 0L && now - lastSampleAt < intervalMs) return
-            lastSampleAt = now
-            // 位置判重
-            if (!lastLng.isNaN() && !lastLat.isNaN()) {
-                val dist = distanceMeters(lastLat, lastLng, lat, lng)
-                if (dist < MIN_MOVE_METERS) {
-                    Log.d(TAG, "位置未变化(位移 %.1f 米)，跳过记录".format(dist))
-                    return
-                }
+            if (lastSampleAt != 0L && now - lastSampleAt < intervalMs) {
+                reject("INTERVAL_NOT_DUE", dist, intervalMs, "gap=" + (now - lastSampleAt))
+                return
             }
+            // 位置判重
+            if (dist >= 0.0 && dist < MIN_MOVE_METERS) {
+                reject("DIST_TOO_SMALL", dist, intervalMs)
+                return
+            }
+            lastSampleAt = now
             append(ctx, now, lng, lat)
             lastLng = lng
             lastLat = lat
-            Log.i(TAG, "★ 记录轨迹点(运动) t=$now lng=$lng lat=$lat")
+            Log.i(TAG, "★ 记录轨迹点(运动) t=$now lng=$lng lat=$lat hAcc=$hAcc")
+            TrackDebugLog.event(
+                "TRACK_ACCEPT",
+                "t" to now,
+                "lng" to String.format("%.7f", lng),
+                "lat" to String.format("%.7f", lat),
+                "hAcc" to hAcc,
+                "provider" to provider,
+                "moving" to MotionDetector.isMoving(),
+                "motionSensor" to MotionDetector.isSensorAvailable(),
+                "motionAgeMs" to (now - MotionDetector.lastMotionAtMs()),
+                "distM" to dist,
+                "intervalMs" to intervalMs
+            )
         } catch (e: Exception) {
             Log.w(TAG, "记录轨迹失败: ${e.message}")
+            TrackDebugLog.event("TRACK_ERROR", "error" to e.message)
         } finally {
             if (lock.isHeldByCurrentThread) lock.unlock()
         }

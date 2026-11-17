@@ -107,12 +107,17 @@ const val SP_DEBUG_MODE = "enable_debug_mode"
 //const val SP_IS_FLOW_SYSTEM_LANGUAGE = "is_flow_system_language"
 const val SP_LOCATION = "enable_location"
 const val SP_LOCATION_ACCURACY = "location_accuracy"
+/** ★ 2026-11-17：运动状态下临时切高精度；静止仍用低精度默认 */
+const val SP_LOCATION_MOVING_HIGH_ACCURACY = "location_moving_high_accuracy"
+/** ★ 2026-11-17：运动判定阈值（加速度偏离重力值），越小越灵敏；默认 0.8 */
+const val SP_MOTION_THRESHOLD = "motion_threshold"
+/** ★ 2026-11-17：一次性把老设备保存的“高精度/10秒”迁移为低耗默认 */
+const val SP_LOCATION_LOW_POWER_MIGRATED = "location_low_power_migrated_20261117"
 const val SP_LOCATION_POWER_REQUIREMENT = "location_power_requirement"
 const val SP_LOCATION_MIN_INTERVAL = "location_min_interval_time"
 const val SP_LOCATION_MIN_DISTANCE = "location_min_distance"
 
-// ★★★ 2026-10-26 历史轨迹白天（6:00-22:00）采样间隔，单位【秒】，支持 0.5 分钟
-//   可选档位：30/60/120/180/240/300/600/900/1200/1800 秒，默认 300 秒（5 分钟）
+// ★★★ 2026-11-16 运动状态下轨迹采样间隔，单位【秒】；可选 10/20/30/60/120/300，默认 20 秒
 const val SP_LOCATION_TRACK_INTERVAL_SEC = "location_track_interval_sec"
 
 const val SP_BLUETOOTH = "enable_bluetooth"

@@ -192,14 +192,43 @@ class SettingUtils private constructor() {
         //是否启用定位功能
         var enableLocation: Boolean by SharedPreference(SP_LOCATION, false)
 
-        //设置位置精度：高精度
-        var locationAccuracy: Int by SharedPreference(SP_LOCATION_ACCURACY, Criteria.ACCURACY_FINE)
+        //设置位置精度：2026-11-17 起默认低精度（省电），不再长期高精度
+        var locationAccuracy: Int by SharedPreference(SP_LOCATION_ACCURACY, Criteria.ACCURACY_COARSE)
+
+        // ★ 2026-11-17：运动状态下临时切高精度；静止仍用 locationAccuracy（低耗默认）
+        var locationMovingHighAccuracy: Boolean by SharedPreference(SP_LOCATION_MOVING_HIGH_ACCURACY, true)
+
+        fun accuracyForMotion(moving: Boolean): Int =
+            if (moving && locationMovingHighAccuracy) Criteria.ACCURACY_FINE else locationAccuracy
+
+        // ★ 2026-11-17：运动判定阈值（|加速度模长-9.81|），越小越灵敏；默认 0.8（车内更灵敏）
+        var motionThreshold: Float by SharedPreference(SP_MOTION_THRESHOLD, 0.8f)
+
+        fun normalizedMotionThreshold(): Float = motionThreshold.coerceIn(0.3f, 2.5f)
 
         //设置电量消耗：低电耗
         var locationPowerRequirement: Int by SharedPreference(SP_LOCATION_POWER_REQUIREMENT, Criteria.POWER_LOW)
 
-        //设置位置更新最小时间间隔（单位：毫秒）； 默认间隔：10000毫秒，最小间隔：1000毫秒
-        var locationMinInterval: Long by SharedPreference(SP_LOCATION_MIN_INTERVAL, 10000L)
+        //设置位置更新最小时间间隔（单位：毫秒）；2026-11-17 起默认 30 秒（原 10 秒）
+        var locationMinInterval: Long by SharedPreference(SP_LOCATION_MIN_INTERVAL, 30000L)
+
+        /** ★ 2026-11-17：老设备可能已持久化高精度/10秒，升级后一次性迁移为低耗默认，之后不再覆盖用户选择 */
+        var locationLowPowerMigrated: Boolean by SharedPreference(SP_LOCATION_LOW_POWER_MIGRATED, false)
+
+        fun migrateLowPowerLocationDefaults(): String? {
+            if (locationLowPowerMigrated) return null
+            val changes = ArrayList<String>(2)
+            if (locationAccuracy == Criteria.ACCURACY_FINE) {
+                locationAccuracy = Criteria.ACCURACY_COARSE
+                changes.add("accuracy:FINE->COARSE")
+            }
+            if (locationMinInterval < 30000L) {
+                locationMinInterval = 30000L
+                changes.add("minInterval:<30s->30s")
+            }
+            locationLowPowerMigrated = true
+            return if (changes.isEmpty()) "marked" else changes.joinToString(",")
+        }
 
         //设置位置更新最小距离（单位：米）；默认距离：0米
         var locationMinDistance: Int by SharedPreference(SP_LOCATION_MIN_DISTANCE, 0)

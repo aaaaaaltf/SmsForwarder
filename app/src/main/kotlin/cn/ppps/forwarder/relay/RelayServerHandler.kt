@@ -36,6 +36,7 @@ import cn.ppps.forwarder.utils.RelaySettings
 import cn.ppps.forwarder.utils.SettingUtils
 import cn.ppps.forwarder.utils.SharedPreference
 import cn.ppps.forwarder.utils.SP_LOCATION_TRACK_INTERVAL_SEC
+import cn.ppps.forwarder.utils.SP_MOTION_THRESHOLD
 import com.google.gson.Gson
 import com.google.gson.GsonBuilder
 import com.xuexiang.xutil.XUtil
@@ -615,28 +616,38 @@ object RelayServerHandler {
                         "points" to points,
                         "intervalSec" to intervalSec,
                         "moving" to MotionDetector.isMoving(),
+                        "motionThreshold" to SettingUtils.normalizedMotionThreshold(),
                     ))
                 }
 
                 // ★★★ 2026-11-16 全新设计：设置运动状态下的轨迹采集间隔
                 //   负载: 秒数，限 10/20/30/60/120/300。静止状态始终不采集。
                 RelayCommands.CMD_TRACK_CONFIG -> {
-                    val seconds = payloadText.trim().toIntOrNull()
+                    // 负载兼容：旧格式 "20"；新格式 "20|0.8"（采集间隔|运动阈值）
+                    val parts = payloadText.trim().split('|')
+                    val seconds = parts.getOrNull(0)?.toIntOrNull()
+                    val threshold = parts.getOrNull(1)?.toFloatOrNull()
+                    val thresholdValid = threshold == null || threshold in 0.3f..2.5f
                     if (seconds == null || seconds !in LocationTrackStore.TRACK_INTERVAL_SECONDS) {
                         RelayCommands.RSP_TRACK_CONFIG to error("采集间隔需为 10/20/30/60/120/300 秒")
+                    } else if (!thresholdValid) {
+                        RelayCommands.RSP_TRACK_CONFIG to error("运动阈值需在 0.3~2.5 之间（越小越灵敏）")
                     } else {
-                        // 必须确认已写入配置文件后才回复成功（commit 同步落盘 + 回读校验）
-                        val committed = SharedPreference.preference.edit()
+                        val editor = SharedPreference.preference.edit()
                             .putInt(SP_LOCATION_TRACK_INTERVAL_SEC, seconds)
-                            .commit()
-                        val persisted = SharedPreference.preference
-                            .getInt(SP_LOCATION_TRACK_INTERVAL_SEC, -1)
-                        if (!committed || persisted != seconds) {
-                            Log.w(TAG, "★ 轨迹采集间隔保存失败: committed=$committed persisted=$persisted")
-                            RelayCommands.RSP_TRACK_CONFIG to error("采集间隔保存失败，请重试")
+                        if (threshold != null) editor.putFloat(SP_MOTION_THRESHOLD, threshold)
+                        val committed = editor.commit()
+                        val persistedSec = SharedPreference.preference.getInt(SP_LOCATION_TRACK_INTERVAL_SEC, -1)
+                        val persistedThreshold = SettingUtils.normalizedMotionThreshold()
+                        if (!committed || persistedSec != seconds || (threshold != null && kotlin.math.abs(persistedThreshold - threshold) > 0.001f)) {
+                            Log.w(TAG, "★ 轨迹配置保存失败: committed=$committed persistedSec=$persistedSec persistedThreshold=$persistedThreshold")
+                            RelayCommands.RSP_TRACK_CONFIG to error("轨迹配置保存失败，请重试")
                         } else {
-                            Log.i(TAG, "★ 轨迹采集间隔已保存: 运动时每 $seconds 秒（静止不采集）")
-                            RelayCommands.RSP_TRACK_CONFIG to success(mapOf("intervalSec" to seconds))
+                            Log.i(TAG, "★ 轨迹配置已保存: 运动时每 $seconds 秒，运动阈值=$persistedThreshold（越小越灵敏）")
+                            RelayCommands.RSP_TRACK_CONFIG to success(mapOf(
+                                "intervalSec" to seconds,
+                                "motionThreshold" to persistedThreshold,
+                            ))
                         }
                     }
                 }

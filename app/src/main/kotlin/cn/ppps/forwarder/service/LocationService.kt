@@ -6,11 +6,16 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.location.Criteria
 import android.location.Location
 import android.location.LocationManager
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import android.os.PowerManager
 import cn.ppps.forwarder.App
 import cn.ppps.forwarder.entity.LocationInfo
+import cn.ppps.forwarder.relay.TrackDebugLog
 import cn.ppps.forwarder.utils.ACTION_RESTART
 import cn.ppps.forwarder.utils.ACTION_START
 import cn.ppps.forwarder.utils.ACTION_STOP
@@ -36,6 +41,45 @@ class LocationService : Service() {
      *   目的只是把静止时每次定位（默认 10 秒一次）都发一次同步网络反查的浪费去掉。
      */
     private val GEOCODE_MOVE_DEG = 0.0003
+
+    /** ★ 2026-11-17 省电：静止 60 秒后停定位 SDK；10 秒巡检，60 秒写一次心跳 */
+    private val LOCATION_IDLE_STOP_MS = 60_000L
+    private val IDLE_WATCH_INTERVAL_MS = 10_000L
+    private val HEARTBEAT_INTERVAL_MS = 60_000L
+    private val MOTION_WAKE_COOLDOWN_MS = 10_000L
+    private val ACCURACY_SWITCH_COOLDOWN_MS = 10_000L
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var idleWatchPosted = false
+    private var heartbeatTicks = 0
+    private var lastMotionWakeStartAt = 0L
+    private var lastAccuracySwitchAt = 0L
+    /** 当前已下发给 LocationClient 的精度；-1 表示尚未启动/未知 */
+    private var clientAccuracy = -1
+
+    private val idleWatchRunnable = object : Runnable {
+        override fun run() {
+            if (!isRunning) {
+                idleWatchPosted = false
+                return
+            }
+            try {
+                ensureAccuracyMatchesMotion("IDLE_WATCH")
+                checkIdleStop()
+                heartbeatTicks++
+                if (heartbeatTicks * IDLE_WATCH_INTERVAL_MS >= HEARTBEAT_INTERVAL_MS) {
+                    heartbeatTicks = 0
+                    writeHeartbeat()
+                }
+            } finally {
+                if (isRunning) {
+                    mainHandler.postDelayed(this, IDLE_WATCH_INTERVAL_MS)
+                } else {
+                    idleWatchPosted = false
+                }
+            }
+        }
+    }
 
     private val locationStatusReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -99,13 +143,32 @@ class LocationService : Service() {
                     override fun onLocationChanged(location: Location) {
                         //位置信息
                         Log.d(TAG, "onLocationChanged(location = ${location})")
+                        val hAcc = if (location.hasAccuracy()) location.accuracy else -1f
+                        val provider = location.provider ?: ""
+                        TrackDebugLog.event(
+                            "LOCATION_CALLBACK",
+                            "lng" to String.format("%.7f", location.longitude),
+                            "lat" to String.format("%.7f", location.latitude),
+                            "hAcc" to hAcc,
+                            "provider" to provider,
+                            "screenOn" to isScreenOn(),
+                            "moving" to cn.ppps.forwarder.relay.MotionDetector.isMoving(),
+                            "motionSensor" to cn.ppps.forwarder.relay.MotionDetector.isSensorAvailable(),
+                            "motionAgeMs" to if (cn.ppps.forwarder.relay.MotionDetector.lastMotionAtMs() <= 0L) -1L
+                                             else System.currentTimeMillis() - cn.ppps.forwarder.relay.MotionDetector.lastMotionAtMs(),
+                            "clientStarted" to App.LocationClient.isStarted(),
+                            "clientAccuracy" to clientAccuracy,
+                            "baseAccuracy" to SettingUtils.locationAccuracy,
+                            "targetAccuracy" to SettingUtils.accuracyForMotion(cn.ppps.forwarder.relay.MotionDetector.isMoving()),
+                            "movingHighAccuracy" to SettingUtils.locationMovingHighAccuracy
+                        )
 
                         val locationInfoNew = LocationInfo(
                             location.longitude, location.latitude, "", App.DateFormat.format(Date(location.time)), location.provider.toString()
                         )
 
                         // ★★★ 2026-08-28 省电：坐标没动就不做【同步网络反查】。
-                        //   依据：本回调按 locationMinInterval（默认 10 秒）持续触发，而旧代码每次都无条件
+                        //   依据：本回调按 locationMinInterval（2026-11-17 起默认 30 秒）持续触发，旧代码每次都无条件
                         //   调 Geocoder.getFromLocation() —— 那是一次同步的地理编码网络往返（还跑在
                         //   定位回调线程上，顺带是 ANR 风险）。手机静置在桌上时每次拿到的经纬度几乎相同，
                         //   地址字符串也必然相同 → 每小时约 360 次毫无产出的网络请求 + 唤醒基带/Wi-Fi。
@@ -133,7 +196,7 @@ class LocationService : Service() {
                         //   位移 ≥25 米才落盘，只保留最近 6 个月。
                         try {
                             cn.ppps.forwarder.relay.LocationTrackStore.onLocation(
-                                this@LocationService, location.longitude, location.latitude)
+                                this@LocationService, location.longitude, location.latitude, hAcc, provider)
                         } catch (e: Exception) {
                             Log.w(TAG, "记录轨迹异常: ${e.message}")
                         }
@@ -145,37 +208,58 @@ class LocationService : Service() {
                     override fun onException(@LocationErrorCode errorCode: Int, e: Exception) {
                         //定位出现异常 && 尝试重启定位
                         Log.w(TAG, "onException(errorCode = $errorCode, e = ${e})")
-                        restartLocation()
+                        restartLocation("EXCEPTION_$errorCode")
                     }
                 })
 
-                restartLocation()
-                isRunning = true
-                // ★ 2026-11-16 运动/静止状态机：启动加速度计运动检测，静止时停止采集轨迹
+                // ★ 2026-11-17 运动唤醒：运动检测/threshold sensor 触发后重新拉起定位 SDK
+                cn.ppps.forwarder.relay.MotionDetector.setMotionListener { source ->
+                    mainHandler.post { onWakeByMotion(source) }
+                }
+                // ★ 运动检测常驻（比 GPS 低功耗）；静止时只停定位 SDK，不清空当前位置缓存
                 cn.ppps.forwarder.relay.MotionDetector.start(this@LocationService)
+                isRunning = true
+                startLocationClient("SERVICE_START", force = true)
+                scheduleIdleWatch()
+                TrackDebugLog.event(
+                    "LOCATION_SERVICE_START",
+                    "idleStopMs" to LOCATION_IDLE_STOP_MS,
+                    "baseAccuracy" to SettingUtils.locationAccuracy,
+                    "movingHighAccuracy" to SettingUtils.locationMovingHighAccuracy,
+                    "targetAccuracy" to effectiveAccuracy(),
+                    "minIntervalMs" to SettingUtils.locationMinInterval
+                )
             } else if (!SettingUtils.enableLocation && App.LocationClient.isStarted()) {
                 Log.d(TAG, "stopLocation")
                 App.LocationClient.stopLocation()
+                clientAccuracy = -1
                 isRunning = false
             }
         } catch (e: Exception) {
             e.printStackTrace()
             Log.e(TAG, "startService: ${e.message}")
+            TrackDebugLog.event("SERVICE_START_ERROR", "error" to e.message)
             isRunning = false
         }
     }
 
     private fun stopService() {
-        //清空缓存
-        HttpServerUtils.apiLocationCache = LocationInfo()
-
-        // ★ 停止运动检测
+        cancelIdleWatch()
+        TrackDebugLog.event(
+            "LOCATION_SERVICE_STOP",
+            "clientStarted" to App.LocationClient.isStarted(),
+            "screenOn" to isScreenOn()
+        )
+        cn.ppps.forwarder.relay.MotionDetector.setMotionListener(null)
         cn.ppps.forwarder.relay.MotionDetector.stop()
 
+        //清空当前位置缓存（仅真正的服务停止；静止停定位不清缓存）
+        HttpServerUtils.apiLocationCache = LocationInfo()
+
         isRunning = try {
-            //如果已经开始定位，则先停止定位
             if (SettingUtils.enableLocation && App.LocationClient.isStarted()) {
                 App.LocationClient.stopLocation()
+                clientAccuracy = -1
             }
             stopForeground(true)
             stopSelf()
@@ -187,25 +271,192 @@ class LocationService : Service() {
         }
     }
 
-    private fun restartLocation() {
-        //如果已经开始定位，则先停止定位
-        if (App.LocationClient.isStarted()) {
-            App.LocationClient.stopLocation()
+    private fun scheduleIdleWatch() {
+        if (idleWatchPosted) return
+        idleWatchPosted = true
+        mainHandler.removeCallbacks(idleWatchRunnable)
+        mainHandler.postDelayed(idleWatchRunnable, IDLE_WATCH_INTERVAL_MS)
+    }
+
+    private fun cancelIdleWatch() {
+        idleWatchPosted = false
+        mainHandler.removeCallbacks(idleWatchRunnable)
+    }
+
+    /** 静止超过门限：只停定位 SDK；MotionDetector 和位置缓存继续保留。 */
+    private fun checkIdleStop() {
+        if (!isRunning || !SettingUtils.enableLocation) return
+        if (!App.LocationClient.isStarted()) return
+        if (!cn.ppps.forwarder.relay.MotionDetector.isIdleFor(LOCATION_IDLE_STOP_MS)) return
+        val cache = HttpServerUtils.apiLocationCache
+        val md = cn.ppps.forwarder.relay.MotionDetector
+        val anchor = if (md.lastMotionAtMs() > md.idleAnchorAtMs()) md.lastMotionAtMs() else md.idleAnchorAtMs()
+        TrackDebugLog.event(
+            "LOCATION_STOP_IDLE",
+            "idleStopMs" to LOCATION_IDLE_STOP_MS,
+            "idleAnchorMs" to anchor,
+            "idleAgeMs" to (System.currentTimeMillis() - anchor),
+            "motionAgeMs" to if (md.lastMotionAtMs() <= 0L) -1L else System.currentTimeMillis() - md.lastMotionAtMs(),
+            "screenOn" to isScreenOn(),
+            "cacheLng" to cache.longitude,
+            "cacheLat" to cache.latitude,
+            "cacheTime" to cache.time,
+            "clientAccuracy" to clientAccuracy
+        )
+        Log.i(TAG, "★ 静止 ${LOCATION_IDLE_STOP_MS}ms，停止定位SDK（保留运动检测和位置缓存）")
+        App.LocationClient.stopLocation()
+        clientAccuracy = -1
+    }
+
+    /** 加速度 / trigger sensor 检测到运动：重新拉起定位，并确保切到运动态精度。 */
+    private fun onWakeByMotion(source: String) {
+        if (!isRunning || !SettingUtils.enableLocation) return
+        val moving = cn.ppps.forwarder.relay.MotionDetector.isMoving()
+        val target = SettingUtils.accuracyForMotion(moving)
+        val started = App.LocationClient.isStarted()
+        if (started && clientAccuracy == target) {
+            TrackDebugLog.event(
+                "MOTION_WAKE_SKIPPED",
+                "source" to source,
+                "reason" to "ALREADY_TARGET_ACCURACY",
+                "targetAccuracy" to target,
+                "clientAccuracy" to clientAccuracy
+            )
+            return
         }
-        if (LocationUtils.isLocationEnabled(App.context) && LocationUtils.hasLocationCapability(App.context)) {
-            //可根据具体需求设置定位配置参数（这里只列出一些主要的参数）
-            val locationOption = App.LocationClient.getLocationOption().setAccuracy(SettingUtils.locationAccuracy)//设置位置精度：高精度
-                .setPowerRequirement(SettingUtils.locationPowerRequirement) //设置电量消耗：低电耗
-                .setMinTime(SettingUtils.locationMinInterval)//设置位置更新最小时间间隔（单位：毫秒）； 默认间隔：10000毫秒，最小间隔：1000毫秒
-                .setMinDistance(SettingUtils.locationMinDistance)//设置位置更新最小距离（单位：米）；默认距离：0米
-                .setOnceLocation(false)//设置是否只定位一次，默认为 false，当设置为 true 时，则只定位一次后，会自动停止定位
-                .setLastKnownLocation(false)//设置是否获取最后一次缓存的已知位置，默认为 true
-            //设置定位配置参数
+        val now = System.currentTimeMillis()
+        if (!started && now - lastMotionWakeStartAt < MOTION_WAKE_COOLDOWN_MS) {
+            TrackDebugLog.event(
+                "MOTION_WAKE_SKIPPED",
+                "source" to source,
+                "reason" to "COOLDOWN",
+                "gapMs" to (now - lastMotionWakeStartAt)
+            )
+            return
+        }
+        lastMotionWakeStartAt = now
+        TrackDebugLog.event(
+            "MOTION_WAKE_START",
+            "source" to source,
+            "screenOn" to isScreenOn(),
+            "moving" to moving,
+            "targetAccuracy" to target,
+            "clientAccuracy" to clientAccuracy,
+            "motionAgeMs" to if (cn.ppps.forwarder.relay.MotionDetector.lastMotionAtMs() <= 0L) -1L
+                             else now - cn.ppps.forwarder.relay.MotionDetector.lastMotionAtMs()
+        )
+        val reason = if (target == Criteria.ACCURACY_FINE)
+            "MOTION_HIGH_ACCURACY_$source" else "MOTION_LOW_ACCURACY_$source"
+        startLocationClient(reason, force = started)
+    }
+
+    /** 巡检兜底：运动态高精度 / 运动结束低精度，防止 listener 漏掉时精度长期不切回。 */
+    private fun ensureAccuracyMatchesMotion(reason: String) {
+        if (!isRunning || !SettingUtils.enableLocation) return
+        if (!App.LocationClient.isStarted()) return
+        val moving = cn.ppps.forwarder.relay.MotionDetector.isMoving()
+        val target = SettingUtils.accuracyForMotion(moving)
+        if (clientAccuracy == target) return
+        val now = System.currentTimeMillis()
+        if (now - lastAccuracySwitchAt < ACCURACY_SWITCH_COOLDOWN_MS) return
+        lastAccuracySwitchAt = now
+        val switchReason = if (moving && target == Criteria.ACCURACY_FINE)
+            "MOTION_HIGH_ACCURACY_$reason" else "MOTION_END_LOW_POWER_$reason"
+        TrackDebugLog.event(
+            "ACCURACY_SWITCH",
+            "reason" to switchReason,
+            "moving" to moving,
+            "from" to clientAccuracy,
+            "to" to target
+        )
+        startLocationClient(switchReason, force = true)
+    }
+
+    private fun effectiveAccuracy(): Int =
+        SettingUtils.accuracyForMotion(cn.ppps.forwarder.relay.MotionDetector.isMoving())
+
+    private fun startLocationClient(reason: String, force: Boolean = false) {
+        val migrated = SettingUtils.migrateLowPowerLocationDefaults()
+        if (migrated != null) {
+            TrackDebugLog.event("LOW_POWER_MIGRATION", "changes" to migrated)
+            Log.i(TAG, "★ 低耗定位配置迁移: $migrated")
+        }
+        if (!SettingUtils.enableLocation) return
+        if (!LocationUtils.isLocationEnabled(App.context) || !LocationUtils.hasLocationCapability(App.context)) {
+            Log.w(TAG, "onException: GPS未开启")
+            TrackDebugLog.event("LOCATION_START_SKIPPED", "reason" to reason, "detail" to "LOCATION_DISABLED")
+            return
+        }
+        if (App.LocationClient.isStarted()) {
+            if (!force) {
+                TrackDebugLog.event("LOCATION_START_SKIPPED", "reason" to reason, "detail" to "ALREADY_STARTED")
+                return
+            }
+            App.LocationClient.stopLocation()
+            clientAccuracy = -1
+        }
+        try {
+            val moving = cn.ppps.forwarder.relay.MotionDetector.isMoving()
+            val accuracy = effectiveAccuracy()
+            val locationOption = App.LocationClient.getLocationOption()
+                .setAccuracy(accuracy)
+                .setPowerRequirement(SettingUtils.locationPowerRequirement)
+                .setMinTime(SettingUtils.locationMinInterval)
+                .setMinDistance(SettingUtils.locationMinDistance)
+                .setOnceLocation(false)
+                .setLastKnownLocation(false)
             App.LocationClient.setLocationOption(locationOption)
             App.LocationClient.startLocation()
-        } else {
-            Log.w(TAG, "onException: GPS未开启")
+            clientAccuracy = accuracy
+            TrackDebugLog.event(
+                "LOCATION_START",
+                "reason" to reason,
+                "accuracy" to accuracy,
+                "baseAccuracy" to SettingUtils.locationAccuracy,
+                "movingHighAccuracy" to SettingUtils.locationMovingHighAccuracy,
+                "moving" to moving,
+                "power" to SettingUtils.locationPowerRequirement,
+                "minIntervalMs" to SettingUtils.locationMinInterval,
+                "minDistanceM" to SettingUtils.locationMinDistance,
+                "screenOn" to isScreenOn()
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "startLocationClient: ${e.message}")
+            TrackDebugLog.event("LOCATION_START_ERROR", "reason" to reason, "error" to e.message)
         }
+    }
+
+    private fun restartLocation(reason: String = "RESTART") {
+        startLocationClient(reason, force = true)
+    }
+
+    private fun isScreenOn(): Boolean {
+        return try {
+            val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+            pm?.isInteractive == true
+        } catch (_: Exception) {
+            true
+        }
+    }
+
+    private fun writeHeartbeat() {
+        val cache = HttpServerUtils.apiLocationCache
+        TrackDebugLog.event(
+            "HEARTBEAT",
+            "serviceRunning" to isRunning,
+            "clientStarted" to App.LocationClient.isStarted(),
+            "clientAccuracy" to clientAccuracy,
+            "targetAccuracy" to effectiveAccuracy(),
+            "moving" to cn.ppps.forwarder.relay.MotionDetector.isMoving(),
+            "motionSensor" to cn.ppps.forwarder.relay.MotionDetector.isSensorAvailable(),
+            "motionAgeMs" to if (cn.ppps.forwarder.relay.MotionDetector.lastMotionAtMs() <= 0L) -1L
+                             else System.currentTimeMillis() - cn.ppps.forwarder.relay.MotionDetector.lastMotionAtMs(),
+            "screenOn" to isScreenOn(),
+            "cacheLng" to cache.longitude,
+            "cacheLat" to cache.latitude,
+            "cacheTime" to cache.time,
+            "trackPoints" to cn.ppps.forwarder.relay.LocationTrackStore.count(this)
+        )
     }
 
     private fun handleLocationStatusChanged() {
@@ -214,13 +465,15 @@ class LocationService : Service() {
             //已启用
             Log.d(TAG, "handleLocationStatusChanged: 已启用")
             if (SettingUtils.enableLocation && !App.LocationClient.isStarted()) {
-                App.LocationClient.startLocation()
+                startLocationClient("PROVIDER_ENABLED", force = false)
             }
         } else {
             //已停用
             Log.d(TAG, "handleLocationStatusChanged: 已停用")
             if (SettingUtils.enableLocation && App.LocationClient.isStarted()) {
                 App.LocationClient.stopLocation()
+                clientAccuracy = -1
+                TrackDebugLog.event("LOCATION_STOP_PROVIDER_DISABLED", "screenOn" to isScreenOn())
             }
         }
     }
