@@ -19,6 +19,8 @@ object TrackDebugLog {
     private const val DIR_NAME = "track_debug"
     private const val FILE_PREFIX = "track_debug_"
     private const val MAX_FILE_BYTES = 2L * 1024 * 1024
+    /** ★ 2026-11-18：翻页保留数（当前 + .1~.3），避免只留一份导致早段日志丢失 */
+    private const val KEEP_ROTATIONS = 3
 
     private val lock = Any()
 
@@ -50,18 +52,25 @@ object TrackDebugLog {
                     .getOrNull() ?: ctx.cacheDir.absolutePath
                 val dir = File(base, DIR_NAME)
                 if (!dir.exists()) dir.mkdirs()
-                var file = File(dir, FILE_PREFIX + day + ".log")
+                val file = File(dir, FILE_PREFIX + day + ".log")
                 if (!file.exists()) file.createNewFile()
-                if (file.length() > MAX_FILE_BYTES) {
-                    val rotated = File(dir, FILE_PREFIX + day + ".1.log")
-                    file.renameTo(rotated)
-                    file = File(dir, FILE_PREFIX + day + ".log")
-                    file.createNewFile()
-                }
+                if (file.length() > MAX_FILE_BYTES) rotate(dir, day, file)
                 FileWriter(file, true).use { it.append(line) }
             } catch (_: Exception) {
             }
         }
+    }
+
+    /** 翻页轮转：当前 -> .1，原 .1 -> .2，原 .2 -> .3，最老的 .3 删除。 */
+    private fun rotate(dir: File, day: String, file: File) {
+        val oldest = File(dir, FILE_PREFIX + day + ".${KEEP_ROTATIONS}.log")
+        if (oldest.exists()) oldest.delete()
+        for (i in KEEP_ROTATIONS - 1 downTo 1) {
+            val from = File(dir, FILE_PREFIX + day + ".$i.log")
+            if (from.exists()) from.renameTo(File(dir, FILE_PREFIX + day + ".${i + 1}.log"))
+        }
+        file.renameTo(File(dir, FILE_PREFIX + day + ".1.log"))
+        file.createNewFile()
     }
 
     private fun formatValue(v: Any?): String = when (v) {

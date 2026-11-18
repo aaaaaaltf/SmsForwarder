@@ -238,6 +238,28 @@ object MotionDetector {
 
     fun isSensorAvailable(): Boolean = sensorAvailable
 
+    /**
+     * ★ 2026-11-18「移动即记录」：由定位回调在检测到【位置确实变化】时反向调用。
+     *
+     * 背景：匀速行车 + 手持稳定时加速度计几乎读不到变化，单靠加速度会得到两条误判：
+     *   ① LocationTrackStore 因 !isMoving() 直接 NOT_MOVING 拒绝记录；
+     *   ② LocationService 判静止 60 秒后停掉定位 SDK，连回调都没有。
+     * 位置变化是"手机真的在动"最可靠的证据，因此这里把运动状态续期，使 isMoving() 为真、
+     * 且 idleAnchor 同步刷新，避免刚记一个点就被判静止停 SDK。不触发 wake listener
+     * （避免精度切换/重启 SDK 的重入），只做状态续期 + 留痕。
+     */
+    fun noteLocationMoved(distMeters: Double, provider: String?) {
+        val now = System.currentTimeMillis()
+        lastMotionAt = now
+        idleAnchorAt = now
+        TrackDebugLog.event(
+            "LOCATION_MOVED_WAKE",
+            "distM" to String.format("%.1f", distMeters),
+            "provider" to provider,
+            "lastMotionAt" to lastMotionAt
+        )
+    }
+
     private fun onMotion(source: String, magnitude: Float,
                          reason: String = "GRAVITY",
                          jerk: Float = 0f, stddev: Float = 0f) {

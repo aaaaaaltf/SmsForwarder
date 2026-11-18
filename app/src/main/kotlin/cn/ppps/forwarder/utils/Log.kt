@@ -25,6 +25,10 @@ object Log {
     private lateinit var appContext: Context
     private var initDate: String = ""
 
+    /** ★ 2026-11-18：日志单文件上限 + 翻页保留数（当前 + .1~.KEEP_COUNT） */
+    private const val MAX_LOG_BYTES = 1024L * 1024L
+    private const val KEEP_ROTATIONS = 3
+
     // ★ 2026-08-06：原实现每条日志 new Thread 写文件，高频日志导致线程创建耗尽/卡死，
     //   文件日志停止写入。改为单后台线程 + 阻塞队列串行写文件。
     private val logQueue: LinkedBlockingQueue<String> = LinkedBlockingQueue(20000)
@@ -87,11 +91,9 @@ object Log {
             createLogFile()
             logFile?.let { file ->
                 try {
-                    // ★ 2026-08-05：日志文件超过1MB时清空（删除旧内容），避免无限膨胀
-                    if (file.length() > 1024 * 1024) {
-                        file.delete()
-                        file.createNewFile()
-                    }
+                    // ★ 2026-11-18：由"清空"改为"翻页轮转"，保留最近 KEEP_ROTATIONS 份历史，
+                    //   避免排障时只剩最后一小段（当天曾因超过1MB被delete，导致早7点~18点的日志全丢）
+                    if (file.length() > MAX_LOG_BYTES) rotateLogFile(file)
                     val logWriter = FileWriter(file, true)
                     logWriter.append(line)
                     logWriter.close()
@@ -102,6 +104,32 @@ object Log {
         } catch (e: Exception) {
             AndroidLog.e(TAG, "Error writing to file: ${e.message}")
         }
+    }
+
+    /**
+     * 翻页轮转：log_x.txt -> log_x.1.txt，原 .1 -> .2，原 .2 -> .3，最老的 .3 删除。
+     * 只写文件线程内调用，天然串行，无需额外加锁。
+     */
+    private fun rotateLogFile(file: File) {
+        val dir = file.parentFile ?: return
+        // 丢弃最老的一份
+        val oldest = File(dir, rotatedName(file, KEEP_ROTATIONS))
+        if (oldest.exists()) oldest.delete()
+        // 从老到新依次后移一位：.2 -> .3, .1 -> .2
+        for (i in KEEP_ROTATIONS - 1 downTo 1) {
+            val from = File(dir, rotatedName(file, i))
+            if (from.exists()) from.renameTo(File(dir, rotatedName(file, i + 1)))
+        }
+        // 当前文件 -> .1；随后 FileWriter(file, true) 会自动重建空的当前文件
+        file.renameTo(File(dir, rotatedName(file, 1)))
+    }
+
+    /** log_2026-11-18.txt -> log_2026-11-18.1.txt */
+    private fun rotatedName(file: File, index: Int): String {
+        val name = file.name
+        val dot = name.lastIndexOf('.')
+        return if (dot > 0) name.substring(0, dot) + "." + index + name.substring(dot)
+               else "$name.$index"
     }
 
     fun v(tag: String, message: String) {

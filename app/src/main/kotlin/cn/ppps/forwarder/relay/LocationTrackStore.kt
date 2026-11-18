@@ -18,7 +18,10 @@ import java.util.concurrent.locks.ReentrantLock
  * - 运动状态：按控制端下发的间隔采样（10/20/30/60/120/300 秒，默认 20 秒）。
  * - 位移判重：上一条位置位移小于 [MIN_MOVE_METERS] 时不记录，避免 GPS 抖动产生垃圾点。
  * - 精度过滤：hAcc > MAX_HACC_METERS 的粗定位点不记录（2026-11-17）。
- * - 决策日志：每次回调的触发/拒绝原因写入 TrackDebugLog 专用文件，便于连续多日取证。
+ * - ★2026-11-18「移动即记录」：加速度判不出匀速行车/手持稳定，故用"与上次记录点的实际位移"
+ *   反向续期 MotionDetector（noteLocationMoved）：位移超过判重阈值即视为移动，既让本点可记录，
+ *   也防止 LocationService 在 60s 后误判静止停掉定位 SDK。GPS 静止漂移 < MIN_MOVE_METERS 不误触发。
+ * - 决策日志：每次回调的触发/拒绝原因写入 TrackDebugLog 专用文件；日志翻页保留最近 4 份。
  *
  * 其它约束（保持不变）：
  * - 文件位于 App 私有目录 files/location_track.jsonl，每行一条 JSON，追加写。
@@ -103,10 +106,6 @@ object LocationTrackStore {
             reject("HACC_TOO_LARGE", extra = "limit=" + MAX_HACC_METERS)
             return
         }
-        if (!MotionDetector.isMoving()) {
-            reject("NOT_MOVING")
-            return
-        }
         try {
             lock.lock()
             if (!ensureLoaded(ctx)) {
@@ -117,6 +116,21 @@ object LocationTrackStore {
             val intervalMs = normalizeIntervalSec(SettingUtils.locationTrackIntervalSec) * 1000L
             val dist = if (!lastLng.isNaN() && !lastLat.isNaN())
                 distanceMeters(lastLat, lastLng, lat, lng) else -1.0
+
+            // ★★★ 2026-11-18「移动即记录」核心：位置真的变了就是移动的最可靠证据。
+            //   匀速行车+手持稳定时加速度几乎无变化，若只看 isMoving() 会把车程整段判为静止，
+            //   既拒绝记录、又导致 LocationService 60s 停 SDK 再也拿不到回调。
+            //   这里用"与上一次记录点的实际位移"反向续期 MotionDetector：位移超过判重阈值即视为
+            //   移动，使下面的 isMoving() 成立；同时刷新 idleAnchor 防止刚记一个点就被停 SDK。
+            //   注意：GPS 静止漂移通常 < 判重阈值(MIN_MOVE_METERS=25m)，不会误触发。
+            if (dist >= MIN_MOVE_METERS) {
+                MotionDetector.noteLocationMoved(dist, provider)
+            }
+
+            if (!MotionDetector.isMoving()) {
+                reject("NOT_MOVING", dist, intervalMs)
+                return
+            }
             // 采样节流：未到下一次采样点直接返回（不改 lastSampleAt，保持周期稳定）
             if (lastSampleAt != 0L && now - lastSampleAt < intervalMs) {
                 reject("INTERVAL_NOT_DUE", dist, intervalMs, "gap=" + (now - lastSampleAt))
