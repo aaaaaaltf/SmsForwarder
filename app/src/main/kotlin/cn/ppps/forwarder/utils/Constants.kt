@@ -117,8 +117,13 @@ const val SP_LOCATION_POWER_REQUIREMENT = "location_power_requirement"
 const val SP_LOCATION_MIN_INTERVAL = "location_min_interval_time"
 const val SP_LOCATION_MIN_DISTANCE = "location_min_distance"
 
-// ★★★ 2026-11-16 运动状态下轨迹采样间隔，单位【秒】；可选 10/20/30/60/120/300，默认 20 秒
+// ★★★ 2026-11-16 运动状态下轨迹采样间隔，单位【秒】；可选 10/20/30/60/120/300
+// ★ 2026-11-20 默认由 20 秒改为 10 秒：移动时 20 秒才取一个点，车速 30km/h 一点就走约 170m，
+//   地图上两点直接连直线，弯道全被拉直。加密到 10 秒可显著贴合实际路径。
 const val SP_LOCATION_TRACK_INTERVAL_SEC = "location_track_interval_sec"
+
+/** ★ 2026-11-20：一次性把老设备持久化的 20 秒采样迁移为 10 秒（仅当仍为旧默认 20 时） */
+const val SP_LOCATION_TRACK_INTERVAL_DENSE_MIGRATED = "location_track_interval_dense_20261120"
 
 const val SP_BLUETOOTH = "enable_bluetooth"
 const val SP_BLUETOOTH_SCAN_INTERVAL = "bluetooth_scan_interval"

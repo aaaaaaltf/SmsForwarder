@@ -17,7 +17,7 @@ import java.util.concurrent.locks.ReentrantLock
  * - 静止状态：完全不采集（不写盘），由 [MotionDetector] 依据加速度计 / trigger sensor 判定。
  * - 运动状态：按控制端下发的间隔采样（10/20/30/60/120/300 秒，默认 20 秒）。
  * - 位移判重：上一条位置位移小于 [MIN_MOVE_METERS] 时不记录，避免 GPS 抖动产生垃圾点。
- * - 精度过滤：hAcc > MAX_HACC_METERS 的粗定位点不记录（2026-11-17）。
+ * - 精度过滤：hAcc ≥ MAX_HACC_METERS 的粗定位点不记录；hAcc < 0（未知精度）单独拒绝（2026-11-21）。
  * - ★2026-11-18「移动即记录」：加速度判不出匀速行车/手持稳定，故用"与上次记录点的实际位移"
  *   反向续期 MotionDetector（noteLocationMoved）：位移超过判重阈值即视为移动，既让本点可记录，
  *   也防止 LocationService 在 60s 后误判静止停掉定位 SDK。GPS 静止漂移 < MIN_MOVE_METERS 不误触发。
@@ -39,17 +39,20 @@ object LocationTrackStore {
      */
     val TRACK_INTERVAL_SECONDS: IntArray = intArrayOf(10, 20, 30, 60, 120, 300)
 
-    /** 默认采集间隔：20 秒 */
-    const val DEFAULT_INTERVAL_SEC = 20
+    /** 默认采集间隔：10 秒（2026-11-20 由 20 秒改：20秒点在移动中会拉直线） */
+    const val DEFAULT_INTERVAL_SEC = 10
 
-    /** 校验并纠正配置：不在可选档位内时退回默认 20 秒 */
+    /** 校验并纠正配置：不在可选档位内时退回默认 10 秒 */
     fun normalizeIntervalSec(sec: Int): Int =
         if (sec in TRACK_INTERVAL_SECONDS) sec else DEFAULT_INTERVAL_SEC
 
     /** 判重阈值（米）：小于该位移视为"位置未变化"，不记录 */
     private const val MIN_MOVE_METERS = 25.0
 
-    /** 精度阈值（米）：hAcc 大于该值的粗定位点直接拒绝（2026-11-17） */
+    /**
+     * 精度阈值（米）：hAcc ≥ 该值的粗定位点直接拒绝（2026-11-17，2026-11-21 由 > 改为 ≥）。
+     * 华为实测中 SDK 会返回 hAcc 恰好 500.0、坐标恒定的兜底点，用 > 会把它放行并污染轨迹。
+     */
     const val MAX_HACC_METERS = 500.0f
 
     /** 轨迹数据最长保留 6 个月（180 天） */
@@ -102,7 +105,12 @@ object LocationTrackStore {
             reject("ZERO_COORD")
             return
         }
-        if (hAcc.isNaN() || hAcc > MAX_HACC_METERS) {
+        // 精度过滤：未知精度（无 accuracy 字段，SDK 用负数表示）与粗定位分开记原因，便于日志核对。
+        if (hAcc.isNaN() || hAcc < 0f) {
+            reject("HACC_UNKNOWN", extra = "hAcc=" + hAcc)
+            return
+        }
+        if (hAcc >= MAX_HACC_METERS) {
             reject("HACC_TOO_LARGE", extra = "limit=" + MAX_HACC_METERS)
             return
         }

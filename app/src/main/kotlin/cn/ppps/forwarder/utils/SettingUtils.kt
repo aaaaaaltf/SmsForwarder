@@ -202,6 +202,9 @@ class SettingUtils private constructor() {
             if (moving && locationMovingHighAccuracy) Criteria.ACCURACY_FINE else locationAccuracy
 
         // ★ 2026-11-17：运动判定阈值（|加速度模长-9.81|），越小越灵敏；默认 0.8（车内更灵敏）
+        // ★ 2026-11-22 方案A：默认值保持 0.8，但不覆盖用户已持久化的选择。华为实测 0.4 档下
+        //   41% 的运动事件只是模长偏离 0.4~0.8 的室内手持微动；若用户自己设过 0.4，说明其偏好
+        //   更灵敏，保持原值（省电改由方案C「原地活动降精度」兜底）。
         var motionThreshold: Float by SharedPreference(SP_MOTION_THRESHOLD, 0.8f)
 
         fun normalizedMotionThreshold(): Float = motionThreshold.coerceIn(0.3f, 2.5f)
@@ -233,8 +236,24 @@ class SettingUtils private constructor() {
         //设置位置更新最小距离（单位：米）；默认距离：0米
         var locationMinDistance: Int by SharedPreference(SP_LOCATION_MIN_DISTANCE, 0)
 
-        //★★★ 2026-11-16 全新设计：运动状态下轨迹采样间隔，单位秒（10/20/30/60/120/300），默认 20 秒。静止不采集。
-        var locationTrackIntervalSec: Int by SharedPreference(SP_LOCATION_TRACK_INTERVAL_SEC, 20)
+        //★★★ 2026-11-16 运动状态下轨迹采样间隔，单位秒（10/20/30/60/120/300）。静止不采集。
+        //★ 2026-11-20 默认 20→10 秒：20 秒点在移动中会拉直线（车速30km/h 一点走约170m）。
+        var locationTrackIntervalSec: Int by SharedPreference(SP_LOCATION_TRACK_INTERVAL_SEC, 10)
+
+        /** ★ 2026-11-20：老设备仍持久化旧默认 20 秒时，一次性迁移为 10 秒（不覆盖其它选择） */
+        var locationTrackIntervalDenseMigrated: Boolean
+                by SharedPreference(SP_LOCATION_TRACK_INTERVAL_DENSE_MIGRATED, false)
+
+        fun migrateTrackIntervalDenser(): String? {
+            if (locationTrackIntervalDenseMigrated) return null
+            var changed: String? = null
+            if (locationTrackIntervalSec == 20) {
+                locationTrackIntervalSec = 10
+                changed = "trackInterval:20s->10s"
+            }
+            locationTrackIntervalDenseMigrated = true
+            return changed
+        }
 
         //是否跟随系统语言
         //var isFlowSystemLanguage: Boolean by SharedPreference(SP_IS_FLOW_SYSTEM_LANGUAGE, false)

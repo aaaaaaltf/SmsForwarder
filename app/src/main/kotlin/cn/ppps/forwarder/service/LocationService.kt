@@ -48,6 +48,13 @@ class LocationService : Service() {
     private val HEARTBEAT_INTERVAL_MS = 60_000L
     private val MOTION_WAKE_COOLDOWN_MS = 10_000L
     private val ACCURACY_SWITCH_COOLDOWN_MS = 10_000L
+    /** ★ 2026-11-20 运动态 GPS 回调间隔：5 秒（原 30 秒太稀，移动中轨迹会拉直线） */
+    private val MOTION_MIN_TIME_MS = 5_000L
+    /**
+     * ★ 2026-11-22 方案C：运动持续该时长仍没有 ≥25 米真实位移 ⇒ 判为「原地活动」，
+     *   从高精度 GPS 退回低精度（不停 SDK，仍能感知真实移动后自动升回 GPS）。
+     */
+    private val MOVING_NO_DISPLACE_DOWNGRADE_MS = 120_000L
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var idleWatchPosted = false
@@ -159,7 +166,7 @@ class LocationService : Service() {
                             "clientStarted" to App.LocationClient.isStarted(),
                             "clientAccuracy" to clientAccuracy,
                             "baseAccuracy" to SettingUtils.locationAccuracy,
-                            "targetAccuracy" to SettingUtils.accuracyForMotion(cn.ppps.forwarder.relay.MotionDetector.isMoving()),
+                            "targetAccuracy" to effectiveAccuracy(),
                             "movingHighAccuracy" to SettingUtils.locationMovingHighAccuracy
                         )
 
@@ -312,7 +319,8 @@ class LocationService : Service() {
     private fun onWakeByMotion(source: String) {
         if (!isRunning || !SettingUtils.enableLocation) return
         val moving = cn.ppps.forwarder.relay.MotionDetector.isMoving()
-        val target = SettingUtils.accuracyForMotion(moving)
+        val high = highAccuracyActive()
+        val target = if (high) Criteria.ACCURACY_FINE else SettingUtils.locationAccuracy
         val started = App.LocationClient.isStarted()
         if (started && clientAccuracy == target) {
             TrackDebugLog.event(
@@ -355,25 +363,43 @@ class LocationService : Service() {
         if (!isRunning || !SettingUtils.enableLocation) return
         if (!App.LocationClient.isStarted()) return
         val moving = cn.ppps.forwarder.relay.MotionDetector.isMoving()
-        val target = SettingUtils.accuracyForMotion(moving)
+        val high = highAccuracyActive()
+        val target = if (high) Criteria.ACCURACY_FINE else SettingUtils.locationAccuracy
         if (clientAccuracy == target) return
         val now = System.currentTimeMillis()
         if (now - lastAccuracySwitchAt < ACCURACY_SWITCH_COOLDOWN_MS) return
         lastAccuracySwitchAt = now
-        val switchReason = if (moving && target == Criteria.ACCURACY_FINE)
-            "MOTION_HIGH_ACCURACY_$reason" else "MOTION_END_LOW_POWER_$reason"
+        val noDisplace = moving && !high && SettingUtils.locationMovingHighAccuracy
+        val switchReason = when {
+            high -> "MOTION_HIGH_ACCURACY_$reason"
+            noDisplace -> "MOTION_NO_DISPLACE_LOW_POWER_$reason"
+            else -> "MOTION_END_LOW_POWER_$reason"
+        }
         TrackDebugLog.event(
             "ACCURACY_SWITCH",
             "reason" to switchReason,
             "moving" to moving,
+            "noDisplace" to noDisplace,
             "from" to clientAccuracy,
             "to" to target
         )
         startLocationClient(switchReason, force = true)
     }
 
+    /**
+     * ★ 2026-11-22 方案C：是否应使用运动态高精度。
+     *   除「运动中 + 允许运动高精度」外，还要求最近 [MOVING_NO_DISPLACE_DOWNGRADE_MS] 内
+     *   真的走出过 25 米。室内手持/滑动屏幕只会持续命中运动事件而没有位移，不应占用 GPS。
+     */
+    private fun highAccuracyActive(): Boolean {
+        if (!SettingUtils.locationMovingHighAccuracy) return false
+        val md = cn.ppps.forwarder.relay.MotionDetector
+        if (!md.isMoving()) return false
+        return !md.isMovingWithoutDisplacement(MOVING_NO_DISPLACE_DOWNGRADE_MS)
+    }
+
     private fun effectiveAccuracy(): Int =
-        SettingUtils.accuracyForMotion(cn.ppps.forwarder.relay.MotionDetector.isMoving())
+        if (highAccuracyActive()) Criteria.ACCURACY_FINE else SettingUtils.locationAccuracy
 
     private fun startLocationClient(reason: String, force: Boolean = false) {
         val migrated = SettingUtils.migrateLowPowerLocationDefaults()
@@ -396,12 +422,40 @@ class LocationService : Service() {
             clientAccuracy = -1
         }
         try {
+            val denseMigrated = SettingUtils.migrateTrackIntervalDenser()
+            if (denseMigrated != null) {
+                TrackDebugLog.event("TRACK_INTERVAL_MIGRATION", "changes" to denseMigrated)
+                Log.i(TAG, "★ 轨迹采样间隔加密迁移: $denseMigrated")
+            }
             val moving = cn.ppps.forwarder.relay.MotionDetector.isMoving()
-            val accuracy = effectiveAccuracy()
+            // ★ 2026-11-22 方案C：运动中但连续 2 分钟没有 25 米位移 ⇒ 视为原地活动，不开 GPS。
+            val highAccuracy = highAccuracyActive()
+            val noDisplace = moving && !highAccuracy && SettingUtils.locationMovingHighAccuracy
+            val accuracy = if (highAccuracy) Criteria.ACCURACY_FINE else SettingUtils.locationAccuracy
+            // ★★★ 2026-11-19【让GPS真正生效】：底层 com.github.pppscn:location 用
+            //   locationManager.getBestProvider(criteria, enabledOnly=true) 只注册【单个】provider。
+            //   之前 criteria 是 accuracy=FINE 但仍带 POWER_LOW + costAllowed=false（库默认），
+            //   getBestProvider 会判定 GPS「高耗电/付费、不满足条件」而排除，永远只返回 network ⇒
+            //   全程 provider=network、hAcc 数百米、轨迹被 HACC_TOO_LARGE 丢弃（开车没轨迹根因）。
+            //   方案A：运动态且允许高精度时，放开为 POWER_HIGH + costAllowed=true，让 GPS 入选；
+            //   静止态维持原低耗配置（POWER_LOW + costAllowed=false，仍选 network 省电）。
+            //   option 对象是复用的，两个字段每次都显式写，避免运动→静止后 cost 残留。
+            val power = if (highAccuracy) Criteria.POWER_HIGH else SettingUtils.locationPowerRequirement
+            val costAllowed = highAccuracy
+            // ★★★ 2026-11-20【运动态强制 GPS + 加密回调，解决"拉直线"】：
+            //   实测方案A（FINE+HIGH+cost=true）在华为上 getBestProvider 仍返回 network、GPS 从未被请求；
+            //   network 基站定位只在基站切换时更新、不连续，叠加 minTime=30s 使点位更稀，
+            //   地图上稀疏点被连成直线、弯道全丢。这里运动态直接 setProvider("gps") 绕过
+            //   getBestProvider 强制卫星定位，并把回调间隔降到 5 秒；静止态传 null 走 getBestProvider
+            //   （仍选 network 省电）且维持低耗间隔。库 setProvider 参数为 @Nullable，可传 null。
+            val provider = if (highAccuracy) LocationManager.GPS_PROVIDER else null
+            val minTime = if (highAccuracy) MOTION_MIN_TIME_MS else SettingUtils.locationMinInterval
             val locationOption = App.LocationClient.getLocationOption()
                 .setAccuracy(accuracy)
-                .setPowerRequirement(SettingUtils.locationPowerRequirement)
-                .setMinTime(SettingUtils.locationMinInterval)
+                .setPowerRequirement(power)
+                .setCostAllowed(costAllowed)
+                .setProvider(provider)
+                .setMinTime(minTime)
                 .setMinDistance(SettingUtils.locationMinDistance)
                 .setOnceLocation(false)
                 .setLastKnownLocation(false)
@@ -415,8 +469,12 @@ class LocationService : Service() {
                 "baseAccuracy" to SettingUtils.locationAccuracy,
                 "movingHighAccuracy" to SettingUtils.locationMovingHighAccuracy,
                 "moving" to moving,
-                "power" to SettingUtils.locationPowerRequirement,
-                "minIntervalMs" to SettingUtils.locationMinInterval,
+                "highAccuracy" to highAccuracy,
+                "noDisplace" to noDisplace,
+                "power" to power,
+                "costAllowed" to costAllowed,
+                "provider" to (provider ?: "auto"),
+                "minTimeMs" to minTime,
                 "minDistanceM" to SettingUtils.locationMinDistance,
                 "screenOn" to isScreenOn()
             )
