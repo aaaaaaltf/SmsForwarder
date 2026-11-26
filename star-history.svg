@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="960" height="520" viewBox="0 0 960 520" role="img" aria-labelledby="title description">
   <title id="title">aaaaaaltf/SmsForwarder Star History</title>
-  <desc id="description">GitHub stars by date, last updated 2026-11-25</desc>
+  <desc id="description">GitHub stars by date, last updated 2026-11-26</desc>
   <style>
     .background { fill: #ffffff; }
     .grid { fill: none; stroke: #d8dee4; stroke-width: 1; }
@@ -26,11 +26,11 @@
   </style>
   <rect class="background" width="960" height="520" rx="8"/>
   <text class="heading" x="76" y="38">aaaaaaltf/SmsForwarder Star History</text>
-  <text class="subtitle" x="76" y="62">GitHub stars by date · updated 2026-11-25</text>
+  <text class="subtitle" x="76" y="62">GitHub stars by date · updated 2026-11-26</text>
   <text class="value" x="928" y="40" text-anchor="end">★ 0</text>
   <path class="grid" d="M 76 456.0 H 928"/><text class="label" x="64" y="460.0" text-anchor="end">0</text><path class="grid" d="M 76 92.0 H 928"/><text class="label" x="64" y="96.0" text-anchor="end">5K</text>
   
-  <path class="area" d="M 76.0 456.0 H 104.4 V 456.0 H 132.8 V 456.0 H 161.2 V 456.0 H 189.6 V 456.0 H 218.0 V 456.0 H 246.4 V 456.0 H 274.8 V 456.0 H 303.2 V 456.0 H 331.6 V 456.0 H 360.0 V 456.0 H 388.4 V 456.0 H 416.8 V 456.0 H 445.2 V 456.0 H 473.6 V 456.0 H 502.0 V 456.0 H 530.4 V 456.0 H 558.8 V 456.0 H 587.2 V 456.0 H 615.6 V 456.0 H 644.0 V 456.0 H 672.4 V 456.0 H 700.8 V 456.0 H 729.2 V 456.0 H 757.6 V 456.0 H 786.0 V 456.0 H 814.4 V 456.0 H 842.8 V 456.0 H 871.2 V 456.0 H 899.6 V 456.0 H 928.0 V 456.0 V 456 H 76.0 Z"/>
-  <path class="line" d="M 76.0 456.0 H 104.4 V 456.0 H 132.8 V 456.0 H 161.2 V 456.0 H 189.6 V 456.0 H 218.0 V 456.0 H 246.4 V 456.0 H 274.8 V 456.0 H 303.2 V 456.0 H 331.6 V 456.0 H 360.0 V 456.0 H 388.4 V 456.0 H 416.8 V 456.0 H 445.2 V 456.0 H 473.6 V 456.0 H 502.0 V 456.0 H 530.4 V 456.0 H 558.8 V 456.0 H 587.2 V 456.0 H 615.6 V 456.0 H 644.0 V 456.0 H 672.4 V 456.0 H 700.8 V 456.0 H 729.2 V 456.0 H 757.6 V 456.0 H 786.0 V 456.0 H 814.4 V 456.0 H 842.8 V 456.0 H 871.2 V 456.0 H 899.6 V 456.0 H 928.0 V 456.0"/>
+  <path class="area" d="M 76.0 456.0 H 103.5 V 456.0 H 131.0 V 456.0 H 158.5 V 456.0 H 185.9 V 456.0 H 213.4 V 456.0 H 240.9 V 456.0 H 268.4 V 456.0 H 295.9 V 456.0 H 323.4 V 456.0 H 350.8 V 456.0 H 378.3 V 456.0 H 405.8 V 456.0 H 433.3 V 456.0 H 460.8 V 456.0 H 488.3 V 456.0 H 515.7 V 456.0 H 543.2 V 456.0 H 570.7 V 456.0 H 598.2 V 456.0 H 625.7 V 456.0 H 653.2 V 456.0 H 680.6 V 456.0 H 708.1 V 456.0 H 735.6 V 456.0 H 763.1 V 456.0 H 790.6 V 456.0 H 818.1 V 456.0 H 845.5 V 456.0 H 873.0 V 456.0 H 900.5 V 456.0 H 928.0 V 456.0 V 456 H 76.0 Z"/>
+  <path class="line" d="M 76.0 456.0 H 103.5 V 456.0 H 131.0 V 456.0 H 158.5 V 456.0 H 185.9 V 456.0 H 213.4 V 456.0 H 240.9 V 456.0 H 268.4 V 456.0 H 295.9 V 456.0 H 323.4 V 456.0 H 350.8 V 456.0 H 378.3 V 456.0 H 405.8 V 456.0 H 433.3 V 456.0 H 460.8 V 456.0 H 488.3 V 456.0 H 515.7 V 456.0 H 543.2 V 456.0 H 570.7 V 456.0 H 598.2 V 456.0 H 625.7 V 456.0 H 653.2 V 456.0 H 680.6 V 456.0 H 708.1 V 456.0 H 735.6 V 456.0 H 763.1 V 456.0 H 790.6 V 456.0 H 818.1 V 456.0 H 845.5 V 456.0 H 873.0 V 456.0 H 900.5 V 456.0 H 928.0 V 456.0"/>
   <circle class="point" cx="928.0" cy="456.0" r="5"/>
 </svg>
